@@ -3646,8 +3646,9 @@ def visualize_decoded_structure(
                     fontsize=9, framealpha=0.95,
                 )
             plt.tight_layout(rect=[0, 0.04, 1, 0.94])
+        n_figs_created = 4
     else:
-        # ── 기본: 2×2 grid ──
+        # ── 기본: 2×2 grid (overview) ──
         fig = plt.figure(figsize=(15, 14), facecolor="white")
         fig.suptitle(
             f"{title} [{coord_label}]\n{info_line}\n{meta_note}",
@@ -3669,7 +3670,27 @@ def visualize_decoded_structure(
             )
         plt.tight_layout(rect=[0, 0.04, 1, 0.96])
 
-    n_figs_created = 4 if separate_windows else 1
+        # ── ★ 추가: Top View 만 별도 큰 창 ──
+        top_label, top_elev, top_azim = "Decoded — Top View", 89.9, -90.0
+        fig_top = plt.figure(figsize=(11, 10), facecolor="white")
+        fig_top.suptitle(
+            f"{title}  —  TOP VIEW [{coord_label}]\n{info_line}\n{meta_note}",
+            fontsize=11, fontweight="normal", color="#222", y=0.985,
+        )
+        ax_top = fig_top.add_subplot(1, 1, 1, projection="3d")
+        _draw_one(ax_top, top_label, top_elev, top_azim)
+        if sketches:
+            fig_top.legend(
+                handles=[
+                    mpatches.Patch(color=PAL[i % len(PAL)], label=f"Sketch {i + 1}")
+                    for i in range(len(sketches))
+                ],
+                loc="lower center", ncol=min(len(sketches), 6),
+                facecolor="white", edgecolor="#ddd", labelcolor="#444",
+                fontsize=10, framealpha=0.95,
+            )
+        plt.tight_layout(rect=[0, 0.05, 1, 0.94])
+        n_figs_created = 2
     print(
         f"  ✓ decoded structure figure 생성 "
         f"(tokens={recon_trim.shape[0]}, mode={'real' if use_real else 'normalized'}, "
