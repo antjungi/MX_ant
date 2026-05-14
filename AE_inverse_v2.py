@@ -350,8 +350,9 @@ def ensure_eos_when_truncated(t, max_len):
 # ★ v2: Canonicalize sketches by (volume desc, z asc, x asc, y asc)
 # ══════════════════════════════════════════════════════════════
 def _sketch_sort_key_from_ext_row(ext_row):
-    """EXT 토큰 row 에서 sorting key (-volume, z, x, y) 반환.
-    volume ≈ scale² · (e1+e2). 큰 부피가 먼저 오도록 음수.
+    """[Fallback] EXT 토큰 row 만으로 sorting key (-volume, z, x, y) 추정.
+    volume ≈ scale² · (e1+e2). P_SCALE 이 GND/non-GND 를 잘 구분하지 못할 수 있어
+    JSON 이 있으면 _compute_real_sketch_volumes_from_json() 쪽이 우선.
     """
     scale = int(ext_row[1 + P_SCALE])
     e1 = int(ext_row[1 + P_E1])
@@ -371,14 +372,78 @@ def _sketch_sort_key_from_ext_row(ext_row):
     return (-volume, pzv, pxv, pyv)
 
 
-def canonicalize_sketches_by_volume_position(tokens):
+def _compute_real_sketch_volumes_from_json(json_data):
+    """JSON sequence 에서 각 (Sketch, Extrude) 쌍의 실좌표 (mm) 부피와 origin 계산.
+
+    Returns: (volumes, positions) - 각 sketch 의 실제 mm 단위 bbox volume 과 plane origin.
+    sketch 와 extrude 가 1:1 매칭되지 않으면 None 반환.
+    """
+    try:
+        seq = json_data["sequence"]
+    except Exception:
+        return None, None
+
+    volumes = []
+    positions = []
+    pending = None
+
+    for op in seq:
+        op_type = op.get("type", "")
+
+        if op_type == "Sketch":
+            profile = op.get("profile", {})
+            xs, ys = [], []
+            for loop in profile.get("children", []):
+                for e in loop.get("children", []):
+                    et = e.get("type", "")
+                    for key in ("start_point", "end_point", "mid_point"):
+                        if key in e:
+                            xs.append(float(e[key]["x"]))
+                            ys.append(float(e[key]["y"]))
+                    if et == "Circle":
+                        cp = e.get("center_point", {"x": 0.0, "y": 0.0})
+                        r = float(e.get("radius", 0.0))
+                        xs.extend([float(cp["x"]) - r, float(cp["x"]) + r])
+                        ys.extend([float(cp["y"]) - r, float(cp["y"]) + r])
+            if xs and ys:
+                w = max(xs) - min(xs)
+                h = max(ys) - min(ys)
+                area = max(w * h, 1e-8)
+            else:
+                area = 1e-8
+            origin = op["plane"]["origin"]
+            pending = {
+                "area": float(area),
+                "ox": float(origin["x"]),
+                "oy": float(origin["y"]),
+                "oz": float(origin["z"]),
+            }
+
+        elif op_type == "Extrude":
+            if pending is None:
+                continue
+            ext1 = float(op.get("extent_one", {}).get("distance", 0.0))
+            ext2 = float(op.get("extent_two", {}).get("distance", 0.0))
+            thickness = abs(ext1) + abs(ext2) + 1e-6
+            vol = pending["area"] * thickness
+            volumes.append(vol)
+            positions.append((pending["ox"], pending["oy"], pending["oz"]))
+            pending = None
+
+    if not volumes:
+        return None, None
+    return volumes, positions
+
+
+def canonicalize_sketches_by_volume_position(tokens, json_file=None, verbose=False, tag=""):
     """sketch 청크 (SOL ... EXT) 들을 (부피 desc, z asc, x asc, y asc) 로 정렬.
 
-    - 큰 부피 sketch 가 먼저 오도록 (보통 GND/substrate)
-    - 같은 부피면 낮은 z 우선 (ground plane 쪽)
-    - 그래도 ties 면 x, y 로 완전 deterministic
+    JSON metadata 가 있으면 실제 mm 단위 polygon 면적 × extrude 거리로 부피 계산.
+    없으면 EXT 토큰 슬롯값으로 fallback.
+
     - sketch 내부 토큰 순서는 그대로 유지
     - EOS / padding 은 tail 로 그대로 보존
+    - verbose=True 면 정렬 키와 결과 순서를 print
     """
     tokens = np.asarray(tokens, dtype=np.int32)
     cmd_seq = tokens[:, 0]
@@ -403,9 +468,48 @@ def canonicalize_sketches_by_volume_position(tokens):
         else np.zeros((0, 17), dtype=tokens.dtype)
     )
 
-    sort_keys = [_sketch_sort_key_from_ext_row(c[-1]) for c in chunks]
+    # 1) JSON 으로 real-coord volume 시도
+    json_volumes = None
+    json_positions = None
+    if json_file is not None and os.path.exists(json_file):
+        try:
+            import json as _json
+            with open(json_file, "r", encoding="utf-8") as f:
+                jd = _json.load(f)
+            json_volumes, json_positions = _compute_real_sketch_volumes_from_json(jd)
+        except Exception:
+            json_volumes = None
+
+    use_json = (
+        json_volumes is not None
+        and json_positions is not None
+        and len(json_volumes) == len(chunks)
+    )
+
+    if use_json:
+        sort_keys = [
+            (-float(json_volumes[i]),
+             float(json_positions[i][2]),
+             float(json_positions[i][0]),
+             float(json_positions[i][1]))
+            for i in range(len(chunks))
+        ]
+        key_source = "json_real"
+    else:
+        sort_keys = [_sketch_sort_key_from_ext_row(c[-1]) for c in chunks]
+        key_source = "token_scale"
+
     order = sorted(range(len(chunks)), key=lambda i: sort_keys[i])
     sorted_chunks = [chunks[i] for i in order]
+    changed = (order != list(range(len(chunks))))
+
+    if verbose:
+        vols_str = ", ".join(f"{-k[0]:.3g}" for k in sort_keys)
+        print(
+            f"    canon [{tag}|{key_source}] n_sk={len(chunks)} "
+            f"vols=[{vols_str}] order={order} "
+            f"{'(reordered)' if changed else '(no change)'}"
+        )
 
     out = np.concatenate(
         sorted_chunks + ([tail] if tail.size else []), axis=0,
@@ -1459,12 +1563,38 @@ class JointDataset(Dataset):
         self.raw = []
         self.padded = []
         n_changed = 0
+        n_json_used = 0
+        n_token_fallback = 0
 
-        for f in self.npy_files:
+        # type 별로 첫 sample 1 개씩만 verbose 로 보여줘서 정렬 동작 확인용
+        verbose_per_type = set()
+        type_ids_for_verbose = (
+            np.asarray(type_ids, dtype=np.int64)
+            if type_ids is not None
+            else np.zeros(len(self.npy_files), dtype=np.int64)
+        )
+
+        for i, f in enumerate(self.npy_files):
             t = np.load(f).astype(np.int32)
             t = ensure_eos_when_truncated(t, max_len)
             if self.do_canonicalize:
-                t_canon = canonicalize_sketches_by_volume_position(t)
+                jf = self.json_files[i] if i < len(self.json_files) else None
+                tid = int(type_ids_for_verbose[i]) if i < len(type_ids_for_verbose) else -1
+                verbose = tid not in verbose_per_type
+                if verbose:
+                    verbose_per_type.add(tid)
+                t_canon = canonicalize_sketches_by_volume_position(
+                    t,
+                    json_file=jf,
+                    verbose=verbose,
+                    tag=f"sample{i}/type{tid}",
+                )
+                # 정렬 키 출처도 count
+                if jf is not None and os.path.exists(jf):
+                    n_json_used += 1
+                else:
+                    n_token_fallback += 1
+
                 if not np.array_equal(t_canon, t):
                     n_changed += 1
                 t = t_canon
@@ -1475,6 +1605,10 @@ class JointDataset(Dataset):
             print(
                 f"  ★ canonicalized {n_changed}/{len(self.npy_files)} sequences "
                 f"(volume desc, z asc, x asc, y asc)"
+            )
+            print(
+                f"    sort key source: json_real={n_json_used}, "
+                f"token_scale_fallback={n_token_fallback}"
             )
 
         self.sparam_db = sparam_db.astype(np.float32)
