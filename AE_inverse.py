@@ -4442,10 +4442,12 @@ if __name__ == "__main__":
         # ★ STEP file export (HFSS import 용)
         #   True : CadQuery 로 디코딩된 구조를 .step 파일로 저장
         #          (cadquery 필요: pip install cadquery)
-        #          출력: inverse_design_<timestamp>.step
+        #          저장 경로: <script_dir>/inversed_step/inverse_design_<timestamp>.step
         INV_EXPORT_STEP = True
+        INV_STEP_DIR = os.path.join(script_dir, "inversed_step")
+        os.makedirs(INV_STEP_DIR, exist_ok=True)
         INV_STEP_PATH = os.path.join(
-            script_dir, f"inverse_design_{run_tag}.step",
+            INV_STEP_DIR, f"inverse_design_{run_tag}.step",
         )
 
         if cfg.show_figures and RUN_INVERSE_DESIGN:
