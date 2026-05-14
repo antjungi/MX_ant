@@ -3241,11 +3241,39 @@ def train_fixed_medium_var(
     # ── ★ 구조 복원 시각화 (encoder 입력 vs decoder 복원) ──
     if cfg.show_figures:
         subsection("Reconstruction structure visualization")
-        viz_pool = list(val_idx) if len(val_idx) > 0 else list(train_idx)
+        # type 별로 한 개씩 우선 뽑고, n_preview 더 많으면 나머지 채움
+        pool_source = list(val_idx) if len(val_idx) > 0 else list(train_idx)
         n_show = max(1, int(cfg.n_preview))
+
+        stratified = []
+        seen_types = set()
+        for idx in pool_source:
+            try:
+                t_id = int(dataset.type_ids[idx])
+            except Exception:
+                t_id = -1
+            if t_id not in seen_types:
+                stratified.append(idx)
+                seen_types.add(t_id)
+
+        # 모든 type 1 개씩은 무조건 보이고, n_show 가 더 크면 추가로 채움
+        viz_pool = list(stratified)
+        if n_show > len(viz_pool):
+            for idx in pool_source:
+                if idx not in viz_pool:
+                    viz_pool.append(idx)
+                    if len(viz_pool) >= n_show:
+                        break
+        max_to_show = max(n_show, len(stratified))
+
+        print(
+            f"  recon viz: showing {min(len(viz_pool), max_to_show)} samples "
+            f"(stratified by type, n_types={len(seen_types)})"
+        )
+
         try:
             visualize_reconstruction(
-                ae, dataset, viz_pool, device, max_samples=n_show,
+                ae, dataset, viz_pool, device, max_samples=max_to_show,
             )
         except Exception as e:
             import traceback as _tb
@@ -4054,7 +4082,7 @@ def visualize_decoded_structure(
         ax.view_init(elev=elev, azim=azim)
 
     if separate_windows:
-        # ── 4 개 view 를 각각 별도 figure 로 ──
+        # ── (옵션) 4 개 view 를 각각 별도 figure 로 ──
         for label, elev, azim in views:
             fig = plt.figure(figsize=(10, 9), facecolor="white")
             fig.suptitle(
@@ -4076,31 +4104,9 @@ def visualize_decoded_structure(
             plt.tight_layout(rect=[0, 0.04, 1, 0.94])
         n_figs_created = 4
     else:
-        # ── 기본: 2×2 grid (overview) ──
-        fig = plt.figure(figsize=(15, 14), facecolor="white")
-        fig.suptitle(
-            f"{title} [{coord_label}]\n{info_line}\n{meta_note}",
-            fontsize=10, fontweight="normal", color="#222", y=0.985,
-        )
-        for slot, (label, elev, azim) in enumerate(views):
-            ax = fig.add_subplot(2, 2, slot + 1, projection="3d")
-            _draw_one(ax, label, elev, azim)
-
-        if sketches:
-            fig.legend(
-                handles=[
-                    mpatches.Patch(color=PAL[i % len(PAL)], label=f"Sketch {i + 1}")
-                    for i in range(len(sketches))
-                ],
-                loc="lower center", ncol=min(len(sketches), 6),
-                facecolor="white", edgecolor="#ddd", labelcolor="#444",
-                fontsize=9, framealpha=0.95,
-            )
-        plt.tight_layout(rect=[0, 0.04, 1, 0.96])
-
-        # ── ★ 추가: Top View 만 별도 큰 창 ──
+        # ── 기본: Top View 큰 창 하나만 ──
         top_label, top_elev, top_azim = "Decoded — Top View", 89.9, -90.0
-        fig_top = plt.figure(figsize=(11, 10), facecolor="white")
+        fig_top = plt.figure(figsize=(12, 11), facecolor="white")
         fig_top.suptitle(
             f"{title}  —  TOP VIEW [{coord_label}]\n{info_line}\n{meta_note}",
             fontsize=11, fontweight="normal", color="#222", y=0.985,
@@ -4118,7 +4124,7 @@ def visualize_decoded_structure(
                 fontsize=10, framealpha=0.95,
             )
         plt.tight_layout(rect=[0, 0.05, 1, 0.94])
-        n_figs_created = 2
+        n_figs_created = 1
     print(
         f"  ✓ decoded structure figure 생성 "
         f"(tokens={recon_trim.shape[0]}, mode={'real' if use_real else 'normalized'}, "
