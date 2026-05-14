@@ -2920,22 +2920,37 @@ def inverse_design_optimize(
     channel_target_freqs,
     bandwidth_ghz,
     device,
-    n_starts=8,
-    n_iters=500,
+    n_starts=32,
+    n_iters=2000,
     lr=5e-2,
     in_band_weight=10.0,
     out_band_weight=0.0,
     z_prior_weight=1e-3,
+    z_prior_weight_end=1e-5,
     deep_db=-20.0,
     flat_db=0.0,
     seed=0,
-    verbose_every=50,
+    verbose_every=100,
+    # Tier 1
+    cosine_lr=True,
+    lr_min_ratio=0.05,
+    early_stop_patience=200,
+    # Tier 2(a) — random restart on stagnation
+    restart_patience=80,
+    restart_frac=0.25,
+    restart_noise=0.3,
+    max_restarts=10,
 ):
-    """Multi-start latent optimization.
-    - 학습 dataset 의 latent 분포에서 prior 통계를 계산
-    - n_starts 후보를 학습 latent 중에서 무작위 초기화
-    - surrogate(z) → full-grid dB → target 매칭 loss + latent prior reg
-    - 최적 후보 1개의 z 와 예측 곡선 반환
+    """Multi-start latent optimization with cosine LR + prior decay + random restart.
+
+    Tier1:
+      - cosine LR schedule (lr → lr * lr_min_ratio)
+      - z_prior_weight 선형 감소 (초반엔 분포 안 유지, 후반엔 풀어줘서 fine search)
+      - early stopping (early_stop_patience iter 정체)
+
+    Tier2(a):
+      - 정체(restart_patience iter 동안 best 개선 없음) 시 worst restart_frac
+        만큼을 학습 latent 무작위 샘플 + noise 로 교체 + Adam moments 리셋
     """
     ae.eval()
     mlp.eval()
@@ -2977,21 +2992,55 @@ def inverse_design_optimize(
     in_band_count = masks_t.float().sum(dim=0).clamp(min=1.0).unsqueeze(0)
     out_band_count = (~masks_t).float().sum(dim=0).clamp(min=1.0).unsqueeze(0)
 
-    print(f"  multi-start optimization | n_starts={n_starts}, n_iters={n_iters}, lr={lr}")
-    print(f"  loss weights: in_band={in_band_weight}, out_band={out_band_weight}, z_prior={z_prior_weight}")
+    last_improve_iter = 0
+    last_restart_iter = -10 ** 9
+    restart_count = 0
+    iters_used = n_iters
+    early_stopped = False
+
+    print(
+        f"  multi-start optimization | "
+        f"n_starts={n_starts}, n_iters={n_iters}, lr={lr} "
+        f"({'cosine→' + f'{lr * lr_min_ratio:.1e}' if cosine_lr else 'constant'})"
+    )
+    print(
+        f"  loss weights: in_band={in_band_weight}, out_band={out_band_weight}"
+    )
+    print(
+        f"  prior weight schedule: {z_prior_weight:.1e} → {z_prior_weight_end:.1e}"
+    )
+    print(
+        f"  random restart: worst {int(restart_frac * 100)}% replaced after "
+        f"{restart_patience} stagnant iters (max {max_restarts}x)"
+    )
+    print(
+        f"  early stop: after {early_stop_patience} stagnant iters"
+    )
     print(f"  target: deep_db={deep_db}, flat_db={flat_db}")
 
     for it in range(n_iters):
+        # ── Tier1: schedules ──
+        progress = it / max(n_iters - 1, 1)
+        if cosine_lr:
+            cos_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+            cur_lr = lr * (lr_min_ratio + (1.0 - lr_min_ratio) * cos_factor)
+        else:
+            cur_lr = lr
+        for pg in optimizer.param_groups:
+            pg["lr"] = cur_lr
+
+        cur_prior_w = (
+            z_prior_weight
+            + (z_prior_weight_end - z_prior_weight) * progress
+        )
+
         optimizer.zero_grad()
 
         pred_sel = mlp(z)
         pred_full = interpolate_selected_to_full_torch(pred_sel, interp_w)
 
         diff = pred_full - target_full_t.unsqueeze(0)
-
-        # in-band: hinge — pred ≤ deep_db 만 만족하면 OK (더 깊으면 페널티 없음)
         in_band_violation_sq = F.relu(diff) ** 2
-        # out-band: 일반 MSE (default out_band_weight=0이라 거의 영향 없음)
         out_band_sq = diff ** 2
 
         in_band = (
@@ -3006,7 +3055,7 @@ def inverse_design_optimize(
         ).mean(dim=-1)
 
         z_reg_per = (((z - z_mean) / z_std) ** 2).mean(dim=-1)
-        total_per = match_per + z_prior_weight * z_reg_per
+        total_per = match_per + cur_prior_w * z_reg_per
         loss = total_per.sum()
 
         loss.backward()
@@ -3015,21 +3064,79 @@ def inverse_design_optimize(
         with torch.no_grad():
             bi = int(torch.argmin(match_per).item())
             cur = float(match_per[bi].item())
-            if cur < best_loss:
+            if cur < best_loss - 1e-8:
                 best_loss = cur
                 best_z = z[bi:bi + 1].detach().clone()
                 best_pred_full = pred_full[bi].detach().cpu().numpy()
                 best_in_band = in_band[bi].detach().cpu().numpy()
                 best_start_idx = bi
+                last_improve_iter = it
 
+        # ── Tier2(a): random restart on stagnation ──
+        if (
+            restart_count < max_restarts
+            and it - last_improve_iter >= restart_patience
+            and it - last_restart_iter >= restart_patience
+        ):
+            with torch.no_grad():
+                n_replace = max(1, int(round(n_starts * restart_frac)))
+                worst_idx = torch.topk(
+                    match_per, k=n_replace, largest=True
+                ).indices
+
+                new_pick = rng.choice(
+                    z_prior_t.size(0), size=n_replace, replace=False,
+                )
+                new_init = z_prior_t[new_pick].clone()
+                if restart_noise > 0:
+                    new_init = new_init + restart_noise * torch.randn_like(new_init)
+                z.data[worst_idx] = new_init
+
+                # Adam moments 리셋 (해당 슬롯만)
+                state = optimizer.state.get(z, {})
+                if "exp_avg" in state:
+                    state["exp_avg"][worst_idx] = 0
+                    state["exp_avg_sq"][worst_idx] = 0
+                if "step" in state:
+                    # tensor 형태 step (PyTorch >=1.7) 대비
+                    pass
+
+            restart_count += 1
+            last_restart_iter = it
+            last_improve_iter = it  # 새 init 에 patience 부여
+            print(
+                f"    iter {it + 1:4d}/{n_iters} | RESTART worst {n_replace}/{n_starts} "
+                f"(restart #{restart_count})"
+            )
+
+        # ── Tier1: early stop ──
+        if (
+            it - last_improve_iter >= early_stop_patience
+            and it - last_restart_iter >= early_stop_patience
+        ):
+            iters_used = it + 1
+            early_stopped = True
+            print(
+                f"    iter {it + 1:4d}/{n_iters} | EARLY STOP "
+                f"(no improvement for {early_stop_patience} iters)"
+            )
+            break
+
+        # ── verbose logging ──
         if it == 0 or (it + 1) % verbose_every == 0 or it == n_iters - 1:
             with torch.no_grad():
                 avg = float(match_per.mean().item())
                 zr = float(z_reg_per.mean().item())
                 print(
-                    f"    iter {it + 1:4d}/{n_iters} | best_match={best_loss:.4f} | "
-                    f"avg_match={avg:.4f} | mean_z_reg={zr:.3f}"
+                    f"    iter {it + 1:4d}/{n_iters} | best={best_loss:.4f} | "
+                    f"avg={avg:.4f} | z_reg={zr:.2f} | "
+                    f"lr={cur_lr:.2e} | prior_w={cur_prior_w:.1e}"
                 )
+
+    print(
+        f"\n  optimization stats: iters_used={iters_used}, "
+        f"restarts={restart_count}, early_stopped={early_stopped}"
+    )
 
     return {
         "best_z": best_z,
@@ -3044,6 +3151,9 @@ def inverse_design_optimize(
         "bandwidth_ghz": float(bandwidth_ghz),
         "deep_db": float(deep_db),
         "flat_db": float(flat_db),
+        "iters_used": iters_used,
+        "restart_count": restart_count,
+        "early_stopped": early_stopped,
     }
 
 
@@ -3534,14 +3644,21 @@ def run_inverse_design_pipeline(
     device,
     channel_target_freqs=(2.0, 3.0, 4.0),
     bandwidth_ghz=0.1,
-    n_starts=8,
-    n_iters=500,
+    n_starts=32,
+    n_iters=2000,
     lr=5e-2,
     in_band_weight=10.0,
     out_band_weight=0.0,
     z_prior_weight=1e-3,
+    z_prior_weight_end=1e-5,
     deep_db=-20.0,
     seed=0,
+    cosine_lr=True,
+    early_stop_patience=200,
+    restart_patience=80,
+    restart_frac=0.25,
+    restart_noise=0.3,
+    max_restarts=10,
 ):
     section("INVERSE DESIGN — latent search + decode")
 
@@ -3566,7 +3683,14 @@ def run_inverse_design_pipeline(
         in_band_weight=in_band_weight,
         out_band_weight=out_band_weight,
         z_prior_weight=z_prior_weight,
+        z_prior_weight_end=z_prior_weight_end,
         deep_db=deep_db,
+        cosine_lr=cosine_lr,
+        early_stop_patience=early_stop_patience,
+        restart_patience=restart_patience,
+        restart_frac=restart_frac,
+        restart_noise=restart_noise,
+        max_restarts=max_restarts,
         seed=seed,
     )
 
@@ -3803,13 +3927,22 @@ if __name__ == "__main__":
         # ── ★ Inverse design: target S11/S22/S33 = 2/3/4 GHz, BW 100 MHz ──
         INV_CHANNEL_TARGET_FREQS = (2.0, 3.0, 4.0)
         INV_BANDWIDTH_GHZ = 0.1
-        INV_N_STARTS = 8
-        INV_N_ITERS = 500
+        INV_DEEP_DB = -15.0
+
+        # Tier 1 + Tier 2(a) — stronger optimizer
+        INV_N_STARTS = 32              # 8 → 32 (4배)
+        INV_N_ITERS = 2000             # 500 → 2000 (early stop 으로 줄어들 수 있음)
         INV_LR = 5e-2
         INV_IN_BAND_WEIGHT = 10.0
         INV_OUT_BAND_WEIGHT = 0.0
-        INV_Z_PRIOR_WEIGHT = 1e-3
-        INV_DEEP_DB = -15.0
+        INV_Z_PRIOR_WEIGHT = 1e-3      # 초기값
+        INV_Z_PRIOR_WEIGHT_END = 1e-5  # 종료값 (선형 감소)
+        INV_COSINE_LR = True           # cosine LR schedule
+        INV_EARLY_STOP_PATIENCE = 200  # 200 iter 정체 시 중단
+        INV_RESTART_PATIENCE = 80      # 80 iter 정체 시 worst restart
+        INV_RESTART_FRAC = 0.25        # 하위 25% 교체
+        INV_RESTART_NOISE = 0.3        # restart 시 noise 크기
+        INV_MAX_RESTARTS = 10          # 최대 restart 횟수
 
         if cfg.show_figures:
             try:
@@ -3826,8 +3959,15 @@ if __name__ == "__main__":
                     in_band_weight=INV_IN_BAND_WEIGHT,
                     out_band_weight=INV_OUT_BAND_WEIGHT,
                     z_prior_weight=INV_Z_PRIOR_WEIGHT,
+                    z_prior_weight_end=INV_Z_PRIOR_WEIGHT_END,
                     deep_db=INV_DEEP_DB,
                     seed=cfg.seed,
+                    cosine_lr=INV_COSINE_LR,
+                    early_stop_patience=INV_EARLY_STOP_PATIENCE,
+                    restart_patience=INV_RESTART_PATIENCE,
+                    restart_frac=INV_RESTART_FRAC,
+                    restart_noise=INV_RESTART_NOISE,
+                    max_restarts=INV_MAX_RESTARTS,
                 )
             except Exception as e:
                 import traceback as _tb
