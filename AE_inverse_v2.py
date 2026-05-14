@@ -98,6 +98,9 @@ CMD_NAME = {
 RETURN_PORT_PAIRS = ((1, 1), (2, 2), (3, 3))
 RETURN_LABELS = ["S11", "S22", "S33"]
 
+# ★ v2 (B1): role classification head 최대 sketch 슬롯
+MAX_SKETCHES = 16
+
 
 # ── Param slot indices in EXT token ──
 P_SCALE = 0
@@ -179,6 +182,18 @@ class CFG:
     use_geometric_pe: bool = True
     geo_pe_n_freqs: int = 6
     geo_pe_dropout: float = 0.1
+
+    # ★ v2 combo: data canonicalization + encoder shuffle aug + rank head
+    canonicalize_sketches: bool = True       # A1: 학습 데이터를 큰 sketch 먼저로 정렬
+    encoder_shuffle_aug: bool = True         # A2: encoder 입력만 무작위 셔플 (decoder target 은 canonical)
+    aug_seed: int = 1234
+    use_rank_head: bool = True               # B1: 각 sketch 의 size rank 분류 aux head
+    w_rank: float = 0.5                      # rank loss 가중치
+
+    # ★ v2 combo: inverse design 개선
+    inv_smooth_hinge: bool = True            # C1: ReLU² → SoftPlus² smooth hinge
+    inv_smooth_hinge_beta: float = 5.0
+    inv_lbfgs_iters: int = 50                # C2: Adam 끝나면 LBFGS 50 iter
 
     # aux numeric
     aux_numeric: bool = True
@@ -347,6 +362,86 @@ def ensure_eos_when_truncated(t, max_len):
     out[-1] = eos_row
 
     return out
+
+
+def _sketch_volume_from_ext_row(ext_row):
+    """EXT 토큰 row 에서 (scale^2 * (e1+e2)) 형식의 normalized 부피 계산."""
+    scale = int(ext_row[1 + P_SCALE])
+    e1 = int(ext_row[1 + P_E1])
+    e2 = int(ext_row[1 + P_E2])
+    sv = scale / QMAX if scale >= 0 else 0.5
+    e1v = e1 / QMAX if e1 >= 0 else 0.1
+    e2v = e2 / QMAX if e2 >= 0 else 0.0
+    return sv * sv * (e1v + e2v) + 1e-8
+
+
+def _split_sketch_chunks(tokens):
+    """tokens 를 sketch 청크 (SOL...EXT) 들과 tail(EOS+padding) 로 분리.
+
+    Returns: (chunks, tail) where
+      chunks: list of np.ndarray, 각 (chunk_len, 17)
+      tail:   np.ndarray (rest_len, 17)
+    """
+    cmd_seq = tokens[:, 0]
+    chunks = []
+    start = 0
+    last_idx = len(tokens)
+    for i in range(len(tokens)):
+        c = int(cmd_seq[i])
+        if c == EXT:
+            chunks.append(tokens[start:i + 1].copy())
+            start = i + 1
+        elif c == EOS or c < 0:
+            last_idx = i
+            break
+    tail = tokens[last_idx:].copy() if last_idx < len(tokens) else np.zeros((0, 17), dtype=tokens.dtype)
+    return chunks, tail
+
+
+def canonicalize_sketches(tokens):
+    """sketch 청크를 부피 큰 순으로 정렬 (largest first).
+    Decoder 가 항상 같은 의미적 순서로 출력하도록 학습되게 만듦.
+    """
+    tokens = np.asarray(tokens, dtype=np.int32)
+    chunks, tail = _split_sketch_chunks(tokens)
+    if len(chunks) <= 1:
+        return tokens.copy()
+
+    vols = np.array([_sketch_volume_from_ext_row(c[-1]) for c in chunks])
+    order = np.argsort(-vols)
+    sorted_chunks = [chunks[i] for i in order]
+    out = np.concatenate(sorted_chunks + ([tail] if tail.size else []), axis=0)
+
+    L = len(tokens)
+    if out.shape[0] < L:
+        pad = np.full((L - out.shape[0], 17), PAD_V, dtype=tokens.dtype)
+        out = np.concatenate([out, pad], axis=0)
+    return out[:L]
+
+
+def shuffle_sketches(tokens, rng):
+    """sketch 청크를 무작위 순서로 셔플 (encoder augmentation 용).
+    sketch 내부 토큰 순서는 그대로 유지, 청크 간 순서만 변경.
+
+    Args:
+        tokens: (L, 17) int array
+        rng: numpy random Generator
+    """
+    tokens = np.asarray(tokens, dtype=np.int32)
+    chunks, tail = _split_sketch_chunks(tokens)
+    if len(chunks) <= 1:
+        return tokens.copy()
+
+    perm = np.arange(len(chunks))
+    rng.shuffle(perm)
+    shuffled = [chunks[i] for i in perm]
+    out = np.concatenate(shuffled + ([tail] if tail.size else []), axis=0)
+
+    L = len(tokens)
+    if out.shape[0] < L:
+        pad = np.full((L - out.shape[0], 17), PAD_V, dtype=tokens.dtype)
+        out = np.concatenate([out, pad], axis=0)
+    return out[:L]
 
 
 def select_frequency_indices(raw_n_freq, target_n_freq, freq_start, freq_end, mode="linspace"):
@@ -1376,6 +1471,9 @@ class JointDataset(Dataset):
         interp_matrix,
         type_ids=None,
         type_names=None,
+        canonicalize=True,
+        encoder_shuffle_aug=False,
+        aug_seed=1234,
     ):
         self.npy_files = list(npy_files)
         self.max_len = max_len
@@ -1385,14 +1483,22 @@ class JointDataset(Dataset):
             jf = f.replace("_tokens.npy", "_deepcad.json")
             self.json_files.append(jf if os.path.exists(jf) else None)
 
-        self.raw = []
-        self.padded = []
+        # ★ v2: 옵션
+        self.do_canonicalize = bool(canonicalize)
+        self.encoder_shuffle_aug = bool(encoder_shuffle_aug)
+        self.aug_rng = np.random.default_rng(int(aug_seed))
+
+        self.raw = []          # 원본 (canonicalize 적용 안 됨)
+        self.raw_canon = []    # canonical (A1 적용)
+        self.padded = []       # canonical 패딩 (decoder target 용)
 
         for f in self.npy_files:
             t = np.load(f).astype(np.int32)
             t = ensure_eos_when_truncated(t, max_len)
             self.raw.append(t)
-            self.padded.append(self._pad(t))
+            t_canon = canonicalize_sketches(t) if self.do_canonicalize else t
+            self.raw_canon.append(t_canon)
+            self.padded.append(self._pad(t_canon))
 
         self.sparam_db = sparam_db.astype(np.float32)
         self.freqs = np.asarray(freqs, dtype=np.float32)
@@ -1467,25 +1573,40 @@ class JointDataset(Dataset):
     def __len__(self):
         return len(self.padded)
 
-    def __getitem__(self, idx):
+    def get_item_with_aug(self, idx, augment=False):
+        """augment=True 일 때 encoder 입력은 sketch 순서 셔플,
+        decoder target 은 canonical 유지."""
+        tok_canonical = self.padded[idx]
+        if augment and self.encoder_shuffle_aug:
+            # padded 가 float 이라 int 로 잠시 변환해 셔플
+            t_int = tok_canonical.astype(np.int32)
+            t_int = shuffle_sketches(t_int, self.aug_rng)
+            tok_enc = t_int.astype(np.float32)
+        else:
+            tok_enc = tok_canonical
         return (
-            torch.tensor(self.padded[idx], dtype=torch.float32),
+            torch.tensor(tok_enc, dtype=torch.float32),
+            torch.tensor(tok_canonical, dtype=torch.float32),
             torch.tensor(self.sparam_db[idx], dtype=torch.float32),
             torch.tensor(self.sparam_db_full[idx], dtype=torch.float32),
             torch.tensor(int(self.type_ids[idx]), dtype=torch.long),
         )
 
+    def __getitem__(self, idx):
+        return self.get_item_with_aug(idx, augment=False)
+
 
 class SubsetDataset(Dataset):
-    def __init__(self, dataset, indices):
+    def __init__(self, dataset, indices, augment=False):
         self.dataset = dataset
         self.indices = list(indices)
+        self.augment = bool(augment)
 
     def __len__(self):
         return len(self.indices)
 
     def __getitem__(self, i):
-        return self.dataset[self.indices[i]]
+        return self.dataset.get_item_with_aug(self.indices[i], augment=self.augment)
 
 
 # ============================================================
@@ -1652,6 +1773,7 @@ class DeepCADBaselineAE(nn.Module):
         use_geometric_pe=True,
         geo_pe_n_freqs=6,
         geo_pe_dropout=0.1,
+        use_rank_head=True,
     ):
         super().__init__()
 
@@ -1704,6 +1826,21 @@ class DeepCADBaselineAE(nn.Module):
         else:
             self.geo_emb = None
             self.geo_post_norm = None
+
+        # ★ v2 (B1): per-sketch rank classification head.
+        #   Encoder output 의 각 EXT 위치에서 그 sketch 의 size rank 를 예측.
+        self.use_rank_head = bool(use_rank_head)
+        if self.use_rank_head:
+            rh_hid = max(d_model // 2, 64)
+            self.rank_head = nn.Sequential(
+                nn.Linear(d_model, rh_hid),
+                nn.LayerNorm(rh_hid),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(rh_hid, MAX_SKETCHES),
+            )
+        else:
+            self.rank_head = None
 
         enc_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead,
@@ -1814,7 +1951,10 @@ class DeepCADBaselineAE(nn.Module):
 
         return emb, pad_mask
 
-    def encode(self, x, geo_feats=None):
+    def encode_with_extras(self, x, geo_feats=None):
+        """Returns (z, rank_logits, encoder_h, pad_mask).
+        rank_logits: (B, L, MAX_SKETCHES) — only if use_rank_head, else None.
+        """
         emb, pad_mask = self._content_embed(x)
         emb = self.pos_enc(emb)
 
@@ -1842,6 +1982,14 @@ class DeepCADBaselineAE(nn.Module):
             pooled = (h * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1.0)
             z = self.to_z(pooled)
 
+        rank_logits = None
+        if self.use_rank_head and self.rank_head is not None:
+            rank_logits = self.rank_head(h)  # (B, L, MAX_SKETCHES)
+
+        return z, rank_logits, h, pad_mask
+
+    def encode(self, x, geo_feats=None):
+        z, _, _, _ = self.encode_with_extras(x, geo_feats=geo_feats)
         return z
 
     def _memory_from_z(self, z):
@@ -1965,11 +2113,15 @@ class DeepCADBaselineAE(nn.Module):
             np.stack(cleaned, axis=0), dtype=torch.long, device=device,
         )
 
-    def forward(self, x):
-        z = self.encode(x)
-        cmd_logits, prm_logits = self.decode_teacher(z, x)
+    def forward(self, x_enc, x_dec=None):
+        """x_enc: encoder 입력 (셔플 가능). x_dec: decoder teacher target (canonical).
+        x_dec=None 이면 x_enc 와 동일하게 사용 (eval 또는 단순 사용)."""
+        if x_dec is None:
+            x_dec = x_enc
+        z, rank_logits, _, _ = self.encode_with_extras(x_enc)
+        cmd_logits, prm_logits = self.decode_teacher(z, x_dec)
         aux = self.aux_numeric_predict(z)
-        return cmd_logits, prm_logits, aux, z
+        return cmd_logits, prm_logits, aux, z, rank_logits
 
 
 # ══════════════════════════════════════════════════════════════
@@ -2090,6 +2242,45 @@ def vicreg_z_loss(z, var_target=1.0, eps=1e-4):
     return var_loss, cov_loss
 
 
+def rank_loss_fn(rank_logits, x_enc):
+    """x_enc 각 EXT 위치에서 그 sketch 의 size rank 를 예측하는 CE loss.
+    rank label 은 x_enc 자체에서 EXT slot 값으로 계산 (셔플된 순서 무관).
+    """
+    if rank_logits is None:
+        return None, 0
+    B, L, _ = x_enc.shape
+    device = rank_logits.device
+
+    x_np = x_enc.detach().cpu().numpy().astype(np.int32)
+
+    sel_logits = []
+    sel_targets = []
+
+    for b in range(B):
+        cmd_seq = x_np[b, :, 0]
+        ext_positions = np.where(cmd_seq == EXT)[0]
+        if len(ext_positions) == 0:
+            continue
+        vols = np.array([_sketch_volume_from_ext_row(x_np[b, ep]) for ep in ext_positions])
+        order = np.argsort(-vols)   # 0 = largest
+        ranks = np.zeros(len(ext_positions), dtype=np.int64)
+        for r, i in enumerate(order):
+            ranks[i] = r
+        for i, ep in enumerate(ext_positions):
+            if ranks[i] >= MAX_SKETCHES:
+                continue
+            sel_logits.append(rank_logits[b, int(ep)])
+            sel_targets.append(int(ranks[i]))
+
+    if not sel_logits:
+        return rank_logits.new_zeros(()), 0
+
+    logits_stack = torch.stack(sel_logits, dim=0)            # (N, MAX_SKETCHES)
+    targets_t = torch.tensor(sel_targets, device=device, dtype=torch.long)
+    loss = F.cross_entropy(logits_stack, targets_t)
+    return loss, len(sel_targets)
+
+
 # ══════════════════════════════════════════════════════════════
 # Epoch
 # ══════════════════════════════════════════════════════════════
@@ -2106,12 +2297,15 @@ def run_epoch(ae, mlp, loader, optimizer, device, cfg, interp_w, train_mode=True
         "var": 0.0, "cov": 0.0,
         "z_std": 0.0, "z_norm": 0.0,
         "res_abs": 0.0, "grad_norm": 0.0,
+        "rank": 0.0,
     }
     n = 0
 
     for batch in loader:
-        batch_tok, batch_sel_db, batch_full_db, _tid = batch
-        batch_tok = batch_tok.to(device)
+        # v2: 5-tuple (encoder 입력, decoder target, sel_db, full_db, type)
+        batch_tok_enc, batch_tok_dec, batch_sel_db, batch_full_db, _tid = batch
+        batch_tok_enc = batch_tok_enc.to(device)
+        batch_tok_dec = batch_tok_dec.to(device)
         batch_sel_db = batch_sel_db.to(device)
         batch_full_db = batch_full_db.to(device)
 
@@ -2119,10 +2313,13 @@ def run_epoch(ae, mlp, loader, optimizer, device, cfg, interp_w, train_mode=True
             optimizer.zero_grad(set_to_none=True)
 
         with torch.set_grad_enabled(train_mode):
-            cmd_logits, prm_logits, aux, z = ae(batch_tok)
+            cmd_logits, prm_logits, aux, z, rank_logits = ae(
+                batch_tok_enc, batch_tok_dec,
+            )
 
+            # Decoder target = canonical sequence
             ae_loss, ae_comp = ae_loss_fn(
-                cmd_logits, prm_logits, aux, batch_tok, cfg,
+                cmd_logits, prm_logits, aux, batch_tok_dec, cfg,
             )
 
             pred_sel_db, residual = mlp(z, return_parts=True)
@@ -2145,6 +2342,16 @@ def run_epoch(ae, mlp, loader, optimizer, device, cfg, interp_w, train_mode=True
                 var_loss = z.new_zeros(())
                 cov_loss = z.new_zeros(())
 
+            # ★ v2 (B1): rank classification aux loss (encoder input 기반)
+            rank_l = z.new_zeros(())
+            if (rank_logits is not None
+                    and getattr(cfg, "w_rank", 0.0) > 0
+                    and getattr(cfg, "use_rank_head", True)):
+                rank_l_val, _n_rank = rank_loss_fn(rank_logits, batch_tok_enc)
+                if rank_l_val is not None and _n_rank > 0:
+                    rank_l = rank_l_val
+                    total = total + cfg.w_rank * rank_l
+
             if train_mode:
                 total.backward()
                 params = list(ae.parameters()) + list(mlp.parameters())
@@ -2166,6 +2373,7 @@ def run_epoch(ae, mlp, loader, optimizer, device, cfg, interp_w, train_mode=True
             acc["z_std"] += float(z.std(dim=0).mean().item()) if z.size(0) > 1 else 0.0
             acc["z_norm"] += float(z.norm(dim=1).mean().item())
             acc["res_abs"] += float(residual.abs().mean().item())
+            acc["rank"] += float(rank_l.item()) if torch.is_tensor(rank_l) else 0.0
 
         n += 1
 
@@ -2294,7 +2502,8 @@ def evaluate_sparam_predictions(ae, mlp, dataset, val_idx_per_type, type_names, 
         all_residual = []
 
         for idx in idxs:
-            tok, true_sel_db, true_full_db, _tid = dataset[idx]
+            tok_enc, tok_dec, true_sel_db, true_full_db, _tid = dataset[idx]
+            tok = tok_enc
             tok = tok.unsqueeze(0).to(device)
 
             z = ae.encode(tok)
@@ -2823,6 +3032,9 @@ def load_multitype_data(cfg, script_dir):
         interp_matrix=interp_matrix,
         type_ids=type_ids,
         type_names=type_names,
+        canonicalize=getattr(cfg, "canonicalize_sketches", True),
+        encoder_shuffle_aug=getattr(cfg, "encoder_shuffle_aug", True),
+        aug_seed=getattr(cfg, "aug_seed", 1234),
     )
 
     return dataset, all_npy, type_ids, type_names, sparam_db, max_len
@@ -2889,8 +3101,8 @@ def train_fixed_medium_var(
     print(f"  selected_n_freq     : {cfg.n_freq}")
     print(f"  full_n_freq         : {cfg.raw_n_freq}")
 
-    train_set = SubsetDataset(dataset, train_idx)
-    val_set = SubsetDataset(dataset, val_idx)
+    train_set = SubsetDataset(dataset, train_idx, augment=True)   # encoder shuffle aug 사용 (dataset 의 플래그가 켜져있어야 실제 적용)
+    val_set = SubsetDataset(dataset, val_idx, augment=False)
 
     train_loader = DataLoader(
         train_set, batch_size=cfg.batch_size, shuffle=True, num_workers=0,
@@ -2917,6 +3129,7 @@ def train_fixed_medium_var(
         use_geometric_pe=getattr(cfg, "use_geometric_pe", True),
         geo_pe_n_freqs=getattr(cfg, "geo_pe_n_freqs", 6),
         geo_pe_dropout=getattr(cfg, "geo_pe_dropout", 0.1),
+        use_rank_head=getattr(cfg, "use_rank_head", True),
     ).to(device)
 
     mlp = SparamCommonResidualMLP(
@@ -2943,6 +3156,9 @@ def train_fixed_medium_var(
           f"{getattr(cfg, 'use_geometric_pe', True)} "
           f"(n_freqs={getattr(cfg, 'geo_pe_n_freqs', 6)}, "
           f"features={N_GEO_FEAT})")
+    print(f"  Canonicalize        : {getattr(cfg, 'canonicalize_sketches', True)} (largest-first)")
+    print(f"  Encoder shuffle aug : {getattr(cfg, 'encoder_shuffle_aug', True)}")
+    print(f"  Rank head           : {getattr(cfg, 'use_rank_head', True)} (w_rank={getattr(cfg, 'w_rank', 0.5)})")
     print(f"  selected output dim : {cfg.n_freq * 3}")
     print(f"  full target dim     : {cfg.raw_n_freq * 3}")
 
@@ -3219,6 +3435,10 @@ def inverse_design_optimize(
     restart_frac=0.25,
     restart_noise=0.3,
     max_restarts=10,
+    # ★ v2 (C1, C2)
+    smooth_hinge=True,
+    smooth_hinge_beta=5.0,
+    lbfgs_iters=50,
 ):
     """Multi-start latent optimization with cosine LR + prior decay + random restart.
 
@@ -3319,7 +3539,12 @@ def inverse_design_optimize(
         pred_full = interpolate_selected_to_full_torch(pred_sel, interp_w)
 
         diff = pred_full - target_full_t.unsqueeze(0)
-        in_band_violation_sq = F.relu(diff) ** 2
+        if smooth_hinge:
+            # ★ C1: SoftPlus² hinge — spec 정확히 만족해도 gradient 흐름
+            in_band_violation = F.softplus(diff * smooth_hinge_beta) / smooth_hinge_beta
+            in_band_violation_sq = in_band_violation ** 2
+        else:
+            in_band_violation_sq = F.relu(diff) ** 2
         out_band_sq = diff ** 2
 
         in_band = (
@@ -3417,12 +3642,74 @@ def inverse_design_optimize(
         f"restarts={restart_count}, early_stopped={early_stopped}"
     )
 
+    # ★ C2: LBFGS finetune — best_z 만 정밀화
+    lbfgs_improved = False
+    if best_z is not None and lbfgs_iters and lbfgs_iters > 0:
+        print(f"\n  LBFGS finetune  (best_z, max_iter={lbfgs_iters})")
+        z_lb = best_z.clone().detach().requires_grad_(True)
+
+        def _match_only_loss(zz):
+            ps = mlp(zz)
+            pf = interpolate_selected_to_full_torch(ps, interp_w)
+            d = pf - target_full_t.unsqueeze(0)
+            if smooth_hinge:
+                ib_v = F.softplus(d * smooth_hinge_beta) / smooth_hinge_beta
+                ib_sq = ib_v ** 2
+            else:
+                ib_sq = F.relu(d) ** 2
+            ib = (ib_sq * masks_t.unsqueeze(0).float()).sum(dim=1) / in_band_count
+            out_sq = d ** 2
+            ob = (out_sq * (~masks_t).unsqueeze(0).float()).sum(dim=1) / out_band_count
+            return (in_band_weight * ib + out_band_weight * ob).mean()
+
+        try:
+            opt_lb = torch.optim.LBFGS(
+                [z_lb], lr=0.1, max_iter=int(lbfgs_iters),
+                line_search_fn="strong_wolfe",
+                tolerance_grad=1e-7, tolerance_change=1e-9,
+            )
+
+            def closure():
+                opt_lb.zero_grad()
+                loss = _match_only_loss(z_lb)
+                loss.backward()
+                return loss
+
+            opt_lb.step(closure)
+
+            with torch.no_grad():
+                ps_lb = mlp(z_lb)
+                pf_lb = interpolate_selected_to_full_torch(ps_lb, interp_w)
+                d_lb = pf_lb - target_full_t.unsqueeze(0)
+                # 평가는 hard hinge 로 (공정 비교)
+                ib_lb = (F.relu(d_lb) ** 2 * masks_t.unsqueeze(0).float()
+                         ).sum(dim=1) / in_band_count
+                ob_lb = (d_lb ** 2 * (~masks_t).unsqueeze(0).float()
+                         ).sum(dim=1) / out_band_count
+                match_lb = (in_band_weight * ib_lb + out_band_weight * ob_lb
+                            ).mean(dim=-1).item()
+
+                if match_lb < best_loss - 1e-8:
+                    best_loss = match_lb
+                    best_z = z_lb.detach().clone()
+                    best_pred_full = pf_lb[0].detach().cpu().numpy()
+                    best_in_band = ib_lb[0].detach().cpu().numpy()
+                    lbfgs_improved = True
+                    print(f"    LBFGS improved best loss → {best_loss:.4f}")
+                else:
+                    print(f"    LBFGS did not improve (was {best_loss:.4f}, got {match_lb:.4f})")
+        except Exception as e:
+            import traceback as _tb
+            print(f"    ⚠ LBFGS failed: {type(e).__name__}: {e}")
+            _tb.print_exc()
+
     return {
         "best_z": best_z,
         "best_loss": best_loss,
         "best_pred_full": best_pred_full,
         "best_in_band_mse": best_in_band,
         "best_start_idx": best_start_idx,
+        "lbfgs_improved": lbfgs_improved,
         "target_full": target_full,
         "masks": masks,
         "freqs_full": np.asarray(dataset.freqs_full, dtype=np.float32),
@@ -3983,6 +4270,9 @@ def run_inverse_design_pipeline(
     restart_noise=0.3,
     max_restarts=10,
     separate_windows=False,
+    smooth_hinge=True,
+    smooth_hinge_beta=5.0,
+    lbfgs_iters=50,
 ):
     section("INVERSE DESIGN — latent search + decode")
 
@@ -4015,6 +4305,9 @@ def run_inverse_design_pipeline(
         restart_frac=restart_frac,
         restart_noise=restart_noise,
         max_restarts=max_restarts,
+        smooth_hinge=smooth_hinge,
+        smooth_hinge_beta=smooth_hinge_beta,
+        lbfgs_iters=lbfgs_iters,
         seed=seed,
     )
 
@@ -4300,6 +4593,9 @@ if __name__ == "__main__":
                     restart_noise=INV_RESTART_NOISE,
                     max_restarts=INV_MAX_RESTARTS,
                     separate_windows=INV_SEPARATE_WINDOWS,
+                    smooth_hinge=getattr(cfg, "inv_smooth_hinge", True),
+                    smooth_hinge_beta=getattr(cfg, "inv_smooth_hinge_beta", 5.0),
+                    lbfgs_iters=getattr(cfg, "inv_lbfgs_iters", 50),
                 )
             except Exception as e:
                 import traceback as _tb
