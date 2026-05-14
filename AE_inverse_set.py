@@ -407,17 +407,16 @@ def shuffle_bodies_batch(batch_tok, max_len=None, rng=None):
     """
     batch_tok: torch tensor [B, L, 17].
     각 sample 마다 body 순서를 셔플해서 같은 shape tensor 반환 (같은 device).
-    max_len 은 명시 안 하면 tensor 의 실제 L 차원 사용.
+    max_len 인자는 무시한다 (구버전 호출 호환 목적으로만 남겨둠).
+    출력 shape 은 항상 입력 batch_tok 의 [B, L, 17] 과 동일.
     """
     device = batch_tok.device
     dtype = batch_tok.dtype
     arr = batch_tok.detach().cpu().numpy()
     L = int(arr.shape[1])
-    if max_len is None:
-        max_len = L
     out = np.empty_like(arr)
     for i in range(arr.shape[0]):
-        out[i] = shuffle_bodies_tokens(arr[i], max_len, rng=rng)
+        out[i] = shuffle_bodies_tokens(arr[i], L, rng=rng)
     return torch.from_numpy(out).to(device=device, dtype=dtype)
 
 
