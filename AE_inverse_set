@@ -958,6 +958,14 @@ class BodySetAE(nn.Module):
         emb, tok_pad = self._embed_body_tokens(flat)
         emb = self.body_pos_enc(emb)
 
+        # PyTorch transformer는 src_key_padding_mask 한 행이 전부 True면
+        # softmax(-inf,...) = NaN을 낸다. fully-masked body의 첫 토큰만
+        # unmask해서 회피. 어차피 body_emb는 아래에서 0으로 덮어쓴다.
+        all_pad = tok_pad.all(dim=1)
+        if bool(all_pad.any()):
+            tok_pad = tok_pad.clone()
+            tok_pad[all_pad, 0] = False
+
         h = self.body_encoder(
             emb,
             src_key_padding_mask=tok_pad,
@@ -967,10 +975,23 @@ class BodySetAE(nn.Module):
         body_emb = (h * valid_tok).sum(dim=1) / valid_tok.sum(dim=1).clamp(min=1.0)
         body_emb = body_emb.view(B, M, self.d_model)
 
+        # body_mask=False 인 slot은 그냥 0으로. (0 * NaN = NaN 방지)
+        body_emb = torch.where(
+            body_mask.unsqueeze(-1),
+            body_emb,
+            torch.zeros_like(body_emb),
+        )
+
         # body order를 알려주는 positional embedding을 넣지 않는다.
         set_h = self.set_encoder(
             body_emb,
             src_key_padding_mask=~body_mask,
+        )
+
+        set_h = torch.where(
+            body_mask.unsqueeze(-1),
+            set_h,
+            torch.zeros_like(set_h),
         )
 
         valid_body = body_mask.float().unsqueeze(-1)
@@ -1158,7 +1179,12 @@ def _body_pair_cost_matrix(cmd_logits_i, prm_logits_i, true_bodies_i, true_mask_
 
         costs.append(torch.stack(row_costs))
 
-    return torch.stack(costs, dim=0), true_ids
+    cost_mat = torch.stack(costs, dim=0)
+    # Hungarian이 NaN/Inf를 거부하므로 방어적 sanitize.
+    if not torch.isfinite(cost_mat).all():
+        cost_mat = torch.nan_to_num(cost_mat, nan=1e6, posinf=1e6, neginf=-1e6)
+
+    return cost_mat, true_ids
 
 
 def _hungarian_assign(cost_np):
