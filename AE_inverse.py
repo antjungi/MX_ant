@@ -3055,7 +3055,7 @@ def visualize_inverse_design_curve(result):
     deep_db = result["deep_db"]
 
     fig, axes = plt.subplots(
-        1, 3, figsize=(15, 4.5), facecolor="white", sharey=True,
+        1, 3, figsize=(15, 4.5), facecolor="white", sharey=False,
     )
     fig.suptitle(
         f"Inverse design — surrogate prediction vs spec (≤ {deep_db:.0f} dB in band)",
@@ -3070,11 +3070,19 @@ def visualize_inverse_design_curve(result):
     band_color = "#3F6E5C"
     spec_color = "#2E4172"
     pred_color = "#E07B5B"
+    ref_color = "#888888"
+    ref_db = -10.0
 
     for c, lbl in enumerate(RETURN_LABELS):
         ax = axes[c]
         f0 = target_freqs[c]
         f_lo, f_hi = f0 - bw / 2.0, f0 + bw / 2.0
+
+        # -10 dB reference (전 주파수 점선)
+        ax.axhline(
+            ref_db, color=ref_color, ls=":", lw=0.8, alpha=0.7,
+            label=f"{ref_db:.0f} dB ref",
+        )
 
         # surrogate 예측 (얇게)
         ax.plot(
@@ -3126,9 +3134,9 @@ def visualize_inverse_design_curve(result):
 
         ax.set_title(title, fontsize=9, fontweight="normal")
         ax.set_xlabel("frequency [GHz]")
-        if c == 0:
-            ax.set_ylabel("|S| [dB]")
+        ax.set_ylabel("|S| [dB]")
         ax.set_ylim(ymin, ymax)
+        ax.tick_params(axis="y", labelleft=True)
         ax.grid(True, alpha=0.15, lw=0.4)
         ax.legend(fontsize=8, loc="lower left", framealpha=0.85)
 
@@ -3376,7 +3384,7 @@ if __name__ == "__main__":
     # ---------------------------------------------------------
     # 실행 설정
     # ---------------------------------------------------------
-    PRESET = "small"
+    PRESET = "tiny"
     LOG_VERBOSITY = "simple"
 
     USE_TYPES = [1, 2]
@@ -3560,7 +3568,7 @@ if __name__ == "__main__":
         INV_IN_BAND_WEIGHT = 10.0
         INV_OUT_BAND_WEIGHT = 0.0
         INV_Z_PRIOR_WEIGHT = 1e-3
-        INV_DEEP_DB = -20.0
+        INV_DEEP_DB = -15.0
 
         if cfg.show_figures:
             try:
