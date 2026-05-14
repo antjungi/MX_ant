@@ -2887,6 +2887,342 @@ def train_fixed_medium_var(
 
 
 # ══════════════════════════════════════════════════════════════
+# Inverse design (latent optimization via surrogate)
+# ══════════════════════════════════════════════════════════════
+def make_target_db_curve(
+    freqs_full,
+    channel_target_freqs,
+    bandwidth_ghz,
+    deep_db=-20.0,
+    flat_db=0.0,
+):
+    """채널별 target 주파수에서 bandwidth 안만 deep_db, 외부는 flat_db."""
+    freqs_full = np.asarray(freqs_full, dtype=np.float32)
+    n_freq = len(freqs_full)
+    n_ch = len(channel_target_freqs)
+
+    target = np.full((n_freq, n_ch), flat_db, dtype=np.float32)
+    masks = np.zeros((n_freq, n_ch), dtype=bool)
+
+    half_bw = bandwidth_ghz / 2.0
+    for c, f0 in enumerate(channel_target_freqs):
+        m = np.abs(freqs_full - f0) <= half_bw
+        target[m, c] = deep_db
+        masks[:, c] = m
+
+    return target, masks
+
+
+def inverse_design_optimize(
+    ae,
+    mlp,
+    dataset,
+    channel_target_freqs,
+    bandwidth_ghz,
+    device,
+    n_starts=8,
+    n_iters=500,
+    lr=5e-2,
+    in_band_weight=10.0,
+    out_band_weight=0.0,
+    z_prior_weight=1e-3,
+    deep_db=-20.0,
+    flat_db=0.0,
+    seed=0,
+    verbose_every=50,
+):
+    """Multi-start latent optimization.
+    - 학습 dataset 의 latent 분포에서 prior 통계를 계산
+    - n_starts 후보를 학습 latent 중에서 무작위 초기화
+    - surrogate(z) → full-grid dB → target 매칭 loss + latent prior reg
+    - 최적 후보 1개의 z 와 예측 곡선 반환
+    """
+    ae.eval()
+    mlp.eval()
+
+    all_indices = list(range(len(dataset)))
+    z_prior, _ = collect_latents(ae, dataset, all_indices, device)
+    z_prior_t = torch.tensor(z_prior, dtype=torch.float32, device=device)
+    z_mean = z_prior_t.mean(dim=0)
+    z_std = z_prior_t.std(dim=0).clamp(min=1e-3)
+
+    target_full, masks = make_target_db_curve(
+        dataset.freqs_full,
+        channel_target_freqs,
+        bandwidth_ghz,
+        deep_db=deep_db,
+        flat_db=flat_db,
+    )
+    target_full_t = torch.tensor(target_full, dtype=torch.float32, device=device)
+    masks_t = torch.tensor(masks, dtype=torch.bool, device=device)
+
+    interp_w = torch.tensor(
+        dataset.interp_matrix, dtype=torch.float32, device=device,
+    )
+
+    rng = np.random.default_rng(seed)
+    n_starts = min(int(n_starts), z_prior_t.size(0))
+    init_idx = rng.choice(z_prior_t.size(0), size=n_starts, replace=False)
+    z_init = z_prior_t[init_idx].clone()
+
+    z = z_init.clone().detach().requires_grad_(True)
+    optimizer = torch.optim.Adam([z], lr=lr)
+
+    best_z = None
+    best_loss = float("inf")
+    best_pred_full = None
+    best_in_band = None
+    best_start_idx = -1
+
+    in_band_count = masks_t.float().sum(dim=0).clamp(min=1.0).unsqueeze(0)
+    out_band_count = (~masks_t).float().sum(dim=0).clamp(min=1.0).unsqueeze(0)
+
+    print(f"  multi-start optimization | n_starts={n_starts}, n_iters={n_iters}, lr={lr}")
+    print(f"  loss weights: in_band={in_band_weight}, out_band={out_band_weight}, z_prior={z_prior_weight}")
+    print(f"  target: deep_db={deep_db}, flat_db={flat_db}")
+
+    for it in range(n_iters):
+        optimizer.zero_grad()
+
+        pred_sel = mlp(z)
+        pred_full = interpolate_selected_to_full_torch(pred_sel, interp_w)
+
+        diff_sq = (pred_full - target_full_t.unsqueeze(0)) ** 2
+
+        in_band = (
+            diff_sq * masks_t.unsqueeze(0).float()
+        ).sum(dim=1) / in_band_count
+        out_band = (
+            diff_sq * (~masks_t).unsqueeze(0).float()
+        ).sum(dim=1) / out_band_count
+
+        match_per = (
+            in_band_weight * in_band + out_band_weight * out_band
+        ).mean(dim=-1)
+
+        z_reg_per = (((z - z_mean) / z_std) ** 2).mean(dim=-1)
+        total_per = match_per + z_prior_weight * z_reg_per
+        loss = total_per.sum()
+
+        loss.backward()
+        optimizer.step()
+
+        with torch.no_grad():
+            bi = int(torch.argmin(match_per).item())
+            cur = float(match_per[bi].item())
+            if cur < best_loss:
+                best_loss = cur
+                best_z = z[bi:bi + 1].detach().clone()
+                best_pred_full = pred_full[bi].detach().cpu().numpy()
+                best_in_band = in_band[bi].detach().cpu().numpy()
+                best_start_idx = bi
+
+        if it == 0 or (it + 1) % verbose_every == 0 or it == n_iters - 1:
+            with torch.no_grad():
+                avg = float(match_per.mean().item())
+                zr = float(z_reg_per.mean().item())
+                print(
+                    f"    iter {it + 1:4d}/{n_iters} | best_match={best_loss:.4f} | "
+                    f"avg_match={avg:.4f} | mean_z_reg={zr:.3f}"
+                )
+
+    return {
+        "best_z": best_z,
+        "best_loss": best_loss,
+        "best_pred_full": best_pred_full,
+        "best_in_band_mse": best_in_band,
+        "best_start_idx": best_start_idx,
+        "target_full": target_full,
+        "masks": masks,
+        "freqs_full": np.asarray(dataset.freqs_full, dtype=np.float32),
+        "channel_target_freqs": list(channel_target_freqs),
+        "bandwidth_ghz": float(bandwidth_ghz),
+        "deep_db": float(deep_db),
+        "flat_db": float(flat_db),
+    }
+
+
+def visualize_inverse_design_curve(result):
+    freqs = result["freqs_full"]
+    target = result["target_full"]
+    pred = result["best_pred_full"]
+    target_freqs = result["channel_target_freqs"]
+    bw = result["bandwidth_ghz"]
+    in_band_mse = result["best_in_band_mse"]
+
+    fig, axes = plt.subplots(
+        1, 3, figsize=(15, 4.5), facecolor="white", sharey=True,
+    )
+    fig.suptitle(
+        "Inverse design — target vs surrogate prediction",
+        fontsize=11, color="#222", y=1.0,
+    )
+
+    for c, lbl in enumerate(RETURN_LABELS):
+        ax = axes[c]
+        f0 = target_freqs[c]
+
+        ax.axvspan(
+            f0 - bw / 2, f0 + bw / 2,
+            color="#3F6E5C", alpha=0.12,
+            label=f"band ±{bw / 2 * 1000:.0f} MHz",
+        )
+        ax.axvline(f0, color="#3F6E5C", ls=":", lw=1)
+
+        ax.plot(freqs, target[:, c], color="#2E4172", lw=2.0, label="target")
+        ax.plot(
+            freqs, pred[:, c],
+            color="#E07B5B", lw=1.8, ls="--", label="surrogate pred",
+        )
+
+        ax.set_title(
+            f"{lbl}  target={f0:.2f} GHz  in-band MSE={in_band_mse[c]:.2f}",
+            fontsize=9, fontweight="normal",
+        )
+        ax.set_xlabel("frequency [GHz]")
+        if c == 0:
+            ax.set_ylabel("|S| [dB]")
+        ax.grid(True, alpha=0.25)
+        ax.legend(fontsize=8, loc="lower left", framealpha=0.85)
+
+    plt.tight_layout()
+    print(f"  ✓ inverse design curve figure 생성")
+
+
+@torch.no_grad()
+def visualize_decoded_structure(
+    ae, z, dataset, device, title="Decoded structure",
+):
+    """latent z → AE.generate() → normalized 3D + Top view."""
+    ae.eval()
+
+    gen = ae.generate(z, max_gen_len=dataset.max_len)
+    recon = gen[0].detach().cpu().numpy().astype(np.int32)
+    recon_trim = trim_after_eos(recon)
+
+    sketches = tokens_to_sketches_normalized(recon_trim)
+
+    fig = plt.figure(figsize=(12, 6), facecolor="white")
+    fig.suptitle(
+        f"{title}\n{recon_trim.shape[0]} tokens · "
+        f"{len(sketches)} extrude · "
+        f"{sum(len(s['loops_2d']) for s in sketches)} loop",
+        fontsize=11, color="#222", y=0.98,
+    )
+
+    views = [
+        (1, "3D View", 28, -55),
+        (2, "Top View", 89.9, -90.0),
+    ]
+
+    for slot, label, elev, azim in views:
+        ax = fig.add_subplot(1, 2, slot, projection="3d")
+        if not sketches:
+            ax.text2D(
+                0.5, 0.5, "(empty)",
+                color="#888", ha="center", va="center",
+                fontsize=11, transform=ax.transAxes,
+            )
+            _style(ax, label)
+            ax.view_init(elev=elev, azim=azim)
+            continue
+        _set_axes_and_render(ax, sketches, use_real=False)
+        _style(ax, label)
+        ax.view_init(elev=elev, azim=azim)
+
+    if sketches:
+        fig.legend(
+            handles=[
+                mpatches.Patch(color=PAL[i % len(PAL)], label=f"Sketch {i + 1}")
+                for i in range(len(sketches))
+            ],
+            loc="lower center", ncol=min(len(sketches), 6),
+            facecolor="white", edgecolor="#ddd", labelcolor="#444",
+            fontsize=9, framealpha=0.95,
+        )
+
+    plt.tight_layout(rect=[0, 0.04, 1, 0.95])
+    print(f"  ✓ decoded structure figure 생성 (tokens={recon_trim.shape[0]})")
+
+    return recon_trim, sketches
+
+
+def run_inverse_design_pipeline(
+    ae,
+    mlp,
+    dataset,
+    device,
+    channel_target_freqs=(2.0, 3.0, 4.0),
+    bandwidth_ghz=0.1,
+    n_starts=8,
+    n_iters=500,
+    lr=5e-2,
+    in_band_weight=10.0,
+    out_band_weight=0.0,
+    z_prior_weight=1e-3,
+    deep_db=-20.0,
+    seed=0,
+):
+    section("INVERSE DESIGN — latent search + decode")
+
+    print(f"  Targets")
+    for c, lbl in enumerate(RETURN_LABELS):
+        f0 = channel_target_freqs[c]
+        print(
+            f"    {lbl}: f={f0:.2f} GHz, band=±{bandwidth_ghz / 2 * 1000:.0f} MHz, "
+            f"deep_db={deep_db}"
+        )
+
+    result = inverse_design_optimize(
+        ae=ae,
+        mlp=mlp,
+        dataset=dataset,
+        channel_target_freqs=channel_target_freqs,
+        bandwidth_ghz=bandwidth_ghz,
+        device=device,
+        n_starts=n_starts,
+        n_iters=n_iters,
+        lr=lr,
+        in_band_weight=in_band_weight,
+        out_band_weight=out_band_weight,
+        z_prior_weight=z_prior_weight,
+        deep_db=deep_db,
+        seed=seed,
+    )
+
+    print(f"\n  Optimization result")
+    print(f"    best match loss  : {result['best_loss']:.4f}")
+    print(f"    best start index : {result['best_start_idx']}")
+    print(f"    in-band MSE      : "
+          f"S11={result['best_in_band_mse'][0]:.3f}  "
+          f"S22={result['best_in_band_mse'][1]:.3f}  "
+          f"S33={result['best_in_band_mse'][2]:.3f}")
+
+    subsection("Inverse design — S-param curve figure")
+    try:
+        visualize_inverse_design_curve(result)
+    except Exception as e:
+        import traceback as _tb
+        print(f"  ⚠ visualize_inverse_design_curve failed: {type(e).__name__}: {e}")
+        _tb.print_exc()
+
+    subsection("Inverse design — decoded structure figure")
+    try:
+        recon_trim, sketches = visualize_decoded_structure(
+            ae, result["best_z"], dataset, device,
+            title="Inverse-designed structure (decoded from optimal z)",
+        )
+        result["decoded_tokens"] = recon_trim
+        result["decoded_n_sketches"] = len(sketches)
+    except Exception as e:
+        import traceback as _tb
+        print(f"  ⚠ visualize_decoded_structure failed: {type(e).__name__}: {e}")
+        _tb.print_exc()
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════════
 # Main
 # ══════════════════════════════════════════════════════════════
 if __name__ == "__main__":
@@ -3083,6 +3419,40 @@ if __name__ == "__main__":
             common_curve=common_curve,
             device=device,
         )
+
+        # ── ★ Inverse design: target S11/S22/S33 = 2/3/4 GHz, BW 100 MHz ──
+        INV_CHANNEL_TARGET_FREQS = (2.0, 3.0, 4.0)
+        INV_BANDWIDTH_GHZ = 0.1
+        INV_N_STARTS = 8
+        INV_N_ITERS = 500
+        INV_LR = 5e-2
+        INV_IN_BAND_WEIGHT = 10.0
+        INV_OUT_BAND_WEIGHT = 0.0
+        INV_Z_PRIOR_WEIGHT = 1e-3
+        INV_DEEP_DB = -20.0
+
+        if cfg.show_figures:
+            try:
+                inv_result = run_inverse_design_pipeline(
+                    ae=ae,
+                    mlp=mlp,
+                    dataset=dataset,
+                    device=device,
+                    channel_target_freqs=INV_CHANNEL_TARGET_FREQS,
+                    bandwidth_ghz=INV_BANDWIDTH_GHZ,
+                    n_starts=INV_N_STARTS,
+                    n_iters=INV_N_ITERS,
+                    lr=INV_LR,
+                    in_band_weight=INV_IN_BAND_WEIGHT,
+                    out_band_weight=INV_OUT_BAND_WEIGHT,
+                    z_prior_weight=INV_Z_PRIOR_WEIGHT,
+                    deep_db=INV_DEEP_DB,
+                    seed=cfg.seed,
+                )
+            except Exception as e:
+                import traceback as _tb
+                print(f"\n[INVERSE DESIGN] failed: {type(e).__name__}: {e}")
+                _tb.print_exc()
 
         section("DONE")
         print(f"  Final eval_full RMSE : {result['eval_full']:.4f} dB")
