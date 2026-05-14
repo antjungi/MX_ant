@@ -3097,11 +3097,27 @@ if __name__ == "__main__":
 
         # plt.show() 는 blocking — 사용자가 창 닫을 때까지 대기.
         # 이 대기 시간은 위에서 측정한 elapsed 에 안 들어감.
+        # ★ Ctrl+C 로 즉시 종료 가능하도록 SIGINT 를 기본(프로세스 kill)으로 복원.
+        #   matplotlib GUI mainloop 가 SIGINT 를 가로채서 Python 에 안 넘기는 백엔드
+        #   (특히 TkAgg) 에서 Ctrl+C 가 먹지 않는 문제를 해결.
+        import signal as _signal
+        try:
+            _signal.signal(_signal.SIGINT, _signal.SIG_DFL)
+        except Exception:
+            pass
+
         if cfg.show_figures and len(plt.get_fignums()) > 0:
             try:
                 plt.show()
+            except KeyboardInterrupt:
+                print("\n[Ctrl+C] closing figures and exiting")
             except Exception as e:
                 print(f"  ⚠ plt.show() failed: {type(e).__name__}: {e}")
+            finally:
+                try:
+                    plt.close("all")
+                except Exception:
+                    pass
 
     except Exception as e:
         import traceback
