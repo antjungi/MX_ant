@@ -205,26 +205,6 @@ class CFG:
 
 
 PRESETS = {
-    "test": dict(
-        # ★ 1-loop sanity check 용 (≈30 초 목표).
-        #   학습 품질은 신경 쓰지 말고 파이프라인 통과만 확인.
-        n_samples_each=30,
-        epochs=3,
-        warmup=1,
-        batch_size=4,
-        d_model=64,
-        d_param=16,
-        nhead=4,
-        n_enc=1,
-        n_dec=1,
-        d_ff=128,
-        latent=64,
-        mem_tokens=4,
-        dropout=0.0,
-        mlp_hidden_mult=1.0,
-        mlp_dropout=0.0,
-        weight_decay=1e-3,
-    ),
     "tiny": dict(
         n_samples_each=300,
         epochs=80,
@@ -750,311 +730,6 @@ def tokens_to_real_sketches(tokens: np.ndarray, dq_meta: dict) -> list:
 
     return sketches
 
-
-# ══════════════════════════════════════════════════════════════
-# STEP export (CadQuery 기반, HFSS import 용)
-# ══════════════════════════════════════════════════════════════
-def _tokens_to_curve_sketches(tokens, dq_meta):
-    """Decoded tokens → 곡선 타입 보존한 sketch 데이터 list.
-    tokens_to_real_sketches() 와 달리 ARC/CIRCLE 을 polyline 으로 펴지 않고
-    (kind, params) 로 저장. STEP 출력 시 진짜 ARC/CIRCLE entity 로 변환 가능.
-
-    반환: list of dict {
-        origin, x_axis, y_axis, z_axis,
-        loops: list of list of (kind, *params),
-        extent_one, extent_two, bool_op, etype,
-    }
-    """
-    if dq_meta is None:
-        return []
-
-    sk_metas = dq_meta["sketches"]
-    max_ext = dq_meta["max_ext"]
-
-    sketches = []
-    cur_loops = []
-    cur_curves = []
-    cur_2d = (0.0, 0.0)
-    sketch_idx = 0
-
-    for row in tokens:
-        cmd = int(row[0])
-        p = row[1:]
-
-        if sketch_idx >= len(sk_metas):
-            if cmd == EOS:
-                break
-            if cmd == EXT:
-                sketch_idx += 1
-            continue
-
-        sm = sk_metas[sketch_idx]
-
-        if cmd == SOL:
-            if cur_curves:
-                cur_loops.append(cur_curves)
-            cur_curves = []
-            cur_2d = (0.0, 0.0)
-
-        elif cmd == LINE:
-            if p[0] < 0 or p[1] < 0:
-                continue
-            ex = _dequant(p[0], sm["xy_min"][0], sm["xy_max"][0])
-            ey = _dequant(p[1], sm["xy_min"][1], sm["xy_max"][1])
-            cur_curves.append(("line", (cur_2d[0], cur_2d[1]), (ex, ey)))
-            cur_2d = (ex, ey)
-
-        elif cmd == ARC:
-            if any(p[i] < 0 for i in range(4)):
-                continue
-            mx = _dequant(p[0], sm["xy_min"][0], sm["xy_max"][0])
-            my = _dequant(p[1], sm["xy_min"][1], sm["xy_max"][1])
-            ex = _dequant(p[2], sm["xy_min"][0], sm["xy_max"][0])
-            ey = _dequant(p[3], sm["xy_min"][1], sm["xy_max"][1])
-            cur_curves.append(
-                ("arc", (cur_2d[0], cur_2d[1]), (mx, my), (ex, ey))
-            )
-            cur_2d = (ex, ey)
-
-        elif cmd == CIRCLE:
-            if any(p[i] < 0 for i in range(3)):
-                continue
-            cx = _dequant(p[0], sm["xy_min"][0], sm["xy_max"][0])
-            cy = _dequant(p[1], sm["xy_min"][1], sm["xy_max"][1])
-            r = (p[2] / QMAX) * sm["sk_scale"]
-            # circle 은 자체 loop. 진행 중인 curve list 가 있으면 먼저 마감.
-            if cur_curves:
-                cur_loops.append(cur_curves)
-                cur_curves = []
-            cur_loops.append([("circle", (cx, cy), float(r))])
-
-        elif cmd == EXT:
-            if cur_curves:
-                cur_loops.append(cur_curves)
-                cur_curves = []
-            if cur_loops:
-                e1 = _dequant(p[P_E1], 0, max_ext)
-                e2 = _dequant(p[P_E2], 0, max_ext) if int(p[P_E2]) >= 0 else 0.0
-                bool_op = int(p[P_BOOL]) if int(p[P_BOOL]) >= 0 else 0
-                etype = int(p[P_ETYPE]) if int(p[P_ETYPE]) >= 0 else 0
-                sketches.append({
-                    "sketch_idx": sketch_idx,
-                    "origin": np.asarray(sm["origin"], dtype=float),
-                    "x_axis": np.asarray(sm["x_axis"], dtype=float),
-                    "y_axis": np.asarray(sm["y_axis"], dtype=float),
-                    "z_axis": np.asarray(sm["z_axis"], dtype=float),
-                    "loops": cur_loops,
-                    "extent_one": float(e1),
-                    "extent_two": float(e2),
-                    "bool_op": int(bool_op),
-                    "etype": int(etype),
-                })
-            cur_loops = []
-            sketch_idx += 1
-            cur_2d = (0.0, 0.0)
-
-        elif cmd == EOS:
-            break
-
-    return sketches
-
-
-def _add_loop_to_workplane(wp, loop_curves):
-    """주어진 (kind, params) list 를 CadQuery Workplane 에 곡선으로 추가."""
-    if not loop_curves:
-        return wp, False
-
-    # 단일 circle 은 moveTo+circle 로 처리
-    if len(loop_curves) == 1 and loop_curves[0][0] == "circle":
-        _, (cx, cy), r = loop_curves[0]
-        return wp.moveTo(float(cx), float(cy)).circle(float(r)), True
-
-    first = True
-    for curve in loop_curves:
-        kind = curve[0]
-        if kind == "line":
-            sx, sy = curve[1]
-            ex, ey = curve[2]
-            if first:
-                wp = wp.moveTo(float(sx), float(sy))
-                first = False
-            wp = wp.lineTo(float(ex), float(ey))
-        elif kind == "arc":
-            sx, sy = curve[1]
-            mx, my = curve[2]
-            ex, ey = curve[3]
-            if first:
-                wp = wp.moveTo(float(sx), float(sy))
-                first = False
-            wp = wp.threePointArc(
-                (float(mx), float(my)), (float(ex), float(ey))
-            )
-        elif kind == "circle":
-            # loop 중간에 circle 이 끼는 비정상 케이스 — skip
-            continue
-
-    if not first:
-        wp = wp.close()
-        return wp, True
-    return wp, False
-
-
-def _build_cq_solid(cq, sk_data, min_extent=1e-6):
-    """sketch data → CadQuery solid (extruded body)."""
-    origin = np.asarray(sk_data["origin"], dtype=float)
-    x_axis = np.asarray(sk_data["x_axis"], dtype=float)
-    z_axis = np.asarray(sk_data["z_axis"], dtype=float)
-
-    # z 정규화
-    zn = np.linalg.norm(z_axis)
-    if zn < 1e-9:
-        z_axis = np.array([0.0, 0.0, 1.0])
-        zn = 1.0
-    z_axis = z_axis / zn
-
-    # x 를 z 에 수직으로 재투영
-    x_proj = x_axis - float(np.dot(x_axis, z_axis)) * z_axis
-    xn = np.linalg.norm(x_proj)
-    if xn < 1e-8:
-        # x 가 z 와 평행할 때 임의의 수직 벡터 선택
-        if abs(z_axis[0]) < 0.9:
-            tmp = np.array([1.0, 0.0, 0.0])
-        else:
-            tmp = np.array([0.0, 1.0, 0.0])
-        x_proj = tmp - float(np.dot(tmp, z_axis)) * z_axis
-        xn = np.linalg.norm(x_proj)
-    x_axis = x_proj / max(xn, 1e-12)
-
-    plane = cq.Plane(
-        origin=cq.Vector(float(origin[0]), float(origin[1]), float(origin[2])),
-        xDir=cq.Vector(float(x_axis[0]), float(x_axis[1]), float(x_axis[2])),
-        normal=cq.Vector(float(z_axis[0]), float(z_axis[1]), float(z_axis[2])),
-    )
-
-    extent_one = float(sk_data["extent_one"])
-    if extent_one < min_extent:
-        return None, "extent_one ≈ 0"
-
-    wp = cq.Workplane(plane)
-    added_loops = 0
-    for loop_curves in sk_data["loops"]:
-        try:
-            wp, ok = _add_loop_to_workplane(wp, loop_curves)
-            if ok:
-                added_loops += 1
-        except Exception:
-            continue
-
-    if added_loops == 0:
-        return None, "no valid loops"
-
-    # 정방향 extrude
-    try:
-        body = wp.extrude(extent_one)
-        return body, None
-    except Exception as e_full:
-        # fallback: 첫 loop 만 시도
-        try:
-            wp2 = cq.Workplane(plane)
-            wp2, ok2 = _add_loop_to_workplane(wp2, sk_data["loops"][0])
-            if ok2:
-                body = wp2.extrude(extent_one)
-                return body, f"fell back to outer loop only ({type(e_full).__name__})"
-        except Exception as e_fb:
-            return None, (
-                f"extrude failed full ({type(e_full).__name__}: {e_full}); "
-                f"fallback failed ({type(e_fb).__name__}: {e_fb})"
-            )
-        return None, f"extrude failed: {type(e_full).__name__}: {e_full}"
-
-
-def export_decoded_to_step(tokens, dq_meta, out_path, verbose=True):
-    """Decoded tokens 를 STEP 파일로 저장. HFSS 에서 import 가능 (mm 단위).
-
-    Boolean ops:
-      0 = union (default)
-      1 = cut
-      2 = intersect
-      3 = NewBody — 별개 solid 로 union 처리 (CadQuery 가 compound 못 다룸)
-    """
-    try:
-        import cadquery as cq
-    except ImportError:
-        if verbose:
-            print("  ⚠ STEP export skipped: cadquery 미설치")
-            print("    설치: pip install cadquery")
-        return False, {"reason": "cadquery not installed"}
-
-    sketches_data = _tokens_to_curve_sketches(tokens, dq_meta)
-    if not sketches_data:
-        if verbose:
-            print("  ⚠ STEP export skipped: 파싱된 sketch 없음")
-        return False, {"reason": "no sketches parsed"}
-
-    if verbose:
-        print(f"  Building {len(sketches_data)} solids...")
-
-    result = None
-    n_ok = 0
-    failures = []
-
-    for i, sk in enumerate(sketches_data):
-        try:
-            body, note = _build_cq_solid(cq, sk)
-        except Exception as e:
-            failures.append((i + 1, f"build raised {type(e).__name__}: {e}"))
-            continue
-        if body is None:
-            failures.append((i + 1, note or "build returned None"))
-            continue
-        if verbose and note:
-            print(f"    sketch {i+1}: {note}")
-
-        bool_op = sk.get("bool_op", 0)
-        try:
-            if result is None:
-                result = body
-            elif bool_op == 1:           # Cut
-                result = result.cut(body)
-            elif bool_op == 2:           # Intersect
-                result = result.intersect(body)
-            else:                         # 0 Union / 3 NewBody
-                result = result.union(body)
-            n_ok += 1
-        except Exception as e:
-            failures.append(
-                (i + 1, f"bool_op {bool_op} failed: {type(e).__name__}: {e}")
-            )
-
-    if result is None:
-        if verbose:
-            print(f"  ⚠ STEP export failed: 유효 solid 0 / {len(sketches_data)}")
-            for idx, msg in failures:
-                print(f"    sketch {idx}: {msg}")
-        return False, {"reason": "no valid solids", "failures": failures}
-
-    try:
-        cq.exporters.export(result, str(out_path), exportType="STEP")
-    except Exception as e:
-        if verbose:
-            print(f"  ⚠ STEP write failed: {type(e).__name__}: {e}")
-        return False, {"reason": f"write failed: {e}", "failures": failures}
-
-    info = {
-        "out_path": str(out_path),
-        "n_solids_ok": n_ok,
-        "n_solids_total": len(sketches_data),
-        "failures": failures,
-    }
-    if verbose:
-        print(f"  ✓ STEP exported: {out_path}")
-        print(f"    solids built : {n_ok}/{len(sketches_data)}")
-        if failures:
-            print(f"    failures :")
-            for idx, msg in failures:
-                print(f"      sketch {idx}: {msg}")
-        print(f"    HFSS import : 단위 mm 로 import 하세요")
-    return True, info
 
 
 def tokens_to_sketches_normalized(tokens: np.ndarray) -> list:
@@ -4157,7 +3832,6 @@ def run_inverse_design_pipeline(
     restart_noise=0.3,
     max_restarts=10,
     separate_windows=False,
-    export_step_path=None,
 ):
     section("INVERSE DESIGN — latent search + decode")
 
@@ -4210,10 +3884,8 @@ def run_inverse_design_pipeline(
         _tb.print_exc()
 
     subsection("Inverse design — decoded structure figure")
-    recon_trim = None
-    used_dq_meta = None
     try:
-        recon_trim, sketches, used_dq_meta = visualize_decoded_structure(
+        recon_trim, sketches, _ = visualize_decoded_structure(
             ae, result["best_z"], dataset, device,
             title="Inverse-designed structure (decoded from optimal z)",
             separate_windows=separate_windows,
@@ -4224,23 +3896,6 @@ def run_inverse_design_pipeline(
         import traceback as _tb
         print(f"  ⚠ visualize_decoded_structure failed: {type(e).__name__}: {e}")
         _tb.print_exc()
-
-    # ── STEP export (HFSS 임포트용) ──
-    if export_step_path is not None and recon_trim is not None:
-        subsection("Inverse design — STEP export (HFSS import 용)")
-        if used_dq_meta is None:
-            print("  ⚠ STEP export skipped: real-coord dequant meta 없음")
-        else:
-            try:
-                ok, info = export_decoded_to_step(
-                    recon_trim, used_dq_meta, export_step_path, verbose=True,
-                )
-                result["step_export_ok"] = bool(ok)
-                result["step_export_info"] = info
-            except Exception as e:
-                import traceback as _tb
-                print(f"  ⚠ STEP export raised: {type(e).__name__}: {e}")
-                _tb.print_exc()
 
     return result
 
@@ -4260,7 +3915,7 @@ if __name__ == "__main__":
     # ---------------------------------------------------------
     # 실행 설정
     # ---------------------------------------------------------
-    PRESET = "test"   # test / tiny / small / full / custom
+    PRESET = "tiny"   # tiny / small / full / custom
     LOG_VERBOSITY = "simple"
 
     USE_TYPES = [1, 2, 3]
@@ -4469,28 +4124,6 @@ if __name__ == "__main__":
         #   True : 4 개 view 각각 별도 큰 창 (확대해서 자세히 볼 때 유용)
         INV_SEPARATE_WINDOWS = False
 
-        # ★ STEP file export (HFSS import 용)
-        #   True : CadQuery 로 디코딩된 구조를 .step 파일로 저장
-        #          (cadquery 필요: pip install cadquery)
-        #          저장 경로: <script_dir>/inversed_step/inverse_design_<timestamp>.step
-        INV_EXPORT_STEP = True
-        INV_STEP_DIR = os.path.join(script_dir, "inversed_step")
-        os.makedirs(INV_STEP_DIR, exist_ok=True)
-        INV_STEP_PATH = os.path.join(
-            INV_STEP_DIR, f"inverse_design_{run_tag}.step",
-        )
-
-        # ★ test preset 일 때 inverse design 도 가볍게 (≈30 초 목표)
-        if (cfg.preset or "").lower() == "test":
-            INV_N_STARTS = 4
-            INV_N_ITERS = 50
-            INV_MAX_RESTARTS = 1
-            INV_EARLY_STOP_PATIENCE = 30
-            INV_RESTART_PATIENCE = 20
-            print("  [TEST PRESET] inverse design 가볍게 축소:")
-            print(f"    n_starts={INV_N_STARTS}, n_iters={INV_N_ITERS}, "
-                  f"max_restarts={INV_MAX_RESTARTS}, early_stop={INV_EARLY_STOP_PATIENCE}")
-
         if cfg.show_figures and RUN_INVERSE_DESIGN:
             try:
                 inv_result = run_inverse_design_pipeline(
@@ -4516,7 +4149,6 @@ if __name__ == "__main__":
                     restart_noise=INV_RESTART_NOISE,
                     max_restarts=INV_MAX_RESTARTS,
                     separate_windows=INV_SEPARATE_WINDOWS,
-                    export_step_path=(INV_STEP_PATH if INV_EXPORT_STEP else None),
                 )
             except Exception as e:
                 import traceback as _tb
