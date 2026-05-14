@@ -959,6 +959,95 @@ def _set_axes_and_render(ax, sketches, use_real):
     return pts
 
 
+def _compute_sketch_centers(sketches, use_real):
+    """각 sketch 의 3D 중심점 (extruded body 의 가운데).
+    real: bot vertices 평균 + normal * extent/2
+    normalized: render_3d_normalized 와 동일한 변환으로 중심 계산.
+    """
+    centers = []
+    for sk in sketches:
+        if use_real:
+            pts_all = []
+            for loop in sk.get("loops_3d", []):
+                pts_all.extend([np.asarray(p, dtype=float) for p in loop])
+            if not pts_all:
+                centers.append(None)
+                continue
+            arr = np.stack(pts_all, axis=0)
+            normal = np.asarray(sk.get("normal", [0, 0, 1]), dtype=float)
+            extent = float(sk.get("extent", 0.0))
+            bot_c = arr.mean(axis=0)
+            c = bot_c + normal * (extent / 2.0)
+        else:
+            pts2d = []
+            for loop in sk.get("loops_2d", []):
+                pts2d.extend(loop)
+            if not pts2d:
+                centers.append(None)
+                continue
+            arr2d = np.array(pts2d, dtype=float)
+            px, py, pz = sk["pos"]
+            size = sk["scale"] * 2.2
+            e1 = sk["e1"] * 1.8
+            ox = (px - 0.5) * 2.0
+            oy = (py - 0.5) * 2.0
+            oz = pz * 2.0
+            cx_2d = arr2d[:, 0].mean()
+            cy_2d = arr2d[:, 1].mean()
+            cx = (cx_2d - 0.5) * size + ox
+            cy = (cy_2d - 0.5) * size + oy
+            cz = oz + e1 / 2.0
+            c = np.array([cx, cy, cz], dtype=float)
+        centers.append(c)
+    return centers
+
+
+def _annotate_centers(ax, centers, with_coords=True, with_label=True):
+    """각 중심점을 marker + 좌표 라벨로 표시."""
+    for i, c in enumerate(centers):
+        if c is None:
+            continue
+        color = PAL[i % len(PAL)]
+        ax.scatter(
+            [float(c[0])], [float(c[1])], [float(c[2])],
+            s=55, c=color, marker="o",
+            edgecolors="black", linewidths=0.8,
+            zorder=2000, depthshade=False,
+        )
+        if with_coords or with_label:
+            if with_coords:
+                txt = f"  S{i+1} ({c[0]:.1f},{c[1]:.1f},{c[2]:.1f})"
+            else:
+                txt = f"  S{i+1}"
+            ax.text(
+                float(c[0]), float(c[1]), float(c[2]),
+                txt,
+                fontsize=6.5, color="#111",
+                bbox=dict(
+                    boxstyle="round,pad=0.15",
+                    fc=(1, 1, 1, 0.82),
+                    ec=(0.6, 0.6, 0.6, 0.6),
+                    lw=0.3,
+                ),
+                zorder=2000,
+            )
+
+
+def _print_sketch_centers(centers, use_real):
+    if not centers:
+        return
+    unit = "mm" if use_real else "norm"
+    print(f"\n  Sketch centers ({len(centers)} entries, {unit}):")
+    for i, c in enumerate(centers):
+        if c is None:
+            print(f"    [sketch {i+1}] (empty)")
+        else:
+            print(
+                f"    [sketch {i+1}] center = "
+                f"({c[0]:8.3f}, {c[1]:8.3f}, {c[2]:8.3f}) {unit}"
+            )
+
+
 def _describe_sketches_z(sketches, use_real):
     """sketch별 z축 진단 문자열 (현재 미사용 — 호출부가 패치로 제거됨)."""
     lines = []
@@ -1009,6 +1098,10 @@ def show_comparison(orig_tok, recon_tok, fname, save_path,
         (1, 0, "Original — Top View",         orig_sk,  89.9, -90.0),
         (1, 1, "Reconstruction — Top View",   recon_sk, 89.9, -90.0),
     ]
+    # 중심점 한 번씩 계산해 캐시
+    orig_centers = _compute_sketch_centers(orig_sk, use_real) if orig_sk else []
+    recon_centers = _compute_sketch_centers(recon_sk, use_real) if recon_sk else []
+
     for row, col, label, sk, elev, azim in views:
         ax = fig.add_subplot(2, 2, row * 2 + col + 1, projection="3d")
         if not sk:
@@ -1024,6 +1117,9 @@ def show_comparison(orig_tok, recon_tok, fname, save_path,
         ne = ne_o if "Original" in label else ne_r
         nl = nl_o if "Original" in label else nl_r
         tok = orig_tok if "Original" in label else recon_tok
+        # ★ 중심점 마커 (비교용 — 좌표는 생략, 라벨만)
+        cs = orig_centers if "Original" in label else recon_centers
+        _annotate_centers(ax, cs, with_coords=False, with_label=True)
         _style(ax, f"{label}\n{ne} extrude · {nl} loop · {tok.shape[0]} token")
         ax.view_init(elev=elev, azim=azim)
 
@@ -3590,6 +3686,10 @@ def visualize_decoded_structure(
         dims = []
         print("  (dimensions not annotated — normalized mode, no real-coord meta)")
 
+    # ★ 각 sketch 중심점 (한 번만 계산해 모든 view 에서 재사용)
+    centers = _compute_sketch_centers(sketches, use_real)
+    _print_sketch_centers(centers, use_real)
+
     views = [
         ("Decoded — 3D View",        28,   -55),
         ("Decoded — 3D View (alt)",  20,    45),
@@ -3619,6 +3719,8 @@ def visualize_decoded_structure(
         _set_axes_and_render(ax, sketches, use_real=use_real)
         if use_real and dims:
             _annotate_dimensions(ax, dims)
+        # ★ 중심점 마커 + 좌표 라벨
+        _annotate_centers(ax, centers, with_coords=use_real, with_label=True)
         _style(
             ax,
             f"{label}\n{ne} extrude · {nl} loop · {recon_trim.shape[0]} token",
