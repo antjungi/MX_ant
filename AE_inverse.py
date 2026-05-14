@@ -3728,7 +3728,7 @@ def visualize_decoded_structure(
         f"{recon_trim.shape[0]} tokens · {ne} extrude · {nl_total} loop"
     )
 
-    def _draw_one(ax, label, elev, azim):
+    def _draw_one(ax, label, elev, azim, annotate=True):
         if not sketches:
             ax.text2D(
                 0.5, 0.5, "(empty)",
@@ -3739,10 +3739,11 @@ def visualize_decoded_structure(
             ax.view_init(elev=elev, azim=azim)
             return
         _set_axes_and_render(ax, sketches, use_real=use_real)
-        if use_real and dims:
-            _annotate_dimensions(ax, dims)
-        # ★ 중심점 마커 + 좌표 라벨
-        _annotate_centers(ax, centers, with_coords=use_real, with_label=True)
+        if annotate:
+            if use_real and dims:
+                _annotate_dimensions(ax, dims)
+            # ★ 중심점 마커 + 좌표 라벨
+            _annotate_centers(ax, centers, with_coords=use_real, with_label=True)
         _style(
             ax,
             f"{label}\n{ne} extrude · {nl} loop · {recon_trim.shape[0]} token",
@@ -3772,27 +3773,34 @@ def visualize_decoded_structure(
             plt.tight_layout(rect=[0, 0.04, 1, 0.94])
         n_figs_created = 4
     else:
-        # ── 기본: Top View 큰 창 하나만 ──
+        # ── 기본: Top View 2 창 (숫자 포함 / 구조만) ──
         top_label, top_elev, top_azim = "Decoded — Top View", 89.9, -90.0
-        fig_top = plt.figure(figsize=(12, 11), facecolor="white")
-        fig_top.suptitle(
-            f"{title}  —  TOP VIEW [{coord_label}]\n{info_line}\n{meta_note}",
-            fontsize=11, fontweight="normal", color="#222", y=0.985,
-        )
-        ax_top = fig_top.add_subplot(1, 1, 1, projection="3d")
-        _draw_one(ax_top, top_label, top_elev, top_azim)
-        if sketches:
-            fig_top.legend(
-                handles=[
-                    mpatches.Patch(color=PAL[i % len(PAL)], label=f"Sketch {i + 1}")
-                    for i in range(len(sketches))
-                ],
-                loc="lower center", ncol=min(len(sketches), 6),
-                facecolor="white", edgecolor="#ddd", labelcolor="#444",
-                fontsize=10, framealpha=0.95,
+
+        def _make_top_fig(annotate, suffix):
+            fig_top = plt.figure(figsize=(12, 11), facecolor="white")
+            fig_top.suptitle(
+                f"{title}  —  TOP VIEW {suffix}[{coord_label}]\n{info_line}\n{meta_note}",
+                fontsize=11, fontweight="normal", color="#222", y=0.985,
             )
-        plt.tight_layout(rect=[0, 0.05, 1, 0.94])
-        n_figs_created = 1
+            ax_top = fig_top.add_subplot(1, 1, 1, projection="3d")
+            _draw_one(ax_top, top_label, top_elev, top_azim, annotate=annotate)
+            if sketches:
+                fig_top.legend(
+                    handles=[
+                        mpatches.Patch(color=PAL[i % len(PAL)], label=f"Sketch {i + 1}")
+                        for i in range(len(sketches))
+                    ],
+                    loc="lower center", ncol=min(len(sketches), 6),
+                    facecolor="white", edgecolor="#ddd", labelcolor="#444",
+                    fontsize=10, framealpha=0.95,
+                )
+            plt.tight_layout(rect=[0, 0.05, 1, 0.94])
+
+        # (1) 숫자/중심점 포함 — dimension 확인용
+        _make_top_fig(annotate=True, suffix="(annotated) ")
+        # (2) 구조만 — 깔끔한 형상 확인용
+        _make_top_fig(annotate=False, suffix="(clean) ")
+        n_figs_created = 2
     print(
         f"  ✓ decoded structure figure 생성 "
         f"(tokens={recon_trim.shape[0]}, mode={'real' if use_real else 'normalized'}, "
