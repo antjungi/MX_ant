@@ -1099,10 +1099,6 @@ def show_comparison(orig_tok, recon_tok, fname, save_path,
         (1, 0, "Original — Top View",         orig_sk,  89.9, -90.0),
         (1, 1, "Reconstruction — Top View",   recon_sk, 89.9, -90.0),
     ]
-    # 중심점 한 번씩 계산해 캐시
-    orig_centers = _compute_sketch_centers(orig_sk, use_real) if orig_sk else []
-    recon_centers = _compute_sketch_centers(recon_sk, use_real) if recon_sk else []
-
     for row, col, label, sk, elev, azim in views:
         ax = fig.add_subplot(2, 2, row * 2 + col + 1, projection="3d")
         if not sk:
@@ -1118,9 +1114,6 @@ def show_comparison(orig_tok, recon_tok, fname, save_path,
         ne = ne_o if "Original" in label else ne_r
         nl = nl_o if "Original" in label else nl_r
         tok = orig_tok if "Original" in label else recon_tok
-        # ★ 중심점 마커 (비교용 — 좌표는 생략, 라벨만)
-        cs = orig_centers if "Original" in label else recon_centers
-        _annotate_centers(ax, cs, with_coords=False, with_label=True)
         _style(ax, f"{label}\n{ne} extrude · {nl} loop · {tok.shape[0]} token")
         ax.view_init(elev=elev, azim=azim)
 
