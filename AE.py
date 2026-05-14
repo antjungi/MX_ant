@@ -2390,7 +2390,7 @@ def visualize_sparam_predictions(
 
             ax.plot(
                 freqs_full, common_full[:, col],
-                color=baseline_color, lw=1.0, ls=":", alpha=0.6,
+                color=baseline_color, lw=1.4, ls=":", alpha=0.9,
                 label="common curve" if (row == 0 and col == 0) else None,
             )
             ax.plot(
