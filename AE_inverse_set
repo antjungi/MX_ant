@@ -1,0 +1,2404 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Body-Set DeepCAD AE + Return-3 Common-Curve Residual Surrogate
+==============================================================
+
+목적:
+  - 기존 sequence AE의 body 순서 의존성 제거
+  - SOL ... EXT 단위 body를 set으로 보고 order-invariant하게 encode
+  - decoder는 unordered body slots를 생성
+  - reconstruction loss는 Hungarian matching으로 body 순서 무시
+  - surrogate는 z -> S11/S22/S33 dB 예측
+  - inverse design도 z latent 위에서 수행 가능
+
+핵심 차이:
+  기존:
+    token1, token2, token3 순서 그대로 CE loss
+
+  변경:
+    body 단위로 나눈 뒤,
+    predicted body slots와 true bodies를 최적 매칭해서 loss 계산
+
+필요 패키지:
+  pip install numpy pandas openpyxl matplotlib torch scipy
+"""
+
+import matplotlib
+for _b in ("TkAgg", "Qt5Agg", "Qt6Agg", "wxAgg", "MacOSX"):
+    try:
+        matplotlib.use(_b)
+        break
+    except Exception:
+        continue
+
+_MPL_BACKEND = matplotlib.get_backend()
+
+import os
+import re
+import glob
+import math
+import time
+import random
+import sys as _sys
+from dataclasses import dataclass
+
+import numpy as np
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+import matplotlib.pyplot as plt
+
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
+
+try:
+    from scipy.optimize import linear_sum_assignment
+    HAS_SCIPY = True
+except Exception:
+    HAS_SCIPY = False
+
+
+# ══════════════════════════════════════════════════════════════
+# DeepCAD token constants
+# ══════════════════════════════════════════════════════════════
+LINE = 0
+ARC = 1
+CIRCLE = 2
+SOL = 3
+EXT = 4
+EOS = 5
+
+N_CMD = 6
+PAD_CMD_CLASS = 6
+N_CMD_WITH_PAD = 7
+
+N_ARGS = 16
+
+N_BIT = 10
+N_QUANT = 2 ** N_BIT
+QMAX = N_QUANT - 1
+
+PAD_V = -1
+PAD_PARAM_INDEX = N_QUANT
+
+VALID_PAR = {
+    LINE: 2,
+    ARC: 4,
+    CIRCLE: 3,
+    SOL: 0,
+    EXT: 8,
+    EOS: 0,
+}
+
+CMD_NAME = {
+    LINE: "LINE",
+    ARC: "ARC",
+    CIRCLE: "CIRCLE",
+    SOL: "SOL",
+    EXT: "EXT",
+    EOS: "EOS",
+    PAD_CMD_CLASS: "PAD",
+}
+
+RETURN_PORT_PAIRS = ((1, 1), (2, 2), (3, 3))
+RETURN_LABELS = ["S11", "S22", "S33"]
+
+
+# ══════════════════════════════════════════════════════════════
+# Config
+# ══════════════════════════════════════════════════════════════
+@dataclass
+class CFG:
+    preset: str = "tiny"
+    seed: int = 7
+
+    # data
+    npy_dirs: tuple = ("hfss_results/step_test",)
+    sparam_globs: tuple = ("hfss_results/sparam/[12].*",)
+    type_names: tuple = ("type1",)
+    n_samples_per_type: tuple = (300,)
+    sample_mode: str = "random"
+
+    # body-set
+    max_bodies_cap: int = 16
+    max_body_tokens_cap: int = 64
+    body_presence_weight: float = 0.5
+    body_cmd_weight: float = 1.0
+    body_param_weight: float = 1.0
+
+    # frequency
+    raw_n_freq: int = 401
+    n_freq: int = 81
+    freq_select_mode: str = "linspace"
+    freq_start: float = 1.0
+    freq_end: float = 5.0
+
+    # training
+    epochs: int = 80
+    warmup: int = 8
+    batch_size: int = 8
+    lr_ae: float = 3e-4
+    lr_mlp: float = 1e-3
+    weight_decay: float = 1e-3
+    grad_clip: float = 1.0
+    val_ratio: float = 0.15
+
+    # model
+    d_model: int = 128
+    d_param: int = 32
+    nhead: int = 4
+    n_body_enc_layers: int = 2
+    n_set_layers: int = 2
+    n_slot_dec_layers: int = 2
+    d_ff: int = 512
+    latent: int = 128
+    dropout: float = 0.1
+    n_freq_bands: int = 6
+
+    # losses
+    w_ae: float = 1.0
+    w_sparam: float = 5.0
+    db_loss_scale: float = 20.0
+
+    # VICReg fixed medium_var
+    use_vicreg: bool = True
+    w_var: float = 0.5
+    w_cov: float = 0.05
+    vicreg_var_target: float = 1.0
+
+    # surrogate
+    mlp_hidden_mult: float = 2.0
+    mlp_dropout: float = 0.3
+    residual_scale: float = 1.0
+    zero_init_residual: bool = True
+
+    # inverse
+    run_inverse_design: bool = False
+    inverse_target_type_id: int | None = None
+    inverse_freqs: tuple = (2.0, 3.0, 4.0)
+    inverse_bw_ghz: float = 0.1
+    inverse_deep_db: float = -15.0
+    inverse_n_starts: int = 32
+    inverse_n_iters: int = 1000
+    inverse_lr: float = 5e-2
+    inverse_z_prior_weight: float = 1e-2
+    inverse_z_prior_weight_end: float = 1e-3
+
+    # misc
+    n_preview: int = 3
+    show_figures: bool = True
+
+
+PRESETS = {
+    "tiny": dict(
+        n_samples_each=300,
+        epochs=80,
+        warmup=8,
+        batch_size=8,
+        d_model=128,
+        d_param=32,
+        nhead=4,
+        n_body_enc_layers=2,
+        n_set_layers=2,
+        n_slot_dec_layers=2,
+        d_ff=512,
+        latent=128,
+        dropout=0.1,
+        mlp_hidden_mult=2.0,
+        mlp_dropout=0.3,
+        weight_decay=1e-3,
+    ),
+    "small": dict(
+        n_samples_each=800,
+        epochs=160,
+        warmup=15,
+        batch_size=8,
+        d_model=256,
+        d_param=64,
+        nhead=8,
+        n_body_enc_layers=3,
+        n_set_layers=3,
+        n_slot_dec_layers=3,
+        d_ff=1024,
+        latent=256,
+        dropout=0.1,
+        mlp_hidden_mult=2.0,
+        mlp_dropout=0.3,
+        weight_decay=1e-3,
+    ),
+    "full": dict(
+        n_samples_each=0,
+        epochs=250,
+        warmup=20,
+        batch_size=4,
+        d_model=384,
+        d_param=96,
+        nhead=8,
+        n_body_enc_layers=4,
+        n_set_layers=4,
+        n_slot_dec_layers=4,
+        d_ff=1536,
+        latent=512,
+        dropout=0.1,
+        mlp_hidden_mult=2.0,
+        mlp_dropout=0.3,
+        weight_decay=1e-3,
+    ),
+}
+
+
+def apply_preset(cfg):
+    name = (cfg.preset or "custom").lower()
+    if name == "custom":
+        return cfg
+    if name not in PRESETS:
+        raise ValueError(f"Unknown preset: {cfg.preset}")
+
+    patch = dict(PRESETS[name])
+    n_each = patch.pop("n_samples_each", None)
+
+    for k, v in patch.items():
+        setattr(cfg, k, v)
+
+    if n_each is not None:
+        cfg.n_samples_per_type = tuple([n_each] * len(cfg.npy_dirs))
+
+    return cfg
+
+
+# ══════════════════════════════════════════════════════════════
+# Utils
+# ══════════════════════════════════════════════════════════════
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def natural_key(path):
+    name = os.path.basename(path)
+    return [int(x) if x.isdigit() else x.lower() for x in re.split(r"(\d+)", name)]
+
+
+def _hr(ch="═", w=72):
+    return ch * w
+
+
+def section(title, ch="═"):
+    print(f"\n{_hr(ch)}\n  {title}\n{_hr(ch)}")
+
+
+def subsection(title, ch="─"):
+    print(f"\n{_hr(ch)}\n  {title}\n{_hr(ch)}")
+
+
+class _Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, s):
+        for st in self.streams:
+            try:
+                st.write(s)
+                st.flush()
+            except Exception:
+                pass
+
+    def flush(self):
+        for st in self.streams:
+            try:
+                st.flush()
+            except Exception:
+                pass
+
+
+def setup_log_file(path):
+    f = open(path, "w", encoding="utf-8", buffering=1)
+    _sys.stdout = _Tee(_sys.stdout, f)
+    _sys.stderr = _Tee(_sys.stderr, f)
+    return f
+
+
+def trim_after_eos(tokens):
+    tokens = np.asarray(tokens)
+    if tokens.ndim != 2 or tokens.shape[1] != 17:
+        return tokens
+
+    rows = []
+    for i in range(tokens.shape[0]):
+        c = int(tokens[i, 0])
+        if c < 0:
+            break
+        rows.append(tokens[i])
+        if c == EOS:
+            break
+
+    if not rows:
+        return np.zeros((0, 17), dtype=np.int32)
+
+    return np.stack(rows, axis=0).astype(np.int32)
+
+
+def select_frequency_indices(raw_n_freq, target_n_freq, freq_start, freq_end, mode="linspace"):
+    raw_n_freq = int(raw_n_freq)
+    target_n_freq = int(target_n_freq)
+
+    if target_n_freq <= 0 or target_n_freq >= raw_n_freq:
+        idx_sel = np.arange(raw_n_freq, dtype=np.int64)
+    else:
+        if mode.lower() != "linspace":
+            raise ValueError(f"Unknown freq_select_mode: {mode}")
+
+        idx_sel = np.round(
+            np.linspace(0, raw_n_freq - 1, target_n_freq)
+        ).astype(np.int64)
+        idx_sel = np.unique(idx_sel)
+
+        if len(idx_sel) != target_n_freq:
+            idx_sel = np.linspace(
+                0, raw_n_freq - 1, target_n_freq
+            ).astype(np.int64)
+            idx_sel = np.unique(idx_sel)
+
+        if len(idx_sel) != target_n_freq:
+            raise RuntimeError(
+                f"frequency selection failed: target={target_n_freq}, unique={len(idx_sel)}"
+            )
+
+    freqs_full = np.linspace(freq_start, freq_end, raw_n_freq).astype(np.float32)
+    freqs_sel = freqs_full[idx_sel].astype(np.float32)
+    return idx_sel, freqs_full, freqs_sel
+
+
+def build_interp_matrix_np(freqs_sel, freqs_full):
+    freqs_sel = np.asarray(freqs_sel, dtype=np.float32)
+    freqs_full = np.asarray(freqs_full, dtype=np.float32)
+
+    n_sel = len(freqs_sel)
+    n_full = len(freqs_full)
+
+    W = np.zeros((n_full, n_sel), dtype=np.float32)
+
+    for i, f in enumerate(freqs_full):
+        if f <= freqs_sel[0]:
+            W[i, 0] = 1.0
+        elif f >= freqs_sel[-1]:
+            W[i, -1] = 1.0
+        else:
+            hi = int(np.searchsorted(freqs_sel, f, side="right"))
+            lo = hi - 1
+            f_lo = freqs_sel[lo]
+            f_hi = freqs_sel[hi]
+            t = float((f - f_lo) / max(f_hi - f_lo, 1e-12))
+            W[i, lo] = 1.0 - t
+            W[i, hi] = t
+
+    return W
+
+
+def interpolate_selected_to_full_torch(pred_sel, interp_w):
+    return torch.einsum("fs,bsc->bfc", interp_w, pred_sel)
+
+
+def interpolate_selected_to_full_np(pred_sel, freqs_sel, freqs_full):
+    pred_sel = np.asarray(pred_sel, dtype=np.float32)
+    single = False
+
+    if pred_sel.ndim == 2:
+        pred_sel = pred_sel[None, ...]
+        single = True
+
+    N, n_sel, C = pred_sel.shape
+    out = np.zeros((N, len(freqs_full), C), dtype=np.float32)
+
+    for i in range(N):
+        for c in range(C):
+            out[i, :, c] = np.interp(freqs_full, freqs_sel, pred_sel[i, :, c])
+
+    return out[0] if single else out
+
+
+# ══════════════════════════════════════════════════════════════
+# Body parsing
+# ══════════════════════════════════════════════════════════════
+def split_sequence_to_bodies(tokens):
+    """
+    SOL ... EXT 를 하나의 body로 분리.
+    순서는 dataset에는 보관하지만, loss에서는 Hungarian matching으로 무시.
+    """
+    tokens = trim_after_eos(tokens)
+    bodies = []
+    cur = []
+    active = False
+
+    for row in tokens:
+        cmd = int(row[0])
+
+        if cmd == EOS:
+            break
+
+        if cmd == SOL:
+            if cur:
+                bodies.append(np.stack(cur, axis=0).astype(np.int32))
+            cur = [row.copy()]
+            active = True
+            continue
+
+        if active:
+            cur.append(row.copy())
+            if cmd == EXT:
+                bodies.append(np.stack(cur, axis=0).astype(np.int32))
+                cur = []
+                active = False
+
+    if cur:
+        # EXT 없이 끝난 비정상 body도 일단 보관
+        bodies.append(np.stack(cur, axis=0).astype(np.int32))
+
+    valid = []
+    for b in bodies:
+        if len(b) >= 2 and int(b[0, 0]) == SOL:
+            valid.append(b)
+
+    return valid
+
+
+def pad_body_tokens(body, max_body_len):
+    out = np.full((max_body_len, 17), PAD_V, dtype=np.int32)
+    L = min(len(body), max_body_len)
+    out[:L] = body[:L]
+
+    # 잘렸는데 EXT가 없으면 마지막을 EXT로 강제
+    if L == max_body_len and EXT not in out[:, 0]:
+        out[-1] = np.full((17,), PAD_V, dtype=np.int32)
+        out[-1, 0] = EXT
+
+    return out
+
+
+def bodies_to_sequence(bodies, presence=None, presence_thr=0.5):
+    rows = []
+    for i, b in enumerate(bodies):
+        if presence is not None:
+            if float(presence[i]) < presence_thr:
+                continue
+
+        b = np.asarray(b, dtype=np.int32)
+        for row in b:
+            cmd = int(row[0])
+            if cmd < 0 or cmd == PAD_CMD_CLASS:
+                continue
+            rows.append(row.copy())
+            if cmd == EXT:
+                break
+
+    eos = np.full((17,), PAD_V, dtype=np.int32)
+    eos[0] = EOS
+    rows.append(eos)
+
+    return np.stack(rows, axis=0).astype(np.int32)
+
+
+# ══════════════════════════════════════════════════════════════
+# S-param loading
+# ══════════════════════════════════════════════════════════════
+def _detect_sparam_cols(header):
+    col_idx = []
+    col_names = []
+    for i, h in enumerate(header):
+        hl = str(h).strip().lower()
+        if hl.startswith("re(") or hl.startswith("im("):
+            col_idx.append(i)
+            col_names.append(str(h).strip())
+    return col_idx, col_names
+
+
+def load_sparam_data(sparam_files, raw_n_freq, expected_cols=None, verbose=True):
+    if pd is None:
+        raise ImportError("pandas 필요: pip install pandas openpyxl")
+
+    if not sparam_files:
+        raise FileNotFoundError("S-param 파일이 없습니다.")
+
+    sparam_files = sorted(sparam_files, key=natural_key)
+    all_s = []
+    ref_cols = expected_cols
+
+    for fi, fp in enumerate(sparam_files):
+        ext = os.path.splitext(fp)[1].lower()
+
+        if ext == ".csv":
+            df = pd.read_csv(fp, header=0)
+        elif ext in (".xlsx", ".xls"):
+            df = pd.read_excel(fp, header=0, engine="openpyxl")
+        else:
+            continue
+
+        headers = [str(c) for c in df.columns]
+        data = df.values
+
+        col_idx, col_names = _detect_sparam_cols(headers)
+        if not col_idx:
+            continue
+
+        if ref_cols is None:
+            ref_cols = col_names
+        elif col_names != ref_cols:
+            raise ValueError(
+                f"S-param column mismatch: {os.path.basename(fp)}\n"
+                f"expected={ref_cols}\nfound={col_names}"
+            )
+
+        sd = data[:, col_idx].astype(np.float64)
+        n_block = sd.shape[0] // raw_n_freq
+
+        for si in range(n_block):
+            chunk = sd[si * raw_n_freq:(si + 1) * raw_n_freq]
+            if chunk.shape == (raw_n_freq, len(ref_cols)):
+                all_s.append(chunk)
+
+    if not all_s:
+        raise ValueError("No valid S-param data loaded.")
+
+    return np.stack(all_s, axis=0), ref_cols
+
+
+def _parse_sparam_pair(name):
+    s = str(name).lower().replace(" ", "")
+
+    m = re.search(r"port(\d+),port(\d+)", s)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+
+    m = re.search(r"port(\d+)port(\d+)", s)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+
+    m = re.search(r"s\((\d+),(\d+)\)", s)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+
+    m = re.search(r"s(\d)(\d)", s)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+
+    return None
+
+
+def _is_re_col(name):
+    return str(name).strip().lower().startswith("re(")
+
+
+def _is_im_col(name):
+    return str(name).strip().lower().startswith("im(")
+
+
+def filter_return3_sparams(sparam_all, sparam_names, return_pairs=RETURN_PORT_PAIRS, verbose=True):
+    pair_to_cols = {}
+
+    for i, name in enumerate(sparam_names):
+        pair = _parse_sparam_pair(name)
+        if pair is None:
+            continue
+
+        pair_to_cols.setdefault(pair, {"re": None, "im": None})
+
+        if _is_re_col(name):
+            pair_to_cols[pair]["re"] = i
+        elif _is_im_col(name):
+            pair_to_cols[pair]["im"] = i
+
+    selected_cols = []
+    selected_names = []
+
+    for pair in return_pairs:
+        if pair not in pair_to_cols:
+            raise ValueError(f"S{pair[0]}{pair[1]} column not found.")
+
+        re_idx = pair_to_cols[pair]["re"]
+        im_idx = pair_to_cols[pair]["im"]
+
+        if re_idx is None or im_idx is None:
+            raise ValueError(f"S{pair[0]}{pair[1]} needs re/im.")
+
+        selected_cols.extend([re_idx, im_idx])
+        selected_names.extend([sparam_names[re_idx], sparam_names[im_idx]])
+
+    out = sparam_all[:, :, selected_cols]
+
+    if verbose:
+        print("\n  Return-3 filtering")
+        print("    target: S11, S22, S33 only")
+        print(f"    before re/im: {sparam_all.shape}")
+        print(f"    after  re/im: {out.shape}")
+        print("    selected columns:")
+        for n in selected_names:
+            print(f"      {n}")
+
+    return out, selected_names
+
+
+def return3_reim_to_db_np(return3_reim):
+    outs = []
+    for k in (0, 2, 4):
+        re_v = return3_reim[..., k]
+        im_v = return3_reim[..., k + 1]
+        mag = np.sqrt(re_v ** 2 + im_v ** 2)
+        db = 20.0 * np.log10(np.clip(mag, 1e-12, None))
+        outs.append(db)
+    return np.stack(outs, axis=-1).astype(np.float32)
+
+
+# ══════════════════════════════════════════════════════════════
+# Dataset
+# ══════════════════════════════════════════════════════════════
+class BodySetDataset(Dataset):
+    def __init__(
+        self,
+        npy_files,
+        sparam_db,
+        freqs,
+        sparam_db_full,
+        freqs_full,
+        freq_idx,
+        interp_matrix,
+        type_ids,
+        type_names,
+        max_bodies,
+        max_body_len,
+    ):
+        self.npy_files = list(npy_files)
+        self.sparam_db = sparam_db.astype(np.float32)
+        self.freqs = np.asarray(freqs, dtype=np.float32)
+        self.sparam_db_full = sparam_db_full.astype(np.float32)
+        self.freqs_full = np.asarray(freqs_full, dtype=np.float32)
+        self.freq_idx = np.asarray(freq_idx, dtype=np.int64)
+        self.interp_matrix = interp_matrix.astype(np.float32)
+
+        self.type_ids = np.asarray(type_ids, dtype=np.int64)
+        self.type_names = list(type_names)
+
+        self.max_bodies = int(max_bodies)
+        self.max_body_len = int(max_body_len)
+
+        self.raw_bodies = []
+        self.body_tensors = []
+        self.body_masks = []
+
+        n_over_body = 0
+        n_over_len = 0
+
+        for f in self.npy_files:
+            seq = np.load(f).astype(np.int32)
+            bodies = split_sequence_to_bodies(seq)
+
+            if len(bodies) > self.max_bodies:
+                n_over_body += 1
+                bodies = bodies[:self.max_bodies]
+
+            body_arr = np.full(
+                (self.max_bodies, self.max_body_len, 17),
+                PAD_V,
+                dtype=np.int32,
+            )
+            body_mask = np.zeros((self.max_bodies,), dtype=np.bool_)
+
+            for i, b in enumerate(bodies):
+                if len(b) > self.max_body_len:
+                    n_over_len += 1
+                body_arr[i] = pad_body_tokens(b, self.max_body_len)
+                body_mask[i] = True
+
+            self.raw_bodies.append(bodies)
+            self.body_tensors.append(body_arr)
+            self.body_masks.append(body_mask)
+
+        dist = ", ".join(
+            f"{name}:{int((self.type_ids == i).sum())}"
+            for i, name in enumerate(self.type_names)
+        )
+
+        print(f"  loaded {len(self.npy_files)} samples")
+        print(f"    type distribution  : {dist}")
+        print(f"    max_bodies         : {self.max_bodies}")
+        print(f"    max_body_len       : {self.max_body_len}")
+        print(f"    truncated bodies   : {n_over_body}")
+        print(f"    truncated body len : {n_over_len}")
+        print(f"    selected S-param   : {self.sparam_db.shape}")
+        print(f"    full S-param       : {self.sparam_db_full.shape}")
+
+    def __len__(self):
+        return len(self.npy_files)
+
+    def __getitem__(self, idx):
+        return (
+            torch.tensor(self.body_tensors[idx], dtype=torch.float32),
+            torch.tensor(self.body_masks[idx], dtype=torch.bool),
+            torch.tensor(self.sparam_db[idx], dtype=torch.float32),
+            torch.tensor(self.sparam_db_full[idx], dtype=torch.float32),
+            torch.tensor(int(self.type_ids[idx]), dtype=torch.long),
+        )
+
+
+class SubsetDataset(Dataset):
+    def __init__(self, dataset, indices):
+        self.dataset = dataset
+        self.indices = list(indices)
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, i):
+        return self.dataset[self.indices[i]]
+
+
+# ══════════════════════════════════════════════════════════════
+# Model
+# ══════════════════════════════════════════════════════════════
+class SinPosEnc(nn.Module):
+    def __init__(self, d_model, max_len=512, dropout=0.1):
+        super().__init__()
+        self.drop = nn.Dropout(dropout)
+
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(max_len).unsqueeze(1).float()
+        div = torch.exp(
+            torch.arange(0, d_model, 2).float()
+            * (-math.log(10000.0) / d_model)
+        )
+
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+
+        self.register_buffer("pe", pe.unsqueeze(0))
+
+    def forward(self, x):
+        return self.drop(x + self.pe[:, :x.size(1)])
+
+
+class BodySetAE(nn.Module):
+    """
+    Order-invariant body-set AE.
+
+    Encoder:
+      token body encoder 공유
+      body embeddings -> set transformer without body positional encoding
+      masked mean pooling -> z
+
+    Decoder:
+      z -> unordered body slots
+      각 slot이 body token sequence를 직접 출력
+    """
+
+    def __init__(self, cfg, max_bodies, max_body_len):
+        super().__init__()
+
+        self.cfg = cfg
+        self.max_bodies = int(max_bodies)
+        self.max_body_len = int(max_body_len)
+        self.d_model = int(cfg.d_model)
+        self.latent = int(cfg.latent)
+
+        self.cmd_emb = nn.Embedding(
+            N_CMD_WITH_PAD,
+            cfg.d_model,
+            padding_idx=PAD_CMD_CLASS,
+        )
+
+        self.param_embs = nn.ModuleList([
+            nn.Embedding(
+                N_QUANT + 1,
+                cfg.d_param,
+                padding_idx=PAD_PARAM_INDEX,
+            )
+            for _ in range(N_ARGS)
+        ])
+
+        if cfg.n_freq_bands > 0:
+            freqs = (2.0 ** torch.arange(cfg.n_freq_bands).float()) * math.pi
+            self.register_buffer("fourier_freqs", freqs)
+            param_in = N_ARGS * cfg.d_param + N_ARGS * 2 * cfg.n_freq_bands
+        else:
+            self.fourier_freqs = None
+            param_in = N_ARGS * cfg.d_param
+
+        self.param_proj = nn.Linear(param_in, cfg.d_model)
+        self.emb_norm = nn.LayerNorm(cfg.d_model)
+        self.body_pos_enc = SinPosEnc(cfg.d_model, max_len=max_body_len + 8, dropout=cfg.dropout)
+
+        body_layer = nn.TransformerEncoderLayer(
+            d_model=cfg.d_model,
+            nhead=cfg.nhead,
+            dim_feedforward=cfg.d_ff,
+            dropout=cfg.dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.body_encoder = nn.TransformerEncoder(
+            body_layer,
+            num_layers=cfg.n_body_enc_layers,
+            norm=nn.LayerNorm(cfg.d_model),
+        )
+
+        set_layer = nn.TransformerEncoderLayer(
+            d_model=cfg.d_model,
+            nhead=cfg.nhead,
+            dim_feedforward=cfg.d_ff,
+            dropout=cfg.dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.set_encoder = nn.TransformerEncoder(
+            set_layer,
+            num_layers=cfg.n_set_layers,
+            norm=nn.LayerNorm(cfg.d_model),
+        )
+
+        self.to_z = nn.Sequential(
+            nn.Linear(cfg.d_model, cfg.latent),
+            nn.LayerNorm(cfg.latent),
+        )
+
+        self.z_to_mem = nn.Linear(cfg.latent, cfg.d_model)
+        self.z_to_slot_bias = nn.Linear(cfg.latent, cfg.d_model)
+
+        self.slot_queries = nn.Parameter(torch.randn(max_bodies, cfg.d_model) * 0.02)
+
+        slot_layer = nn.TransformerDecoderLayer(
+            d_model=cfg.d_model,
+            nhead=cfg.nhead,
+            dim_feedforward=cfg.d_ff,
+            dropout=cfg.dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.slot_decoder = nn.TransformerDecoder(
+            slot_layer,
+            num_layers=cfg.n_slot_dec_layers,
+            norm=nn.LayerNorm(cfg.d_model),
+        )
+
+        self.presence_head = nn.Linear(cfg.d_model, 1)
+
+        self.body_token_pos = nn.Parameter(torch.randn(max_body_len, cfg.d_model) * 0.02)
+        self.token_dec_norm = nn.LayerNorm(cfg.d_model)
+
+        self.cmd_out = nn.Linear(cfg.d_model, N_CMD_WITH_PAD)
+        self.param_out = nn.Linear(cfg.d_model, N_ARGS * N_QUANT)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for n, p in self.named_parameters():
+            if p.dim() > 1 and "body_token_pos" not in n and "slot_queries" not in n:
+                nn.init.xavier_uniform_(p)
+
+    def _embed_body_tokens(self, x):
+        """
+        x: [B2, L, 17]
+        """
+        cmd = x[:, :, 0].long()
+        params = x[:, :, 1:].long()
+
+        tok_pad = cmd < 0
+
+        cmd_idx = cmd.clone()
+        cmd_idx[tok_pad] = PAD_CMD_CLASS
+        cmd_idx = cmd_idx.clamp(0, PAD_CMD_CLASS)
+        cmd_e = self.cmd_emb(cmd_idx)
+
+        prm_idx = params.clone()
+        prm_idx[prm_idx < 0] = PAD_PARAM_INDEX
+        prm_idx = prm_idx.clamp(0, PAD_PARAM_INDEX)
+
+        slot_embs = [
+            self.param_embs[s](prm_idx[:, :, s])
+            for s in range(N_ARGS)
+        ]
+        prm_cat = torch.cat(slot_embs, dim=-1)
+
+        if self.fourier_freqs is not None:
+            p_int = prm_idx.clone()
+            pad_p = params < 0
+            p_int[pad_p] = 0
+            p_f = p_int.float() / float(QMAX)
+
+            ang = p_f.unsqueeze(-1) * self.fourier_freqs.view(1, 1, 1, -1)
+            sin_p = torch.sin(ang)
+            cos_p = torch.cos(ang)
+
+            mask = 1.0 - pad_p.unsqueeze(-1).float()
+            fourier = torch.cat([sin_p * mask, cos_p * mask], dim=-1)
+            fourier = fourier.reshape(x.size(0), x.size(1), N_ARGS * 2 * self.cfg.n_freq_bands)
+
+            prm_cat = torch.cat([prm_cat, fourier], dim=-1)
+
+        prm_e = self.param_proj(prm_cat)
+
+        emb = self.emb_norm(cmd_e + prm_e)
+        emb = emb * (~tok_pad).unsqueeze(-1)
+
+        return emb, tok_pad
+
+    def encode(self, bodies, body_mask):
+        """
+        bodies: [B, M, L, 17]
+        body_mask: [B, M]
+        """
+        B, M, L, _ = bodies.shape
+
+        flat = bodies.reshape(B * M, L, 17)
+        emb, tok_pad = self._embed_body_tokens(flat)
+        emb = self.body_pos_enc(emb)
+
+        h = self.body_encoder(
+            emb,
+            src_key_padding_mask=tok_pad,
+        )
+
+        valid_tok = (~tok_pad).float().unsqueeze(-1)
+        body_emb = (h * valid_tok).sum(dim=1) / valid_tok.sum(dim=1).clamp(min=1.0)
+        body_emb = body_emb.view(B, M, self.d_model)
+
+        # body order를 알려주는 positional embedding을 넣지 않는다.
+        set_h = self.set_encoder(
+            body_emb,
+            src_key_padding_mask=~body_mask,
+        )
+
+        valid_body = body_mask.float().unsqueeze(-1)
+        pooled = (set_h * valid_body).sum(dim=1) / valid_body.sum(dim=1).clamp(min=1.0)
+
+        z = self.to_z(pooled)
+        return z
+
+    def decode_from_z(self, z):
+        B = z.size(0)
+        M = self.max_bodies
+        L = self.max_body_len
+
+        mem = self.z_to_mem(z).unsqueeze(1)
+
+        q = self.slot_queries.unsqueeze(0).expand(B, -1, -1)
+        q = q + self.z_to_slot_bias(z).unsqueeze(1)
+
+        slot_h = self.slot_decoder(tgt=q, memory=mem)
+
+        presence_logits = self.presence_head(slot_h).squeeze(-1)
+
+        tok_h = slot_h.unsqueeze(2) + self.body_token_pos.view(1, 1, L, self.d_model)
+        tok_h = self.token_dec_norm(tok_h)
+
+        cmd_logits = self.cmd_out(tok_h)
+        prm_logits = self.param_out(tok_h).view(B, M, L, N_ARGS, N_QUANT)
+
+        return {
+            "cmd_logits": cmd_logits,
+            "prm_logits": prm_logits,
+            "presence_logits": presence_logits,
+        }
+
+    def forward(self, bodies, body_mask):
+        z = self.encode(bodies, body_mask)
+        dec = self.decode_from_z(z)
+        return dec, z
+
+    @torch.no_grad()
+    def generate_bodies(self, z, presence_thr=0.5):
+        dec = self.decode_from_z(z)
+        cmd = torch.argmax(dec["cmd_logits"], dim=-1)
+        prm = torch.argmax(dec["prm_logits"], dim=-1)
+        pres = torch.sigmoid(dec["presence_logits"])
+
+        B, M, L = cmd.shape
+        out = []
+
+        for b in range(B):
+            bodies = []
+            for m in range(M):
+                rows = []
+                for l in range(L):
+                    c = int(cmd[b, m, l].item())
+                    if c == PAD_CMD_CLASS:
+                        continue
+
+                    row = np.full((17,), PAD_V, dtype=np.int32)
+                    row[0] = c
+
+                    npar = VALID_PAR.get(c, 0)
+                    if npar > 0:
+                        vals = prm[b, m, l, :npar].detach().cpu().numpy().astype(np.int32)
+                        row[1:1 + npar] = vals
+
+                    rows.append(row)
+
+                    if c == EXT:
+                        break
+
+                if rows and float(pres[b, m].item()) >= presence_thr:
+                    bodies.append(np.stack(rows, axis=0).astype(np.int32))
+            out.append((bodies, pres[b].detach().cpu().numpy()))
+        return out
+
+
+class SparamCommonResidualMLP(nn.Module):
+    def __init__(
+        self,
+        latent_dim,
+        n_freq,
+        common_curve,
+        hidden_mult=2.0,
+        dropout=0.3,
+        residual_scale=1.0,
+        zero_init_residual=True,
+    ):
+        super().__init__()
+
+        self.n_freq = int(n_freq)
+        self.residual_scale = float(residual_scale)
+
+        common_curve = torch.as_tensor(common_curve, dtype=torch.float32)
+        if common_curve.shape != (self.n_freq, 3):
+            raise ValueError(f"common_curve shape mismatch: {common_curve.shape}")
+
+        self.register_buffer("common_curve", common_curve)
+
+        h1 = max(int(latent_dim * hidden_mult), 128)
+        h2 = max(int(latent_dim * hidden_mult), 128)
+
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, h1),
+            nn.LayerNorm(h1),
+            nn.GELU(),
+            nn.Dropout(dropout),
+
+            nn.Linear(h1, h2),
+            nn.LayerNorm(h2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+
+            nn.Linear(h2, self.n_freq * 3),
+        )
+
+        if zero_init_residual:
+            last = self.net[-1]
+            nn.init.zeros_(last.weight)
+            nn.init.zeros_(last.bias)
+
+    def forward(self, z, return_parts=False):
+        residual_raw = self.net(z).view(-1, self.n_freq, 3)
+        residual = self.residual_scale * residual_raw
+        pred = self.common_curve.unsqueeze(0) + residual
+
+        if return_parts:
+            return pred, residual
+        return pred
+
+
+# ══════════════════════════════════════════════════════════════
+# Body-set matching loss
+# ══════════════════════════════════════════════════════════════
+def _body_pair_cost_matrix(cmd_logits_i, prm_logits_i, true_bodies_i, true_mask_i, cfg):
+    """
+    cmd_logits_i: [M, L, N_CMD_WITH_PAD]
+    prm_logits_i: [M, L, N_ARGS, N_QUANT]
+    true_bodies_i: [M, L, 17]
+    true_mask_i: [M]
+    """
+    device = cmd_logits_i.device
+    M, L, _ = cmd_logits_i.shape
+
+    true_ids = torch.nonzero(true_mask_i, as_tuple=False).view(-1)
+    Nt = int(true_ids.numel())
+
+    if Nt == 0:
+        return None, true_ids
+
+    costs = []
+
+    for p in range(M):
+        row_costs = []
+        for tj in true_ids:
+            tb = true_bodies_i[tj]  # [L,17]
+
+            cmd_t = tb[:, 0].long()
+            cmd_target = cmd_t.clone()
+            cmd_target[cmd_target < 0] = PAD_CMD_CLASS
+            cmd_target = cmd_target.clamp(0, PAD_CMD_CLASS)
+
+            cmd_loss = F.cross_entropy(
+                cmd_logits_i[p],
+                cmd_target,
+                reduction="mean",
+            )
+
+            prm_t = tb[:, 1:].long()
+            valid_prm = prm_t >= 0
+
+            if bool(valid_prm.any()):
+                prm_loss_all = F.cross_entropy(
+                    prm_logits_i[p].reshape(L * N_ARGS, N_QUANT),
+                    prm_t.clamp(0, QMAX).reshape(L * N_ARGS),
+                    reduction="none",
+                ).reshape(L, N_ARGS)
+
+                prm_loss = (prm_loss_all * valid_prm.float()).sum() / valid_prm.float().sum().clamp(min=1.0)
+            else:
+                prm_loss = torch.zeros((), device=device)
+
+            cost = cfg.body_cmd_weight * cmd_loss + cfg.body_param_weight * prm_loss
+            row_costs.append(cost)
+
+        costs.append(torch.stack(row_costs))
+
+    return torch.stack(costs, dim=0), true_ids
+
+
+def _hungarian_assign(cost_np):
+    """
+    cost shape [M, Nt]
+    returns pred_indices, true_col_indices
+    """
+    if HAS_SCIPY:
+        r, c = linear_sum_assignment(cost_np)
+        return list(r), list(c)
+
+    # fallback greedy
+    M, Nt = cost_np.shape
+    used_p = set()
+    pairs_p = []
+    pairs_t = []
+
+    flat = []
+    for i in range(M):
+        for j in range(Nt):
+            flat.append((float(cost_np[i, j]), i, j))
+    flat.sort(key=lambda x: x[0])
+
+    used_t = set()
+    for _, i, j in flat:
+        if i in used_p or j in used_t:
+            continue
+        used_p.add(i)
+        used_t.add(j)
+        pairs_p.append(i)
+        pairs_t.append(j)
+        if len(pairs_t) >= Nt:
+            break
+
+    return pairs_p, pairs_t
+
+
+def body_set_reconstruction_loss(dec, true_bodies, true_mask, cfg):
+    cmd_logits = dec["cmd_logits"]
+    prm_logits = dec["prm_logits"]
+    presence_logits = dec["presence_logits"]
+
+    B, M, L, _ = cmd_logits.shape
+
+    total_recon = cmd_logits.new_zeros(())
+    total_presence = cmd_logits.new_zeros(())
+    total_match_cost = 0.0
+    total_true = 0
+
+    for i in range(B):
+        cost, true_ids = _body_pair_cost_matrix(
+            cmd_logits[i],
+            prm_logits[i],
+            true_bodies[i],
+            true_mask[i],
+            cfg,
+        )
+
+        presence_target = torch.zeros((M,), dtype=torch.float32, device=cmd_logits.device)
+
+        if cost is not None:
+            cost_np = cost.detach().cpu().numpy()
+            pred_idx, true_col_idx = _hungarian_assign(cost_np)
+
+            matched_costs = []
+            for pp, tc in zip(pred_idx, true_col_idx):
+                matched_costs.append(cost[pp, tc])
+                presence_target[pp] = 1.0
+
+            if matched_costs:
+                recon_i = torch.stack(matched_costs).mean()
+            else:
+                recon_i = cmd_logits.new_zeros(())
+        else:
+            recon_i = cmd_logits.new_zeros(())
+
+        presence_i = F.binary_cross_entropy_with_logits(
+            presence_logits[i],
+            presence_target,
+            reduction="mean",
+        )
+
+        total_recon = total_recon + recon_i
+        total_presence = total_presence + presence_i
+
+        total_match_cost += float(recon_i.detach().item())
+        total_true += int(true_mask[i].sum().item())
+
+    recon = total_recon / B
+    presence = total_presence / B
+    total = recon + cfg.body_presence_weight * presence
+
+    comp = {
+        "body_recon": float(recon.detach().item()),
+        "presence": float(presence.detach().item()),
+        "body_total": float(total.detach().item()),
+        "avg_true_bodies": float(total_true / max(B, 1)),
+    }
+
+    return total, comp
+
+
+def sparam_full_interp_loss(pred_sel_db, true_sel_db, true_full_db, interp_w, cfg):
+    pred_full_db = interpolate_selected_to_full_torch(pred_sel_db, interp_w)
+
+    full_loss = ((pred_full_db - true_full_db) / cfg.db_loss_scale).pow(2).mean()
+    full_rmse_db = torch.sqrt(((pred_full_db - true_full_db) ** 2).mean())
+    sel_rmse_db = torch.sqrt(((pred_sel_db - true_sel_db) ** 2).mean())
+
+    comp = {
+        "sp_loss": float(full_loss.detach().item()),
+        "rmse_full": float(full_rmse_db.detach().item()),
+        "rmse_sel": float(sel_rmse_db.detach().item()),
+    }
+
+    return full_loss, comp
+
+
+def vicreg_z_loss(z, var_target=1.0, eps=1e-4):
+    B, D = z.shape
+    if B <= 1:
+        zero = z.new_zeros(())
+        return zero, zero
+
+    zc = z - z.mean(dim=0, keepdim=True)
+    std = torch.sqrt(zc.var(dim=0, unbiased=False) + eps)
+    var_loss = F.relu(var_target - std).mean()
+
+    cov = (zc.T @ zc) / max(B - 1, 1)
+    off = cov - torch.diag(torch.diag(cov))
+    cov_loss = (off ** 2).sum() / D
+
+    return var_loss, cov_loss
+
+
+# ══════════════════════════════════════════════════════════════
+# Epoch
+# ══════════════════════════════════════════════════════════════
+def run_epoch(ae, mlp, loader, optimizer, device, cfg, interp_w, train_mode=True):
+    if train_mode:
+        ae.train()
+        mlp.train()
+    else:
+        ae.eval()
+        mlp.eval()
+
+    acc = {
+        "total": 0.0,
+        "body": 0.0,
+        "presence": 0.0,
+        "sp": 0.0,
+        "rmse_full": 0.0,
+        "rmse_sel": 0.0,
+        "var": 0.0,
+        "cov": 0.0,
+        "z_std": 0.0,
+        "res_abs": 0.0,
+        "avg_true_bodies": 0.0,
+    }
+
+    n = 0
+
+    for batch in loader:
+        bodies, body_mask, y_sel, y_full, _tid = batch
+
+        bodies = bodies.to(device)
+        body_mask = body_mask.to(device)
+        y_sel = y_sel.to(device)
+        y_full = y_full.to(device)
+
+        if train_mode:
+            optimizer.zero_grad(set_to_none=True)
+
+        with torch.set_grad_enabled(train_mode):
+            dec, z = ae(bodies, body_mask)
+
+            body_loss, body_comp = body_set_reconstruction_loss(
+                dec,
+                bodies,
+                body_mask,
+                cfg,
+            )
+
+            pred_sel, residual = mlp(z, return_parts=True)
+
+            sp_loss, sp_comp = sparam_full_interp_loss(
+                pred_sel,
+                y_sel,
+                y_full,
+                interp_w,
+                cfg,
+            )
+
+            total = cfg.w_ae * body_loss + cfg.w_sparam * sp_loss
+
+            if cfg.use_vicreg and z.size(0) > 1:
+                var_loss, cov_loss = vicreg_z_loss(
+                    z,
+                    var_target=cfg.vicreg_var_target,
+                )
+                total = total + cfg.w_var * var_loss + cfg.w_cov * cov_loss
+            else:
+                var_loss = z.new_zeros(())
+                cov_loss = z.new_zeros(())
+
+            if train_mode:
+                total.backward()
+                nn.utils.clip_grad_norm_(
+                    list(ae.parameters()) + list(mlp.parameters()),
+                    cfg.grad_clip,
+                )
+                optimizer.step()
+
+        with torch.no_grad():
+            acc["total"] += float(total.item())
+            acc["body"] += body_comp["body_recon"]
+            acc["presence"] += body_comp["presence"]
+            acc["avg_true_bodies"] += body_comp["avg_true_bodies"]
+            acc["sp"] += sp_comp["sp_loss"]
+            acc["rmse_full"] += sp_comp["rmse_full"]
+            acc["rmse_sel"] += sp_comp["rmse_sel"]
+            acc["var"] += float(var_loss.item())
+            acc["cov"] += float(cov_loss.item())
+            acc["z_std"] += float(z.std(dim=0).mean().item()) if z.size(0) > 1 else 0.0
+            acc["res_abs"] += float(residual.abs().mean().item())
+
+        n += 1
+
+    return {k: v / max(n, 1) for k, v in acc.items()}
+
+
+# ══════════════════════════════════════════════════════════════
+# Data loading
+# ══════════════════════════════════════════════════════════════
+def load_multitype_data(cfg, script_dir):
+    n_types = len(cfg.npy_dirs)
+
+    if n_types != len(cfg.sparam_globs):
+        raise ValueError("npy_dirs and sparam_globs length mismatch.")
+
+    type_names = (
+        tuple(cfg.type_names)
+        if len(cfg.type_names) == n_types
+        else tuple(f"type{i + 1}" for i in range(n_types))
+    )
+
+    n_samples_per_type = (
+        tuple(cfg.n_samples_per_type)
+        if len(cfg.n_samples_per_type) == n_types
+        else tuple([0] * n_types)
+    )
+
+    freq_idx, freqs_full, freqs_sel = select_frequency_indices(
+        raw_n_freq=cfg.raw_n_freq,
+        target_n_freq=cfg.n_freq,
+        freq_start=cfg.freq_start,
+        freq_end=cfg.freq_end,
+        mode=cfg.freq_select_mode,
+    )
+    cfg.n_freq = int(len(freq_idx))
+    interp_matrix = build_interp_matrix_np(freqs_sel, freqs_full)
+
+    print(f"  Types: {list(type_names)}")
+    print(f"  n_samples per type: {list(n_samples_per_type)}")
+    print(f"  selected freq points: {cfg.n_freq}/{cfg.raw_n_freq}")
+    print(f"  freq range: {freqs_sel[0]:.4f} ~ {freqs_sel[-1]:.4f} GHz")
+
+    all_npy = []
+    all_sp_reim = []
+    all_tid = []
+    sparam_names_ref = None
+
+    for ti in range(n_types):
+        npy_dir = cfg.npy_dirs[ti]
+        sp_glob = cfg.sparam_globs[ti]
+        tname = type_names[ti]
+        n_pick = int(n_samples_per_type[ti])
+
+        npy_dir_abs = npy_dir if os.path.isabs(npy_dir) else os.path.join(script_dir, npy_dir)
+        sp_glob_abs = sp_glob if os.path.isabs(sp_glob) else os.path.join(script_dir, sp_glob)
+
+        print(f"\n  · [{tname}]")
+        print(f"    npy_dir     = {npy_dir_abs}")
+        print(f"    sparam_glob = {sp_glob_abs}")
+
+        npy_files = sorted(
+            glob.glob(os.path.join(npy_dir_abs, "*_tokens.npy")),
+            key=natural_key,
+        )
+        if not npy_files:
+            raise FileNotFoundError(f"No npy files: {npy_dir_abs}")
+
+        sp_files = sorted(glob.glob(sp_glob_abs), key=natural_key)
+        if not sp_files:
+            raise FileNotFoundError(f"No S-param files: {sp_glob_abs}")
+
+        sp_arr_raw, sp_names = load_sparam_data(
+            sp_files,
+            cfg.raw_n_freq,
+            expected_cols=sparam_names_ref,
+            verbose=False,
+        )
+
+        if sparam_names_ref is None:
+            sparam_names_ref = sp_names
+
+        n_match = min(len(npy_files), sp_arr_raw.shape[0])
+        if len(npy_files) != sp_arr_raw.shape[0]:
+            print(f"    count mismatch token/S-param → use first {n_match}")
+
+        npy_files = npy_files[:n_match]
+        sp_arr_raw = sp_arr_raw[:n_match]
+
+        if 0 < n_pick < n_match:
+            if cfg.sample_mode.lower() == "sequential":
+                pick = list(range(n_pick))
+            else:
+                rng = random.Random(cfg.seed + ti)
+                pick = sorted(rng.sample(range(n_match), n_pick))
+
+            npy_files = [npy_files[i] for i in pick]
+            sp_arr_raw = sp_arr_raw[pick]
+            print(f"    selected: {len(npy_files)} by {cfg.sample_mode}")
+        else:
+            print(f"    use all: {len(npy_files)}")
+
+        all_npy.extend(npy_files)
+        all_sp_reim.append(sp_arr_raw)
+        all_tid.extend([ti] * len(npy_files))
+
+    sparam_reim_all = np.concatenate(all_sp_reim, axis=0)
+    type_ids = np.asarray(all_tid, dtype=np.int64)
+
+    sparam_return3_reim, _ = filter_return3_sparams(
+        sparam_reim_all,
+        sparam_names_ref,
+        return_pairs=RETURN_PORT_PAIRS,
+        verbose=True,
+    )
+
+    sparam_db_full = return3_reim_to_db_np(sparam_return3_reim)
+    sparam_db = sparam_db_full[:, freq_idx, :]
+
+    # body statistics
+    n_bodies_list = []
+    body_len_list = []
+
+    for f in all_npy:
+        seq = np.load(f).astype(np.int32)
+        bodies = split_sequence_to_bodies(seq)
+        n_bodies_list.append(len(bodies))
+        for b in bodies:
+            body_len_list.append(len(b))
+
+    max_bodies = min(max(n_bodies_list), cfg.max_bodies_cap)
+    max_body_len = min(max(body_len_list), cfg.max_body_tokens_cap)
+
+    print("\n  Body-set statistics")
+    print(f"    body count mean/max : {np.mean(n_bodies_list):.2f} / {max(n_bodies_list)}")
+    print(f"    body len mean/max   : {np.mean(body_len_list):.2f} / {max(body_len_list)}")
+    print(f"    used max_bodies     : {max_bodies}")
+    print(f"    used max_body_len   : {max_body_len}")
+
+    dataset = BodySetDataset(
+        npy_files=all_npy,
+        sparam_db=sparam_db,
+        freqs=freqs_sel,
+        sparam_db_full=sparam_db_full,
+        freqs_full=freqs_full,
+        freq_idx=freq_idx,
+        interp_matrix=interp_matrix,
+        type_ids=type_ids,
+        type_names=type_names,
+        max_bodies=max_bodies,
+        max_body_len=max_body_len,
+    )
+
+    return dataset, type_ids, type_names
+
+
+def make_stratified_split(cfg, dataset, type_ids, type_names):
+    rng = random.Random(cfg.seed)
+
+    train_idx = []
+    val_idx = []
+    val_idx_per_type = {}
+
+    for ti in range(len(type_names)):
+        idx_t = [i for i in range(len(dataset)) if int(type_ids[i]) == ti]
+        rng.shuffle(idx_t)
+
+        n_val = max(1, int(len(idx_t) * cfg.val_ratio))
+        val_idx_per_type[ti] = idx_t[:n_val]
+        val_idx.extend(idx_t[:n_val])
+        train_idx.extend(idx_t[n_val:])
+
+    rng.shuffle(train_idx)
+    rng.shuffle(val_idx)
+
+    msg = ", ".join(
+        f"{type_names[ti]}:{int((type_ids == ti).sum()) - len(val_idx_per_type[ti])}/{len(val_idx_per_type[ti])}"
+        for ti in range(len(type_names))
+    )
+
+    print(f"  train={len(train_idx)} val={len(val_idx)}")
+    print(f"  per-type train/val: {msg}")
+
+    return train_idx, val_idx, val_idx_per_type
+
+
+def build_common_curve_and_print_baseline(dataset, train_idx, val_idx_per_type, type_names):
+    section("Common curve baseline RMSE")
+
+    common_sel = dataset.sparam_db[train_idx].mean(axis=0).astype(np.float32)
+    common_full = interpolate_selected_to_full_np(
+        common_sel,
+        dataset.freqs,
+        dataset.freqs_full,
+    )
+
+    total_full_sq = 0.0
+    total_full_n = 0
+
+    for ti, tname in enumerate(type_names):
+        idxs = val_idx_per_type.get(ti, [])
+        if not idxs:
+            continue
+
+        true_full = dataset.sparam_db_full[idxs]
+        pred_full = np.broadcast_to(common_full[None, :, :], true_full.shape)
+
+        full_rmse = float(np.sqrt(np.mean((pred_full - true_full) ** 2)))
+        print(f"  [{tname}] common full RMSE : {full_rmse:.3f} dB")
+
+        total_full_sq += float(np.sum((pred_full - true_full) ** 2))
+        total_full_n += int(np.prod(true_full.shape))
+
+    print(f"\n  TOTAL common full RMSE : {math.sqrt(total_full_sq / max(total_full_n, 1)):.3f} dB")
+    return common_sel
+
+
+# ══════════════════════════════════════════════════════════════
+# Evaluation
+# ══════════════════════════════════════════════════════════════
+@torch.no_grad()
+def collect_latents(ae, dataset, indices, device, batch_size=32):
+    ae.eval()
+    z_list = []
+    t_list = []
+
+    for i in range(0, len(indices), batch_size):
+        bi = indices[i:i + batch_size]
+
+        bodies = torch.stack([
+            torch.tensor(dataset.body_tensors[k], dtype=torch.float32)
+            for k in bi
+        ]).to(device)
+
+        masks = torch.stack([
+            torch.tensor(dataset.body_masks[k], dtype=torch.bool)
+            for k in bi
+        ]).to(device)
+
+        z = ae.encode(bodies, masks)
+        z_list.append(z.cpu().numpy())
+        t_list.extend([int(dataset.type_ids[k]) for k in bi])
+
+    return np.concatenate(z_list, axis=0), np.asarray(t_list, dtype=np.int64)
+
+
+@torch.no_grad()
+def evaluate_sparam(ae, mlp, dataset, val_idx_per_type, type_names, device):
+    ae.eval()
+    mlp.eval()
+
+    freqs_sel = dataset.freqs
+    freqs_full = dataset.freqs_full
+
+    total_sq = 0.0
+    total_n = 0
+    per_type = {}
+
+    for ti, tname in enumerate(type_names):
+        idxs = val_idx_per_type.get(ti, [])
+        if not idxs:
+            continue
+
+        preds = []
+        trues = []
+        residual_abs = []
+
+        for idx in idxs:
+            bodies = torch.tensor(dataset.body_tensors[idx], dtype=torch.float32).unsqueeze(0).to(device)
+            mask = torch.tensor(dataset.body_masks[idx], dtype=torch.bool).unsqueeze(0).to(device)
+
+            z = ae.encode(bodies, mask)
+            pred_sel, residual = mlp(z, return_parts=True)
+            pred_sel = pred_sel.cpu().numpy()[0]
+            pred_full = interpolate_selected_to_full_np(pred_sel, freqs_sel, freqs_full)
+
+            preds.append(pred_full)
+            trues.append(dataset.sparam_db_full[idx])
+            residual_abs.append(float(residual.abs().mean().item()))
+
+        preds = np.asarray(preds)
+        trues = np.asarray(trues)
+
+        ch = []
+        for c in range(3):
+            ch.append(float(np.sqrt(np.mean((preds[:, :, c] - trues[:, :, c]) ** 2))))
+
+        avg = float(np.sqrt(np.mean((preds - trues) ** 2)))
+
+        per_type[tname] = {
+            "n": len(idxs),
+            "ch": ch,
+            "avg": avg,
+            "res_abs": float(np.mean(residual_abs)),
+        }
+
+        total_sq += float(np.sum((preds - trues) ** 2))
+        total_n += int(np.prod(trues.shape))
+
+    overall = math.sqrt(total_sq / max(total_n, 1))
+    return {"per_type": per_type, "overall": overall}
+
+
+@torch.no_grad()
+def evaluate_body_reconstruction(ae, dataset, indices, device, n_eval=32):
+    ae.eval()
+
+    sel = list(indices)[:min(n_eval, len(indices))]
+
+    total_true = 0
+    total_pred_present = 0
+    total_matched = 0
+    total_cost = 0.0
+
+    for idx in sel:
+        bodies = torch.tensor(dataset.body_tensors[idx], dtype=torch.float32).unsqueeze(0).to(device)
+        mask = torch.tensor(dataset.body_masks[idx], dtype=torch.bool).unsqueeze(0).to(device)
+
+        dec, z = ae(bodies, mask)
+
+        cost, true_ids = _body_pair_cost_matrix(
+            dec["cmd_logits"][0],
+            dec["prm_logits"][0],
+            bodies[0],
+            mask[0],
+            ae.cfg,
+        )
+
+        n_true = int(mask[0].sum().item())
+        total_true += n_true
+
+        pres_prob = torch.sigmoid(dec["presence_logits"][0]).detach().cpu().numpy()
+        n_pred = int((pres_prob >= 0.5).sum())
+        total_pred_present += n_pred
+
+        if cost is not None:
+            cost_np = cost.detach().cpu().numpy()
+            pred_idx, true_col_idx = _hungarian_assign(cost_np)
+            total_matched += len(pred_idx)
+            total_cost += float(cost_np[pred_idx, true_col_idx].mean())
+
+    n = max(len(sel), 1)
+
+    print("\n  Body-set reconstruction diagnostic")
+    print(f"    samples evaluated       : {len(sel)}")
+    print(f"    avg true bodies         : {total_true / n:.2f}")
+    print(f"    avg predicted present   : {total_pred_present / n:.2f}")
+    print(f"    avg matched bodies      : {total_matched / n:.2f}")
+    print(f"    avg matched body cost   : {total_cost / n:.4f}")
+
+
+def print_sparam_eval(eval_metrics, type_names):
+    section("Return-3 full-grid RMSE")
+
+    for tname in type_names:
+        if tname not in eval_metrics["per_type"]:
+            continue
+
+        r = eval_metrics["per_type"][tname]
+        print(f"\n  [{tname}] n={r['n']}")
+        for i, lbl in enumerate(RETURN_LABELS):
+            print(f"    {lbl}: {r['ch'][i]:.3f} dB")
+        print(f"    AVG: {r['avg']:.3f} dB")
+        print(f"    mean |residual|: {r['res_abs']:.3f} dB")
+
+    print(f"\n  Overall interpolated full-grid RMSE")
+    print(f"    TOTAL: {eval_metrics['overall']:.4f} dB")
+
+
+# ══════════════════════════════════════════════════════════════
+# Visualization
+# ══════════════════════════════════════════════════════════════
+def _arc_pts(sx, sy, mx, my, ex, ey, n=32):
+    D = 2 * (sx * (my - ey) + mx * (ey - sy) + ex * (sy - my))
+    if abs(D) < 1e-9:
+        t = np.linspace(0, 1, n)
+        return list(zip(sx + (ex - sx) * t, sy + (ey - sy) * t))
+
+    ux = ((sx ** 2 + sy ** 2) * (my - ey)
+          + (mx ** 2 + my ** 2) * (ey - sy)
+          + (ex ** 2 + ey ** 2) * (sy - my)) / D
+    uy = ((sx ** 2 + sy ** 2) * (ex - mx)
+          + (mx ** 2 + my ** 2) * (sx - ex)
+          + (ex ** 2 + ey ** 2) * (mx - sx)) / D
+
+    r = math.sqrt((sx - ux) ** 2 + (sy - uy) ** 2)
+
+    a1 = math.atan2(sy - uy, sx - ux)
+    am = math.atan2(my - uy, mx - ux)
+    a2 = math.atan2(ey - uy, ex - ux)
+
+    def fix(a, ref):
+        while a - ref > math.pi:
+            a -= 2 * math.pi
+        while a - ref < -math.pi:
+            a += 2 * math.pi
+        return a
+
+    am = fix(am, a1)
+    a2 = fix(a2, a1)
+
+    if not (min(a1, a2) <= am <= max(a1, a2)):
+        a2 = a2 - 2 * math.pi if a2 > a1 else a2 + 2 * math.pi
+
+    return [(ux + r * math.cos(a), uy + r * math.sin(a)) for a in np.linspace(a1, a2, n)]
+
+
+def tokens_to_2d_loops(seq):
+    seq = trim_after_eos(seq)
+    loops = []
+    cur = []
+    cur_2d = (0.0, 0.0)
+
+    for row in seq:
+        cmd = int(row[0])
+        p = row[1:]
+
+        if cmd == SOL:
+            if cur:
+                loops.append(cur)
+            cur = []
+            cur_2d = (0.0, 0.0)
+
+        elif cmd == LINE:
+            if p[0] >= 0 and p[1] >= 0:
+                x = p[0] / QMAX
+                y = p[1] / QMAX
+                cur.append((x, y))
+                cur_2d = (x, y)
+
+        elif cmd == ARC:
+            if all(p[i] >= 0 for i in range(4)):
+                mx, my = p[0] / QMAX, p[1] / QMAX
+                ex, ey = p[2] / QMAX, p[3] / QMAX
+                sx, sy = cur_2d
+                pts = _arc_pts(sx, sy, mx, my, ex, ey)
+                cur.extend(pts[1:])
+                cur_2d = (ex, ey)
+
+        elif cmd == CIRCLE:
+            if all(p[i] >= 0 for i in range(3)):
+                cx, cy = p[0] / QMAX, p[1] / QMAX
+                r = (p[2] / QMAX) * 0.3
+                th = np.linspace(0, 2 * math.pi, 48, endpoint=False)
+                cur.extend([(cx + r * math.cos(a), cy + r * math.sin(a)) for a in th])
+
+        elif cmd == EXT:
+            if cur:
+                loops.append(cur)
+            cur = []
+
+        elif cmd == EOS:
+            break
+
+    if cur:
+        loops.append(cur)
+
+    return loops
+
+
+def plot_sequence_2d(ax, seq, title):
+    loops = tokens_to_2d_loops(seq)
+
+    for i, loop in enumerate(loops):
+        if len(loop) < 2:
+            continue
+        arr = np.asarray(loop)
+        ax.plot(arr[:, 0], arr[:, 1], lw=1.6, label=f"body {i+1}")
+        ax.scatter(arr[:, 0], arr[:, 1], s=8)
+
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlim(-0.1, 1.1)
+    ax.set_ylim(-0.1, 1.1)
+    ax.grid(True, alpha=0.25)
+    ax.set_title(title, fontsize=10)
+
+
+@torch.no_grad()
+def visualize_bodyset_reconstruction(ae, dataset, indices, device, n_preview=3):
+    ae.eval()
+
+    sel = list(indices)[:min(n_preview, len(indices))]
+    if not sel:
+        return
+
+    for pi, idx in enumerate(sel, 1):
+        bodies = torch.tensor(dataset.body_tensors[idx], dtype=torch.float32).unsqueeze(0).to(device)
+        mask = torch.tensor(dataset.body_masks[idx], dtype=torch.bool).unsqueeze(0).to(device)
+
+        z = ae.encode(bodies, mask)
+        gen_bodies, pres = ae.generate_bodies(z, presence_thr=0.5)
+        pred_seq = bodies_to_sequence(gen_bodies[0], None)
+
+        true_bodies = dataset.raw_bodies[idx]
+        true_seq = bodies_to_sequence(true_bodies, None)
+
+        t_id = int(dataset.type_ids[idx])
+        t_name = dataset.type_names[t_id]
+        fname = os.path.basename(dataset.npy_files[idx])
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5), facecolor="white")
+        plot_sequence_2d(axes[0], true_seq, f"Original body set\n[{t_name}] {fname}")
+        plot_sequence_2d(axes[1], pred_seq, f"Reconstructed body set\norder-free decoder")
+
+        fig.suptitle(
+            f"Body-set reconstruction compare #{pi}\n"
+            f"true bodies={len(true_bodies)}, pred present={(pres >= 0.5).sum()}",
+            fontsize=11,
+        )
+        plt.tight_layout(rect=[0, 0, 1, 0.9])
+
+    print(f"  ✓ body-set reconstruction figures generated: {len(sel)}")
+
+
+def plot_training_curves(hist):
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4), facecolor="white")
+    ep = np.arange(1, len(hist["tr_full"]) + 1)
+
+    axes[0].plot(ep, hist["tr_full"], label="train full RMSE")
+    axes[0].plot(ep, hist["va_full"], label="val full RMSE")
+    axes[0].set_title("Full-grid RMSE")
+    axes[0].set_xlabel("epoch")
+    axes[0].set_ylabel("dB")
+    axes[0].grid(True, alpha=0.25)
+    axes[0].legend()
+
+    axes[1].plot(ep, hist["tr_total"], label="train total")
+    axes[1].plot(ep, hist["va_total"], label="val total")
+    axes[1].set_title("Total loss")
+    axes[1].set_xlabel("epoch")
+    axes[1].grid(True, alpha=0.25)
+    axes[1].legend()
+
+    axes[2].plot(ep, hist["tr_body"], label="body recon")
+    axes[2].plot(ep, hist["tr_presence"], label="presence")
+    axes[2].plot(ep, hist["z_std"], label="z_std")
+    axes[2].set_title("Body-set/VICReg")
+    axes[2].set_xlabel("epoch")
+    axes[2].grid(True, alpha=0.25)
+    axes[2].legend()
+
+    plt.tight_layout()
+    print("  ✓ training curves figure generated")
+
+
+# ══════════════════════════════════════════════════════════════
+# Inverse design
+# ══════════════════════════════════════════════════════════════
+def make_target_db_curve(freqs_full, target_freqs, bandwidth_ghz, deep_db=-15.0, flat_db=0.0):
+    freqs_full = np.asarray(freqs_full, dtype=np.float32)
+    target = np.full((len(freqs_full), 3), flat_db, dtype=np.float32)
+    masks = np.zeros((len(freqs_full), 3), dtype=bool)
+
+    half = bandwidth_ghz / 2.0
+    for c, f0 in enumerate(target_freqs):
+        m = np.abs(freqs_full - f0) <= half
+        target[m, c] = deep_db
+        masks[:, c] = m
+
+    return target, masks
+
+
+def inverse_design_optimize(ae, mlp, dataset, cfg, device):
+    section("INVERSE DESIGN — body-set latent optimization")
+
+    if cfg.inverse_target_type_id is None:
+        prior_indices = list(range(len(dataset)))
+        print("  prior: all types")
+    else:
+        prior_indices = [
+            i for i in range(len(dataset))
+            if int(dataset.type_ids[i]) == int(cfg.inverse_target_type_id)
+        ]
+        print(f"  prior: type_id={cfg.inverse_target_type_id}, n={len(prior_indices)}")
+
+    z_prior_np, _ = collect_latents(ae, dataset, prior_indices, device)
+    z_prior = torch.tensor(z_prior_np, dtype=torch.float32, device=device)
+
+    z_mean = z_prior.mean(dim=0)
+    z_std = z_prior.std(dim=0).clamp(min=1e-3)
+
+    target_full_np, masks_np = make_target_db_curve(
+        dataset.freqs_full,
+        cfg.inverse_freqs,
+        cfg.inverse_bw_ghz,
+        deep_db=cfg.inverse_deep_db,
+        flat_db=0.0,
+    )
+
+    target_full = torch.tensor(target_full_np, dtype=torch.float32, device=device)
+    masks = torch.tensor(masks_np, dtype=torch.bool, device=device)
+    interp_w = torch.tensor(dataset.interp_matrix, dtype=torch.float32, device=device)
+
+    rng = np.random.default_rng(cfg.seed)
+    n_starts = min(cfg.inverse_n_starts, len(prior_indices))
+    pick = rng.choice(z_prior.size(0), size=n_starts, replace=False)
+
+    z = z_prior[pick].clone().detach().requires_grad_(True)
+    opt = torch.optim.Adam([z], lr=cfg.inverse_lr)
+
+    best_loss = float("inf")
+    best_z = None
+    best_pred = None
+
+    in_count = masks.float().sum(dim=0).clamp(min=1.0).unsqueeze(0)
+
+    print(f"  targets: {cfg.inverse_freqs} GHz, bw={cfg.inverse_bw_ghz} GHz, deep={cfg.inverse_deep_db} dB")
+    print(f"  starts={n_starts}, iters={cfg.inverse_n_iters}")
+
+    for it in range(cfg.inverse_n_iters):
+        progress = it / max(cfg.inverse_n_iters - 1, 1)
+        prior_w = cfg.inverse_z_prior_weight + (
+            cfg.inverse_z_prior_weight_end - cfg.inverse_z_prior_weight
+        ) * progress
+
+        opt.zero_grad()
+
+        pred_sel = mlp(z)
+        pred_full = interpolate_selected_to_full_torch(pred_sel, interp_w)
+
+        diff = pred_full - target_full.unsqueeze(0)
+        in_violate = F.relu(diff) ** 2
+        in_band = (in_violate * masks.unsqueeze(0).float()).sum(dim=1) / in_count
+        match_per = in_band.mean(dim=-1)
+
+        z_reg = (((z - z_mean) / z_std) ** 2).mean(dim=-1)
+        loss_per = match_per + prior_w * z_reg
+        loss = loss_per.sum()
+
+        loss.backward()
+        opt.step()
+
+        with torch.no_grad():
+            bi = int(torch.argmin(match_per).item())
+            cur = float(match_per[bi].item())
+            if cur < best_loss:
+                best_loss = cur
+                best_z = z[bi:bi + 1].detach().clone()
+                best_pred = pred_full[bi].detach().cpu().numpy()
+
+        if it == 0 or (it + 1) % 100 == 0 or it == cfg.inverse_n_iters - 1:
+            print(f"    iter {it+1:4d}/{cfg.inverse_n_iters} | best={best_loss:.4f} | prior_w={prior_w:.2e}")
+
+    return {
+        "best_z": best_z,
+        "best_loss": best_loss,
+        "best_pred": best_pred,
+        "target_full": target_full_np,
+        "masks": masks_np,
+    }
+
+
+def visualize_inverse_result(ae, dataset, inv_result, cfg):
+    freqs = dataset.freqs_full
+    pred = inv_result["best_pred"]
+    target = inv_result["target_full"]
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), facecolor="white")
+    for c, lbl in enumerate(RETURN_LABELS):
+        ax = axes[c]
+        ax.plot(freqs, pred[:, c], lw=1.7, label="surrogate pred")
+        ax.plot(freqs, target[:, c], lw=1.2, ls="--", label="target")
+        ax.axhline(-10, color="gray", lw=0.8, ls=":")
+        ax.set_title(lbl)
+        ax.set_xlabel("GHz")
+        ax.set_ylabel("dB")
+        ax.grid(True, alpha=0.25)
+        ax.legend(fontsize=8)
+    plt.tight_layout()
+
+    with torch.no_grad():
+        gen_bodies, pres = ae.generate_bodies(inv_result["best_z"], presence_thr=0.5)
+        seq = bodies_to_sequence(gen_bodies[0], None)
+
+    fig, ax = plt.subplots(1, 1, figsize=(6, 6), facecolor="white")
+    plot_sequence_2d(ax, seq, "Inverse-designed decoded body set")
+    plt.tight_layout()
+
+    print(f"  ✓ inverse figures generated | decoded bodies={(pres >= 0.5).sum()}")
+
+
+# ══════════════════════════════════════════════════════════════
+# Train
+# ══════════════════════════════════════════════════════════════
+def train_bodyset_model(cfg, dataset, train_idx, val_idx, val_idx_per_type, type_names, common_curve, device):
+    set_seed(cfg.seed)
+
+    train_loader = DataLoader(
+        SubsetDataset(dataset, train_idx),
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=0,
+    )
+    val_loader = DataLoader(
+        SubsetDataset(dataset, val_idx),
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=0,
+    )
+
+    ae = BodySetAE(
+        cfg,
+        max_bodies=dataset.max_bodies,
+        max_body_len=dataset.max_body_len,
+    ).to(device)
+
+    mlp = SparamCommonResidualMLP(
+        latent_dim=cfg.latent,
+        n_freq=cfg.n_freq,
+        common_curve=common_curve,
+        hidden_mult=cfg.mlp_hidden_mult,
+        dropout=cfg.mlp_dropout,
+        residual_scale=cfg.residual_scale,
+        zero_init_residual=cfg.zero_init_residual,
+    ).to(device)
+
+    ae_params = sum(p.numel() for p in ae.parameters())
+    mlp_params = sum(p.numel() for p in mlp.parameters())
+
+    section("BUILD BODY-SET MODEL")
+    print(f"  AE params       : {ae_params:,}")
+    print(f"  Surrogate params: {mlp_params:,}")
+    print(f"  Total params    : {ae_params + mlp_params:,}")
+    print(f"  max_bodies      : {dataset.max_bodies}")
+    print(f"  max_body_len    : {dataset.max_body_len}")
+    print(f"  body order      : ignored via Hungarian matching")
+    print(f"  VICReg          : w_var={cfg.w_var}, w_cov={cfg.w_cov}, target={cfg.vicreg_var_target}")
+
+    opt = torch.optim.AdamW(
+        [
+            {"params": list(ae.parameters()), "lr": cfg.lr_ae},
+            {"params": list(mlp.parameters()), "lr": cfg.lr_mlp},
+        ],
+        weight_decay=cfg.weight_decay,
+        betas=(0.9, 0.98),
+    )
+
+    def lr_sched(ep):
+        if ep < cfg.warmup:
+            return (ep + 1) / max(1, cfg.warmup)
+        return 0.5 * (
+            1.0 + math.cos(math.pi * (ep - cfg.warmup) / max(1, cfg.epochs - cfg.warmup))
+        )
+
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_sched)
+
+    interp_w = torch.tensor(dataset.interp_matrix, dtype=torch.float32, device=device)
+
+    hist = {
+        "tr_total": [], "va_total": [],
+        "tr_full": [], "va_full": [],
+        "tr_body": [], "tr_presence": [],
+        "z_std": [],
+    }
+
+    best_val = float("inf")
+    best_ae = None
+    best_mlp = None
+
+    log_every = max(1, cfg.epochs // 8)
+
+    section("TRAIN BODY-SET AE + SURROGATE")
+    print(
+        f"\n  {'ep':>4s} | "
+        f"{'tr_tot':>8s} {'body':>8s} {'pres':>7s} {'tr_full':>8s} "
+        f"{'var':>7s} {'cov':>7s} {'zstd':>6s} | "
+        f"{'va_tot':>8s} {'va_full':>8s} {'va_body':>8s} {'va_pres':>7s} | {'lr':>8s}"
+    )
+    print("  " + "-" * 132)
+
+    for ep in range(1, cfg.epochs + 1):
+        tr = run_epoch(ae, mlp, train_loader, opt, device, cfg, interp_w, train_mode=True)
+        va = run_epoch(ae, mlp, val_loader, opt, device, cfg, interp_w, train_mode=False)
+
+        sched.step()
+
+        hist["tr_total"].append(tr["total"])
+        hist["va_total"].append(va["total"])
+        hist["tr_full"].append(tr["rmse_full"])
+        hist["va_full"].append(va["rmse_full"])
+        hist["tr_body"].append(tr["body"])
+        hist["tr_presence"].append(tr["presence"])
+        hist["z_std"].append(tr["z_std"])
+
+        if va["rmse_full"] < best_val:
+            best_val = va["rmse_full"]
+            best_ae = {k: v.detach().clone().cpu() for k, v in ae.state_dict().items()}
+            best_mlp = {k: v.detach().clone().cpu() for k, v in mlp.state_dict().items()}
+
+        if ep == 1 or ep % log_every == 0 or ep == cfg.epochs:
+            print(
+                f"  {ep:4d} | "
+                f"{tr['total']:8.4f} {tr['body']:8.3f} {tr['presence']:7.3f} {tr['rmse_full']:8.3f} "
+                f"{tr['var']:7.4f} {tr['cov']:7.4f} {tr['z_std']:6.3f} | "
+                f"{va['total']:8.4f} {va['rmse_full']:8.3f} {va['body']:8.3f} {va['presence']:7.3f} | "
+                f"{opt.param_groups[0]['lr']:8.2e}"
+            )
+
+    print(f"\n  Best val full-grid RMSE: {best_val:.4f} dB")
+
+    if best_ae is not None:
+        ae.load_state_dict({k: v.to(device) for k, v in best_ae.items()})
+    if best_mlp is not None:
+        mlp.load_state_dict({k: v.to(device) for k, v in best_mlp.items()})
+
+    section("EVALUATION")
+    evaluate_body_reconstruction(ae, dataset, val_idx, device, n_eval=min(64, len(val_idx)))
+
+    eval_metrics = evaluate_sparam(ae, mlp, dataset, val_idx_per_type, type_names, device)
+    print_sparam_eval(eval_metrics, type_names)
+
+    z_val, _ = collect_latents(ae, dataset, val_idx, device)
+    z_std = z_val.std(axis=0)
+
+    print("\n  Latent diagnostic")
+    print(f"    z shape        : {z_val.shape}")
+    print(f"    z_std mean     : {z_std.mean():.4f}")
+    print(f"    z_std min/max  : {z_std.min():.4f} / {z_std.max():.4f}")
+    print(f"    dead dims      : {(z_std < 1e-3).sum()} / {z_val.shape[1]}")
+
+    if cfg.show_figures:
+        subsection("Figures")
+        plot_training_curves(hist)
+        visualize_bodyset_reconstruction(ae, dataset, val_idx, device, n_preview=cfg.n_preview)
+
+    result = {
+        "best_val": best_val,
+        "eval_full": eval_metrics["overall"],
+    }
+
+    return ae, mlp, result
+
+
+# ══════════════════════════════════════════════════════════════
+# Main
+# ══════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    os.chdir(script_dir)
+
+    from datetime import datetime as _dt
+
+    run_tag = _dt.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(script_dir, f"training_bodyset_return3_{run_tag}.log")
+    log_file = setup_log_file(log_path)
+
+    print(f"[LOG] Tee active → file: {log_path}")
+
+    t0 = time.time()
+
+    # ---------------------------------------------------------
+    # 실행 설정
+    # ---------------------------------------------------------
+    PRESET = "tiny"      # tiny / small / full / custom
+    USE_TYPES = [1, 2, 3]
+
+    RAW_N_FREQ = 401
+    SELECTED_N_FREQ = 81
+
+    # custom일 때만 직접 반영. tiny/small/full이면 preset 우선.
+    SAMPLES_PER_TYPE = (300, 300, 300)
+
+    SHOW_FIGURES = True
+    N_PREVIEW = 3
+
+    RUN_INVERSE_DESIGN = False
+
+    # None이면 전체 type prior 사용.
+    # type3 안에서만 inverse 하고 싶으면 2.
+    INVERSE_TARGET_TYPE_ID = None
+
+    _TYPE_DATA = {
+        1: (
+            os.path.join(script_dir, "hfss_results", "step_test"),
+            os.path.join(script_dir, "hfss_results", "sparam", "[12].*"),
+        ),
+        2: (
+            os.path.join(script_dir, "hfss_results", "step_test1"),
+            os.path.join(script_dir, "hfss_results", "sparam", "3.*"),
+        ),
+        3: (
+            os.path.join(script_dir, "hfss_results", "step_test2"),
+            os.path.join(script_dir, "hfss_results", "sparam", "4.*"),
+        ),
+    }
+
+    for t in USE_TYPES:
+        if t not in _TYPE_DATA:
+            raise ValueError(f"Undefined type number: {t}")
+
+    npy_dirs = tuple(_TYPE_DATA[t][0] for t in USE_TYPES)
+    sparam_globs = tuple(_TYPE_DATA[t][1] for t in USE_TYPES)
+    type_names = tuple(f"type{t}" for t in USE_TYPES)
+
+    cfg = CFG(
+        preset=PRESET,
+        seed=7,
+
+        npy_dirs=npy_dirs,
+        sparam_globs=sparam_globs,
+        type_names=type_names,
+        n_samples_per_type=SAMPLES_PER_TYPE,
+        sample_mode="random",
+
+        raw_n_freq=RAW_N_FREQ,
+        n_freq=SELECTED_N_FREQ,
+        freq_select_mode="linspace",
+        freq_start=1.0,
+        freq_end=5.0,
+
+        use_vicreg=True,
+        w_var=0.5,
+        w_cov=0.05,
+        vicreg_var_target=1.0,
+
+        show_figures=SHOW_FIGURES,
+        n_preview=N_PREVIEW,
+
+        run_inverse_design=RUN_INVERSE_DESIGN,
+        inverse_target_type_id=INVERSE_TARGET_TYPE_ID,
+    )
+
+    try:
+        apply_preset(cfg)
+
+        # preset 적용 후 고정값 재적용
+        cfg.show_figures = SHOW_FIGURES
+        cfg.n_preview = N_PREVIEW
+        cfg.run_inverse_design = RUN_INVERSE_DESIGN
+        cfg.inverse_target_type_id = INVERSE_TARGET_TYPE_ID
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        section("Body-Set DeepCAD AE + Return-3 Surrogate")
+        print(f"  Python : {_sys.version.split()[0]}")
+        print(f"  Torch  : {torch.__version__}")
+        print(f"  Device : {device}" + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
+        print(f"  Backend: {_MPL_BACKEND}")
+        print(f"  Preset : {cfg.preset}")
+        print(f"  Types  : {type_names}")
+        print(f"  SciPy Hungarian: {HAS_SCIPY}")
+        print("")
+        print("  Important:")
+        print("    body order is ignored during AE reconstruction loss")
+        print("    matching = Hungarian body-to-body assignment")
+
+        section("LOAD DATA")
+        dataset, type_ids, type_names = load_multitype_data(cfg, script_dir)
+
+        section("SPLIT")
+        train_idx, val_idx, val_idx_per_type = make_stratified_split(
+            cfg,
+            dataset,
+            type_ids,
+            type_names,
+        )
+
+        common_curve = build_common_curve_and_print_baseline(
+            dataset,
+            train_idx,
+            val_idx_per_type,
+            type_names,
+        )
+
+        ae, mlp, result = train_bodyset_model(
+            cfg,
+            dataset,
+            train_idx,
+            val_idx,
+            val_idx_per_type,
+            type_names,
+            common_curve,
+            device,
+        )
+
+        if cfg.run_inverse_design:
+            inv_result = inverse_design_optimize(ae, mlp, dataset, cfg, device)
+            if cfg.show_figures:
+                visualize_inverse_result(ae, dataset, inv_result, cfg)
+
+        section("DONE")
+        print(f"  Final eval_full RMSE : {result['eval_full']:.4f} dB")
+        print(f"  figures: {len(plt.get_fignums())} (backend={_MPL_BACKEND})")
+
+        elapsed = time.time() - t0
+        h = int(elapsed // 3600)
+        m = int((elapsed % 3600) // 60)
+        s = elapsed % 60
+        print(f"\n  elapsed before figure show: {h}h {m}m {s:.1f}s")
+
+        if cfg.show_figures and len(plt.get_fignums()) > 0:
+            try:
+                plt.show()
+            except KeyboardInterrupt:
+                print("\n[Ctrl+C] closing figures")
+            finally:
+                try:
+                    plt.close("all")
+                except Exception:
+                    pass
+
+    except Exception as e:
+        import traceback
+        print(f"\n[FATAL] {type(e).__name__}: {e}")
+        traceback.print_exc()
+
+    finally:
+        elapsed = time.time() - t0
+        h = int(elapsed // 3600)
+        m = int((elapsed % 3600) // 60)
+        s = elapsed % 60
+
+        print(f"\n  elapsed: {h}h {m}m {s:.1f}s")
+        print(f"[LOG CLOSED] {log_path}")
+
+        try:
+            log_file.close()
+        except Exception:
+            pass
