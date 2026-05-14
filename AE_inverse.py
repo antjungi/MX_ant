@@ -901,19 +901,28 @@ def render_3d_normalized(ax, sketches: list) -> list:
 
 
 def _equal_axes(ax):
+    """데이터의 실제 비율 그대로 box aspect 설정.
+    (1,1,1) 강제하면 길쭉한 구조도 정육면체처럼 보여서 왜곡됨."""
     lims = np.array([ax.get_xlim3d(), ax.get_ylim3d(), ax.get_zlim3d()])
-    c = lims.mean(axis=1)
-    r = max((lims[:, 1] - lims[:, 0]).max() / 2, 0.3)
-    ax.set_xlim3d(c[0] - r, c[0] + r)
-    ax.set_ylim3d(c[1] - r, c[1] + r)
-    ax.set_zlim3d(c[2] - r, c[2] + r)
+    extents = lims[:, 1] - lims[:, 0]
+    # 0/음수 방지 (flat sketch 등)
+    max_ext = float(extents.max()) if extents.size else 1.0
+    floor = max(max_ext * 0.02, 1e-3)
+    extents = np.maximum(extents, floor)
     try:
-        ax.set_box_aspect((1.0, 1.0, 1.0))
+        ax.set_box_aspect(tuple(extents))
     except Exception:
         pass
 
 
 def _style(ax, title):
+    # ★ Orthographic projection — perspective 왜곡 제거
+    #   기본은 'persp' 라 top/side view 에서 평면이 사다리꼴로 비틀려 보임.
+    try:
+        ax.set_proj_type("ortho")
+    except Exception:
+        pass
+
     ax.set_facecolor("white")
     for pane in (ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane):
         pane.fill = False
@@ -934,7 +943,9 @@ def _set_axes_and_render(ax, sketches, use_real):
     pts = render_3d_real(ax, sketches) if use_real else render_3d_normalized(ax, sketches)
     if pts:
         arr = np.array(pts)
-        pad = max((arr.max(axis=0) - arr.min(axis=0)).max() * 0.08, 0.1)
+        # ★ 더 넉넉한 padding (확대해도 잘려나가는 느낌 줄임)
+        ext = arr.max(axis=0) - arr.min(axis=0)
+        pad = max(float(ext.max()) * 0.18, 0.1)
         ax.set_xlim(arr[:, 0].min() - pad, arr[:, 0].max() + pad)
         ax.set_ylim(arr[:, 1].min() - pad, arr[:, 1].max() + pad)
         ax.set_zlim(arr[:, 2].min() - pad, arr[:, 2].max() + pad)
@@ -986,7 +997,7 @@ def show_comparison(orig_tok, recon_tok, fname, save_path,
     coord_label = "real coord (mm)" if use_real else "normalized"
 
     # ── 2행 × 2열 layout ──
-    fig = plt.figure(figsize=(13, 12), facecolor="white")
+    fig = plt.figure(figsize=(15, 14), facecolor="white")
     fig.suptitle(
         f"Geometry Comparison [{coord_label}]\n{fname}",
         fontsize=11, fontweight="normal", color="#222", y=0.985,
@@ -3534,9 +3545,13 @@ def _extend_dequant_meta(dq_meta, n_needed):
 @torch.no_grad()
 def visualize_decoded_structure(
     ae, z, dataset, device, title="Decoded structure",
+    separate_windows=False,
 ):
     """latent z → AE.generate() → 앞쪽 reconstruction viz 와 동일한 스타일로 표시.
     NN training sample 의 JSON 을 빌려서 real-coord(mm) 모드로 렌더.
+
+    separate_windows=True 면 4 개 view 를 각각 다른 figure (큰 창) 로 띄움.
+    확대해서 자세히 보고 싶을 때 유용.
     """
     ae.eval()
 
@@ -3575,26 +3590,23 @@ def visualize_decoded_structure(
         dims = []
         print("  (dimensions not annotated — normalized mode, no real-coord meta)")
 
-    # ── 2×2 layout (앞쪽 reconstruction viz 와 동일한 스타일) ──
-    fig = plt.figure(figsize=(13, 12), facecolor="white")
-    fig.suptitle(
-        f"{title} [{coord_label}]\n"
-        f"{recon_trim.shape[0]} tokens · "
-        f"{len(sketches)} extrude · "
-        f"{nl_total} loop\n"
-        f"{meta_note}",
-        fontsize=10, fontweight="normal", color="#222", y=0.985,
-    )
-
     views = [
-        (0, 0, "Decoded — 3D View",        28,   -55),
-        (0, 1, "Decoded — 3D View (alt)",  20,    45),
-        (1, 0, "Decoded — Top View",       89.9, -90.0),
-        (1, 1, "Decoded — Side View",       5,   -90),
+        ("Decoded — 3D View",        28,   -55),
+        ("Decoded — 3D View (alt)",  20,    45),
+        ("Decoded — Top View",       89.9, -90.0),
+        ("Decoded — Side View",       5,   -90),
     ]
 
-    for row, col, label, elev, azim in views:
-        ax = fig.add_subplot(2, 2, row * 2 + col + 1, projection="3d")
+    ne = len(sketches)
+    nl = (
+        sum(len(s["loops_3d"]) for s in sketches) if use_real
+        else sum(len(s["loops_2d"]) for s in sketches)
+    )
+    info_line = (
+        f"{recon_trim.shape[0]} tokens · {ne} extrude · {nl_total} loop"
+    )
+
+    def _draw_one(ax, label, elev, azim):
         if not sketches:
             ax.text2D(
                 0.5, 0.5, "(empty)",
@@ -3603,35 +3615,65 @@ def visualize_decoded_structure(
             )
             _style(ax, label)
             ax.view_init(elev=elev, azim=azim)
-            continue
+            return
         _set_axes_and_render(ax, sketches, use_real=use_real)
-        ne = len(sketches)
-        nl = (
-            sum(len(s["loops_3d"]) for s in sketches) if use_real
-            else sum(len(s["loops_2d"]) for s in sketches)
-        )
-        # ★ 모든 변/곡선/extrude 길이 라벨링 (mm)
         if use_real and dims:
             _annotate_dimensions(ax, dims)
-        _style(ax, f"{label}\n{ne} extrude · {nl} loop · {recon_trim.shape[0]} token")
+        _style(
+            ax,
+            f"{label}\n{ne} extrude · {nl} loop · {recon_trim.shape[0]} token",
+        )
         ax.view_init(elev=elev, azim=azim)
 
-    if sketches:
-        fig.legend(
-            handles=[
-                mpatches.Patch(color=PAL[i % len(PAL)], label=f"Sketch {i + 1}")
-                for i in range(len(sketches))
-            ],
-            loc="lower center", ncol=min(len(sketches), 6),
-            facecolor="white", edgecolor="#ddd", labelcolor="#444",
-            fontsize=9, framealpha=0.95,
+    if separate_windows:
+        # ── 4 개 view 를 각각 별도 figure 로 ──
+        for label, elev, azim in views:
+            fig = plt.figure(figsize=(10, 9), facecolor="white")
+            fig.suptitle(
+                f"{title} [{coord_label}]\n{info_line}\n{meta_note}",
+                fontsize=10, fontweight="normal", color="#222", y=0.985,
+            )
+            ax = fig.add_subplot(1, 1, 1, projection="3d")
+            _draw_one(ax, label, elev, azim)
+            if sketches:
+                fig.legend(
+                    handles=[
+                        mpatches.Patch(color=PAL[i % len(PAL)], label=f"Sketch {i + 1}")
+                        for i in range(len(sketches))
+                    ],
+                    loc="lower center", ncol=min(len(sketches), 6),
+                    facecolor="white", edgecolor="#ddd", labelcolor="#444",
+                    fontsize=9, framealpha=0.95,
+                )
+            plt.tight_layout(rect=[0, 0.04, 1, 0.94])
+    else:
+        # ── 기본: 2×2 grid ──
+        fig = plt.figure(figsize=(15, 14), facecolor="white")
+        fig.suptitle(
+            f"{title} [{coord_label}]\n{info_line}\n{meta_note}",
+            fontsize=10, fontweight="normal", color="#222", y=0.985,
         )
+        for slot, (label, elev, azim) in enumerate(views):
+            ax = fig.add_subplot(2, 2, slot + 1, projection="3d")
+            _draw_one(ax, label, elev, azim)
 
-    plt.tight_layout(rect=[0, 0.04, 1, 0.96])
+        if sketches:
+            fig.legend(
+                handles=[
+                    mpatches.Patch(color=PAL[i % len(PAL)], label=f"Sketch {i + 1}")
+                    for i in range(len(sketches))
+                ],
+                loc="lower center", ncol=min(len(sketches), 6),
+                facecolor="white", edgecolor="#ddd", labelcolor="#444",
+                fontsize=9, framealpha=0.95,
+            )
+        plt.tight_layout(rect=[0, 0.04, 1, 0.96])
+
+    n_figs_created = 4 if separate_windows else 1
     print(
         f"  ✓ decoded structure figure 생성 "
         f"(tokens={recon_trim.shape[0]}, mode={'real' if use_real else 'normalized'}, "
-        f"nn_idx={nn_idx}, nn_dist={nn_dist:.2f})"
+        f"nn_idx={nn_idx}, nn_dist={nn_dist:.2f}, figs={n_figs_created})"
     )
 
     return recon_trim, sketches
@@ -3659,6 +3701,7 @@ def run_inverse_design_pipeline(
     restart_frac=0.25,
     restart_noise=0.3,
     max_restarts=10,
+    separate_windows=False,
 ):
     section("INVERSE DESIGN — latent search + decode")
 
@@ -3715,6 +3758,7 @@ def run_inverse_design_pipeline(
         recon_trim, sketches = visualize_decoded_structure(
             ae, result["best_z"], dataset, device,
             title="Inverse-designed structure (decoded from optimal z)",
+            separate_windows=separate_windows,
         )
         result["decoded_tokens"] = recon_trim
         result["decoded_n_sketches"] = len(sketches)
@@ -3949,6 +3993,11 @@ if __name__ == "__main__":
         INV_RESTART_NOISE = 0.3        # restart 시 noise 크기
         INV_MAX_RESTARTS = 10          # 최대 restart 횟수
 
+        # ★ 디코딩된 구조 figure 를 별도 4 개 창으로 띄울지
+        #   False: 한 figure 안에 2×2 (overview, 기본)
+        #   True : 4 개 view 각각 별도 큰 창 (확대해서 자세히 볼 때 유용)
+        INV_SEPARATE_WINDOWS = False
+
         if cfg.show_figures and RUN_INVERSE_DESIGN:
             try:
                 inv_result = run_inverse_design_pipeline(
@@ -3973,6 +4022,7 @@ if __name__ == "__main__":
                     restart_frac=INV_RESTART_FRAC,
                     restart_noise=INV_RESTART_NOISE,
                     max_restarts=INV_MAX_RESTARTS,
+                    separate_windows=INV_SEPARATE_WINDOWS,
                 )
             except Exception as e:
                 import traceback as _tb
