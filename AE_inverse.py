@@ -205,6 +205,26 @@ class CFG:
 
 
 PRESETS = {
+    "test": dict(
+        # ★ 1-loop sanity check 용 (≈30 초 목표).
+        #   학습 품질은 신경 쓰지 말고 파이프라인 통과만 확인.
+        n_samples_each=30,
+        epochs=3,
+        warmup=1,
+        batch_size=4,
+        d_model=64,
+        d_param=16,
+        nhead=4,
+        n_enc=1,
+        n_dec=1,
+        d_ff=128,
+        latent=64,
+        mem_tokens=4,
+        dropout=0.0,
+        mlp_hidden_mult=1.0,
+        mlp_dropout=0.0,
+        weight_decay=1e-3,
+    ),
     "tiny": dict(
         n_samples_each=300,
         epochs=80,
@@ -4234,7 +4254,7 @@ if __name__ == "__main__":
     # ---------------------------------------------------------
     # 실행 설정
     # ---------------------------------------------------------
-    PRESET = "tiny"
+    PRESET = "test"   # test / tiny / small / full / custom
     LOG_VERBOSITY = "simple"
 
     USE_TYPES = [1, 2]
@@ -4449,6 +4469,17 @@ if __name__ == "__main__":
         INV_STEP_PATH = os.path.join(
             INV_STEP_DIR, f"inverse_design_{run_tag}.step",
         )
+
+        # ★ test preset 일 때 inverse design 도 가볍게 (≈30 초 목표)
+        if (cfg.preset or "").lower() == "test":
+            INV_N_STARTS = 4
+            INV_N_ITERS = 50
+            INV_MAX_RESTARTS = 1
+            INV_EARLY_STOP_PATIENCE = 30
+            INV_RESTART_PATIENCE = 20
+            print("  [TEST PRESET] inverse design 가볍게 축소:")
+            print(f"    n_starts={INV_N_STARTS}, n_iters={INV_N_ITERS}, "
+                  f"max_restarts={INV_MAX_RESTARTS}, early_stop={INV_EARLY_STOP_PATIENCE}")
 
         if cfg.show_figures and RUN_INVERSE_DESIGN:
             try:
