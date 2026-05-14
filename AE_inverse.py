@@ -2,19 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 DeepCAD AE + Return-3 Common-Curve Residual Surrogate
-Fixed medium_var VICReg Version + Reconstruction Visualization
-====================================================
+=====================================================
 
 목적:
-  - VICReg parameter sweep 제거
-  - 가장 잘 나온 medium_var 설정으로 고정
   - 한 번 실행하면 학습 + 평가 + 진단 로그 출력
-  - ★ AE encode 전/후 구조 비교 figure
-
-★ 패치 (v9g-clean):
-  - show_comparison() 에서 z-axis 정보 터미널 출력 제거
-  - 경과 시간 측정을 plt.show() 직전에 lock
-    (figure 띄워 놓고 사용자가 닫을 때까지 기다리는 시간 안 포함)
+  - 학습 후 reconstruction (encoder 입력 vs decoder 복원) 비교 figure
+  - RUN_INVERSE_DESIGN=True 일 때 latent 최적화 → 디코딩 → spec 매칭 figure
 """
 
 import matplotlib
