@@ -403,14 +403,18 @@ def shuffle_bodies_tokens(tokens_padded, max_len, rng=None):
     return out
 
 
-def shuffle_bodies_batch(batch_tok, max_len, rng=None):
+def shuffle_bodies_batch(batch_tok, max_len=None, rng=None):
     """
-    batch_tok: torch tensor [B, max_len, 17].
+    batch_tok: torch tensor [B, L, 17].
     각 sample 마다 body 순서를 셔플해서 같은 shape tensor 반환 (같은 device).
+    max_len 은 명시 안 하면 tensor 의 실제 L 차원 사용.
     """
     device = batch_tok.device
     dtype = batch_tok.dtype
     arr = batch_tok.detach().cpu().numpy()
+    L = int(arr.shape[1])
+    if max_len is None:
+        max_len = L
     out = np.empty_like(arr)
     for i in range(arr.shape[0]):
         out[i] = shuffle_bodies_tokens(arr[i], max_len, rng=rng)
@@ -2042,7 +2046,6 @@ def run_epoch(ae, mlp, loader, optimizer, device, cfg, interp_w, train_mode=True
     }
     n = 0
 
-    max_len = int(getattr(cfg, "max_len_cap", 256))
     use_shuffle = bool(getattr(cfg, "body_shuffle_aug", False))
     use_cons = bool(getattr(cfg, "use_consistency", False))
     w_cons = float(getattr(cfg, "w_consistency", 0.0))
@@ -2055,7 +2058,7 @@ def run_epoch(ae, mlp, loader, optimizer, device, cfg, interp_w, train_mode=True
 
         # body-set augmentation: train mode 에서만 body 순서 셔플
         if train_mode and use_shuffle:
-            batch_tok = shuffle_bodies_batch(batch_tok, max_len=max_len)
+            batch_tok = shuffle_bodies_batch(batch_tok)
 
         if train_mode:
             optimizer.zero_grad(set_to_none=True)
@@ -2091,7 +2094,7 @@ def run_epoch(ae, mlp, loader, optimizer, device, cfg, interp_w, train_mode=True
             # and pull the two z together
             cons_loss = z.new_zeros(())
             if train_mode and use_cons and w_cons > 0:
-                batch_tok_aug2 = shuffle_bodies_batch(batch_tok, max_len=max_len)
+                batch_tok_aug2 = shuffle_bodies_batch(batch_tok)
                 z2 = ae.encode(batch_tok_aug2)
                 cons_loss = ((z - z2) ** 2).mean()
                 total = total + w_cons * cons_loss
