@@ -4257,7 +4257,7 @@ if __name__ == "__main__":
     PRESET = "test"   # test / tiny / small / full / custom
     LOG_VERBOSITY = "simple"
 
-    USE_TYPES = [1, 2]
+    USE_TYPES = [1, 2, 3]
 
     RAW_N_FREQ = 401
     SELECTED_N_FREQ = 81
@@ -4269,7 +4269,7 @@ if __name__ == "__main__":
     #     small → 800/type
     #     full  → 0(전체)/type
     #   per-type 다른 개수가 필요하면 PRESET="custom" 으로 두고 아래 값 조정.
-    SAMPLES_PER_TYPE = (800, 800)
+    SAMPLES_PER_TYPE = (800, 800, 800)
 
     SHOW_FIGURES = True
 
@@ -4297,6 +4297,10 @@ if __name__ == "__main__":
         2: (
             os.path.join(script_dir, "hfss_results", "step_test1"),
             os.path.join(script_dir, "hfss_results", "sparam", "3.*"),
+        ),
+        3: (
+            os.path.join(script_dir, "hfss_results", "step_test2"),
+            os.path.join(script_dir, "hfss_results", "sparam", "4.*"),
         ),
     }
 
