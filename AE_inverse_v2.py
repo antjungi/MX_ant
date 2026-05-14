@@ -373,66 +373,58 @@ def _sketch_sort_key_from_ext_row(ext_row):
 
 
 def _compute_real_sketch_volumes_from_json(json_data):
-    """JSON sequence 에서 각 (Sketch, Extrude) 쌍의 실좌표 (mm) 부피와 origin 계산.
+    """JSON 에서 각 (Sketch, Extrude) 쌍의 실좌표 (mm) footprint 계산.
 
-    Returns: (volumes, positions) - 각 sketch 의 실제 mm 단위 bbox volume 과 plane origin.
-    sketch 와 extrude 가 1:1 매칭되지 않으면 None 반환.
+    json_to_real_sketches() 로 loop 점들을 미리 3D 실좌표로 변환한 뒤
+    bbox 의 큰 두 축 = sketch plane 위 footprint 면적 (mm²).
+    이 값은 시각화에서 사용하는 것과 동일한 좌표계 → 그림과 정렬이 일치 보장.
+
+    Returns: (areas, positions, details_per_sketch) 또는 (None, None, None).
     """
     try:
-        seq = json_data["sequence"]
+        sketches = json_to_real_sketches(json_data)
     except Exception:
-        return None, None
+        return None, None, None
 
-    volumes = []
+    if not sketches:
+        return None, None, None
+
+    areas = []
     positions = []
-    pending = None
+    details = []
 
-    for op in seq:
-        op_type = op.get("type", "")
+    for sk in sketches:
+        all_pts = []
+        for loop in sk.get("loops_3d", []):
+            for p in loop:
+                all_pts.append(np.asarray(p, dtype=float))
+        if not all_pts:
+            areas.append(0.0)
+            positions.append((0.0, 0.0, 0.0))
+            details.append("(empty)")
+            continue
 
-        if op_type == "Sketch":
-            profile = op.get("profile", {})
-            xs, ys = [], []
-            for loop in profile.get("children", []):
-                for e in loop.get("children", []):
-                    et = e.get("type", "")
-                    for key in ("start_point", "end_point", "mid_point"):
-                        if key in e:
-                            xs.append(float(e[key]["x"]))
-                            ys.append(float(e[key]["y"]))
-                    if et == "Circle":
-                        cp = e.get("center_point", {"x": 0.0, "y": 0.0})
-                        r = float(e.get("radius", 0.0))
-                        xs.extend([float(cp["x"]) - r, float(cp["x"]) + r])
-                        ys.extend([float(cp["y"]) - r, float(cp["y"]) + r])
-            if xs and ys:
-                w = max(xs) - min(xs)
-                h = max(ys) - min(ys)
-                area = max(w * h, 1e-8)
-            else:
-                area = 1e-8
-            origin = op["plane"]["origin"]
-            pending = {
-                "area": float(area),
-                "ox": float(origin["x"]),
-                "oy": float(origin["y"]),
-                "oz": float(origin["z"]),
-            }
+        arr = np.stack(all_pts, axis=0)
+        bbox_min = arr.min(axis=0)
+        bbox_max = arr.max(axis=0)
+        bbox_ext = (bbox_max - bbox_min).tolist()
+        sorted_ext = sorted(bbox_ext, reverse=True)
+        # Sketch 가 어떤 평면에 있든 bbox 의 큰 두 축이 그 평면의 footprint
+        w = sorted_ext[0]
+        h = sorted_ext[1] if len(sorted_ext) > 1 else 0.0
+        area = w * h
 
-        elif op_type == "Extrude":
-            if pending is None:
-                continue
-            ext1 = float(op.get("extent_one", {}).get("distance", 0.0))
-            ext2 = float(op.get("extent_two", {}).get("distance", 0.0))
-            thickness = abs(ext1) + abs(ext2) + 1e-6
-            vol = pending["area"] * thickness
-            volumes.append(vol)
-            positions.append((pending["ox"], pending["oy"], pending["oz"]))
-            pending = None
+        centroid = arr.mean(axis=0)
+        areas.append(float(area))
+        positions.append(
+            (float(centroid[0]), float(centroid[1]), float(centroid[2]))
+        )
+        details.append(
+            f"bbox={bbox_ext[0]:.2f}×{bbox_ext[1]:.2f}×{bbox_ext[2]:.2f}mm "
+            f"area={area:.2f}mm²"
+        )
 
-    if not volumes:
-        return None, None
-    return volumes, positions
+    return areas, positions, details
 
 
 def canonicalize_sketches_by_volume_position(tokens, json_file=None, verbose=False, tag=""):
@@ -468,48 +460,58 @@ def canonicalize_sketches_by_volume_position(tokens, json_file=None, verbose=Fal
         else np.zeros((0, 17), dtype=tokens.dtype)
     )
 
-    # 1) JSON 으로 real-coord volume 시도
-    json_volumes = None
+    # 1) JSON 으로 real-coord footprint area 시도 (시각화와 동일 좌표계)
+    json_areas = None
     json_positions = None
+    json_details = None
     if json_file is not None and os.path.exists(json_file):
         try:
             import json as _json
             with open(json_file, "r", encoding="utf-8") as f:
                 jd = _json.load(f)
-            json_volumes, json_positions = _compute_real_sketch_volumes_from_json(jd)
+            json_areas, json_positions, json_details = (
+                _compute_real_sketch_volumes_from_json(jd)
+            )
         except Exception:
-            json_volumes = None
+            json_areas = None
 
     use_json = (
-        json_volumes is not None
+        json_areas is not None
         and json_positions is not None
-        and len(json_volumes) == len(chunks)
+        and len(json_areas) == len(chunks)
     )
 
     if use_json:
         sort_keys = [
-            (-float(json_volumes[i]),
-             float(json_positions[i][2]),
-             float(json_positions[i][0]),
-             float(json_positions[i][1]))
+            (-float(json_areas[i]),                    # 1차: footprint 면적 desc
+             float(json_positions[i][2]),              # 2차: z asc
+             float(json_positions[i][0]),              # 3차: x asc
+             float(json_positions[i][1]))              # 4차: y asc
             for i in range(len(chunks))
         ]
         key_source = "json_real"
     else:
         sort_keys = [_sketch_sort_key_from_ext_row(c[-1]) for c in chunks]
         key_source = "token_scale"
+        json_details = None
 
     order = sorted(range(len(chunks)), key=lambda i: sort_keys[i])
     sorted_chunks = [chunks[i] for i in order]
     changed = (order != list(range(len(chunks))))
 
     if verbose:
-        vols_str = ", ".join(f"{-k[0]:.3g}" for k in sort_keys)
         print(
             f"    canon [{tag}|{key_source}] n_sk={len(chunks)} "
-            f"vols=[{vols_str}] order={order} "
-            f"{'(reordered)' if changed else '(no change)'}"
+            f"order={order} {'(reordered)' if changed else '(no change)'}"
         )
+        if json_details is not None:
+            for i, det in enumerate(json_details):
+                marker = "→ pos1" if order[0] == i else f"  pos{order.index(i)+1}"
+                print(f"      sk[{i}] {marker}  {det}")
+        else:
+            for i, k in enumerate(sort_keys):
+                marker = "→ pos1" if order[0] == i else f"  pos{order.index(i)+1}"
+                print(f"      sk[{i}] {marker}  est_volume={-k[0]:.4g}")
 
     out = np.concatenate(
         sorted_chunks + ([tail] if tail.size else []), axis=0,
