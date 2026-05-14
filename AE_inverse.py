@@ -3144,6 +3144,240 @@ def visualize_inverse_design_curve(result):
     print(f"  ✓ inverse design curve figure 생성")
 
 
+def extract_decoded_dimensions(tokens, dq_meta):
+    """Decoded tokens → 실좌표(mm) 단위의 dimension list.
+    - tokens_to_real_sketches() 와 달리 ARC/CIRCLE 을 polyline 화 하지 않고
+      각 곡선의 진짜 파라미터(length / radius / 직경 / extrude height) 를 보존."""
+    if dq_meta is None:
+        return []
+
+    sk_metas = dq_meta["sketches"]
+    max_ext = dq_meta["max_ext"]
+
+    dims = []
+    cur_2d = (0.0, 0.0)
+    loop_first_2d = None
+    sketch_idx = 0
+
+    for row in tokens:
+        cmd = int(row[0])
+        p = row[1:]
+
+        if sketch_idx >= len(sk_metas):
+            if cmd == EOS:
+                break
+            if cmd == EXT:
+                sketch_idx += 1
+            continue
+
+        sm = sk_metas[sketch_idx]
+
+        if cmd == SOL:
+            cur_2d = (0.0, 0.0)
+            loop_first_2d = None
+        elif cmd == LINE:
+            if p[0] < 0 or p[1] < 0:
+                continue
+            ex = _dequant(p[0], sm["xy_min"][0], sm["xy_max"][0])
+            ey = _dequant(p[1], sm["xy_min"][1], sm["xy_max"][1])
+            sx, sy = cur_2d
+            if loop_first_2d is None:
+                loop_first_2d = (sx, sy)
+            p_s_3d = sm["origin"] + sx * sm["x_axis"] + sy * sm["y_axis"]
+            p_e_3d = sm["origin"] + ex * sm["x_axis"] + ey * sm["y_axis"]
+            length = float(np.linalg.norm(p_e_3d - p_s_3d))
+            dims.append({
+                "kind": "line",
+                "sketch_idx": sketch_idx,
+                "p_start_3d": p_s_3d,
+                "p_end_3d": p_e_3d,
+                "length": length,
+            })
+            cur_2d = (ex, ey)
+        elif cmd == ARC:
+            if any(p[i] < 0 for i in range(4)):
+                continue
+            mx = _dequant(p[0], sm["xy_min"][0], sm["xy_max"][0])
+            my = _dequant(p[1], sm["xy_min"][1], sm["xy_max"][1])
+            ex = _dequant(p[2], sm["xy_min"][0], sm["xy_max"][0])
+            ey = _dequant(p[3], sm["xy_min"][1], sm["xy_max"][1])
+            sx, sy = cur_2d
+
+            mid_3d = sm["origin"] + mx * sm["x_axis"] + my * sm["y_axis"]
+            p_s_3d = sm["origin"] + sx * sm["x_axis"] + sy * sm["y_axis"]
+            p_e_3d = sm["origin"] + ex * sm["x_axis"] + ey * sm["y_axis"]
+
+            # 원의 중심·반지름 (2D 평면 안에서 계산)
+            D = 2 * (sx * (my - ey) + mx * (ey - sy) + ex * (sy - my))
+            if abs(D) < 1e-9:
+                # 거의 직선 — line 으로 취급
+                length = float(np.linalg.norm(p_e_3d - p_s_3d))
+                dims.append({
+                    "kind": "line",
+                    "sketch_idx": sketch_idx,
+                    "p_start_3d": p_s_3d,
+                    "p_end_3d": p_e_3d,
+                    "length": length,
+                })
+            else:
+                ux = ((sx ** 2 + sy ** 2) * (my - ey)
+                      + (mx ** 2 + my ** 2) * (ey - sy)
+                      + (ex ** 2 + ey ** 2) * (sy - my)) / D
+                uy = ((sx ** 2 + sy ** 2) * (ex - mx)
+                      + (mx ** 2 + my ** 2) * (sx - ex)
+                      + (ex ** 2 + ey ** 2) * (mx - sx)) / D
+                r = math.sqrt((sx - ux) ** 2 + (sy - uy) ** 2)
+                # arc sweep angle (대략)
+                a1 = math.atan2(sy - uy, sx - ux)
+                a2 = math.atan2(ey - uy, ex - ux)
+                am = math.atan2(my - uy, mx - ux)
+                # use _arc_pts logic to get correct sweep
+                def _fix(a, ref):
+                    while a - ref > math.pi:
+                        a -= 2 * math.pi
+                    while a - ref < -math.pi:
+                        a += 2 * math.pi
+                    return a
+                am_f = _fix(am, a1)
+                a2_f = _fix(a2, a1)
+                if not (min(a1, a2_f) <= am_f <= max(a1, a2_f)):
+                    a2_f = a2_f - 2 * math.pi if a2_f > a1 else a2_f + 2 * math.pi
+                sweep = abs(a2_f - a1)
+                arc_len = r * sweep
+                dims.append({
+                    "kind": "arc",
+                    "sketch_idx": sketch_idx,
+                    "p_start_3d": p_s_3d,
+                    "p_mid_3d": mid_3d,
+                    "p_end_3d": p_e_3d,
+                    "radius": float(r),
+                    "sweep_deg": float(math.degrees(sweep)),
+                    "arc_length": float(arc_len),
+                })
+            cur_2d = (ex, ey)
+        elif cmd == CIRCLE:
+            if any(p[i] < 0 for i in range(3)):
+                continue
+            cx = _dequant(p[0], sm["xy_min"][0], sm["xy_max"][0])
+            cy = _dequant(p[1], sm["xy_min"][1], sm["xy_max"][1])
+            r = (p[2] / QMAX) * sm["sk_scale"]
+            c_3d = sm["origin"] + cx * sm["x_axis"] + cy * sm["y_axis"]
+            dims.append({
+                "kind": "circle",
+                "sketch_idx": sketch_idx,
+                "center_3d": c_3d,
+                "radius": float(r),
+                "diameter": float(2 * r),
+            })
+        elif cmd == EXT:
+            e1_val = _dequant(p[P_E1], 0, max_ext)
+            e2_val = (
+                _dequant(p[P_E2], 0, max_ext)
+                if int(p[P_E2]) >= 0 else 0.0
+            )
+            z_raw = sm["z_axis"]
+            normal = z_raw / (np.linalg.norm(z_raw) + 1e-12)
+            ref_3d = sm["origin"]
+            top_3d = ref_3d + normal * e1_val
+            dims.append({
+                "kind": "extrude",
+                "sketch_idx": sketch_idx,
+                "p_start_3d": ref_3d,
+                "p_end_3d": top_3d,
+                "label_pos_3d": (ref_3d + top_3d) / 2.0,
+                "length": float(e1_val),
+                "extent_one": float(e1_val),
+                "extent_two": float(e2_val),
+            })
+            sketch_idx += 1
+            cur_2d = (0.0, 0.0)
+            loop_first_2d = None
+        elif cmd == EOS:
+            break
+
+    return dims
+
+
+def _format_dim_label(d):
+    k = d["kind"]
+    if k == "line":
+        return f"{d['length']:.1f}"
+    if k == "circle":
+        return f"Ø{d['diameter']:.1f}"
+    if k == "arc":
+        return f"R{d['radius']:.1f}"
+    if k == "extrude":
+        return f"h={d['length']:.1f}"
+    return ""
+
+
+def _annotate_dimensions(ax, dims):
+    """3D axes 에 각 dimension 라벨을 표시."""
+    if not dims:
+        return
+    label_kwargs = dict(
+        fontsize=6.5,
+        color="#111",
+        ha="center", va="center",
+        zorder=1000,
+    )
+    bbox_kw = dict(
+        boxstyle="round,pad=0.15",
+        fc=(1, 1, 1, 0.78),
+        ec=(0.7, 0.7, 0.7, 0.6),
+        lw=0.3,
+    )
+
+    for d in dims:
+        k = d["kind"]
+        txt = _format_dim_label(d)
+        if not txt:
+            continue
+        if k == "line":
+            pos = (d["p_start_3d"] + d["p_end_3d"]) / 2.0
+        elif k == "circle":
+            pos = d["center_3d"]
+        elif k == "arc":
+            pos = d["p_mid_3d"]
+        elif k == "extrude":
+            pos = d["label_pos_3d"]
+        else:
+            continue
+        ax.text(
+            float(pos[0]), float(pos[1]), float(pos[2]),
+            txt, bbox=bbox_kw, **label_kwargs,
+        )
+
+
+def _print_decoded_dimensions(dims):
+    if not dims:
+        print("  (no dimensions extracted)")
+        return
+    # sketch 별로 묶어서 출력
+    by_sk = {}
+    for d in dims:
+        by_sk.setdefault(d["sketch_idx"], []).append(d)
+    print(f"\n  Decoded dimensions ({len(dims)} entries, mm):")
+    for sk_i in sorted(by_sk.keys()):
+        print(f"    [sketch {sk_i + 1}]")
+        for d in by_sk[sk_i]:
+            k = d["kind"]
+            if k == "line":
+                print(f"      LINE     length = {d['length']:7.3f} mm")
+            elif k == "circle":
+                print(f"      CIRCLE   Ø = {d['diameter']:7.3f} mm   (R={d['radius']:.3f})")
+            elif k == "arc":
+                print(
+                    f"      ARC      R = {d['radius']:7.3f} mm   "
+                    f"sweep={d['sweep_deg']:6.1f}°   arc_len={d['arc_length']:.3f}"
+                )
+            elif k == "extrude":
+                print(
+                    f"      EXTRUDE  height = {d['extent_one']:7.3f} mm   "
+                    f"(ext2={d['extent_two']:.3f})"
+                )
+
+
 @torch.no_grad()
 def _find_nn_dequant_meta(dataset, ae, z_target, device):
     """latent 공간에서 z_target 에 가장 가까운 training sample 의
@@ -3224,8 +3458,12 @@ def visualize_decoded_structure(
 
     if use_real:
         nl_total = sum(len(s["loops_3d"]) for s in sketches)
+        dims = extract_decoded_dimensions(recon_trim, dq_meta)
+        _print_decoded_dimensions(dims)
     else:
         nl_total = sum(len(s["loops_2d"]) for s in sketches)
+        dims = []
+        print("  (dimensions not annotated — normalized mode, no real-coord meta)")
 
     # ── 2×2 layout (앞쪽 reconstruction viz 와 동일한 스타일) ──
     fig = plt.figure(figsize=(13, 12), facecolor="white")
@@ -3262,6 +3500,9 @@ def visualize_decoded_structure(
             sum(len(s["loops_3d"]) for s in sketches) if use_real
             else sum(len(s["loops_2d"]) for s in sketches)
         )
+        # ★ 모든 변/곡선/extrude 길이 라벨링 (mm)
+        if use_real and dims:
+            _annotate_dimensions(ax, dims)
         _style(ax, f"{label}\n{ne} extrude · {nl} loop · {recon_trim.shape[0]} token")
         ax.view_init(elev=elev, azim=azim)
 
