@@ -2987,13 +2987,18 @@ def inverse_design_optimize(
         pred_sel = mlp(z)
         pred_full = interpolate_selected_to_full_torch(pred_sel, interp_w)
 
-        diff_sq = (pred_full - target_full_t.unsqueeze(0)) ** 2
+        diff = pred_full - target_full_t.unsqueeze(0)
+
+        # in-band: hinge — pred ≤ deep_db 만 만족하면 OK (더 깊으면 페널티 없음)
+        in_band_violation_sq = F.relu(diff) ** 2
+        # out-band: 일반 MSE (default out_band_weight=0이라 거의 영향 없음)
+        out_band_sq = diff ** 2
 
         in_band = (
-            diff_sq * masks_t.unsqueeze(0).float()
+            in_band_violation_sq * masks_t.unsqueeze(0).float()
         ).sum(dim=1) / in_band_count
         out_band = (
-            diff_sq * (~masks_t).unsqueeze(0).float()
+            out_band_sq * (~masks_t).unsqueeze(0).float()
         ).sum(dim=1) / out_band_count
 
         match_per = (
@@ -3044,45 +3049,77 @@ def inverse_design_optimize(
 
 def visualize_inverse_design_curve(result):
     freqs = result["freqs_full"]
-    target = result["target_full"]
     pred = result["best_pred_full"]
     target_freqs = result["channel_target_freqs"]
     bw = result["bandwidth_ghz"]
-    in_band_mse = result["best_in_band_mse"]
+    deep_db = result["deep_db"]
 
     fig, axes = plt.subplots(
         1, 3, figsize=(15, 4.5), facecolor="white", sharey=True,
     )
     fig.suptitle(
-        "Inverse design — target vs surrogate prediction",
+        f"Inverse design — surrogate prediction vs spec (≤ {deep_db:.0f} dB in band)",
         fontsize=11, color="#222", y=1.0,
     )
+
+    pred_min = float(pred.min())
+    pred_max = float(pred.max())
+    ymin = min(pred_min - 3.0, deep_db - 5.0)
+    ymax = max(pred_max + 2.0, 3.0)
 
     for c, lbl in enumerate(RETURN_LABELS):
         ax = axes[c]
         f0 = target_freqs[c]
+        f_lo, f_hi = f0 - bw / 2.0, f0 + bw / 2.0
 
+        # band 표시 (옅게)
         ax.axvspan(
-            f0 - bw / 2, f0 + bw / 2,
-            color="#3F6E5C", alpha=0.12,
+            f_lo, f_hi,
+            color="#3F6E5C", alpha=0.06,
             label=f"band ±{bw / 2 * 1000:.0f} MHz",
         )
-        ax.axvline(f0, color="#3F6E5C", ls=":", lw=1)
+        ax.axvline(f0, color="#3F6E5C", ls=":", lw=0.7, alpha=0.5)
 
-        ax.plot(freqs, target[:, c], color="#2E4172", lw=2.0, label="target")
+        # spec 한계선: in-band 안에서만 ≤ deep_db
+        ax.hlines(
+            deep_db, f_lo, f_hi,
+            colors="#2E4172", linestyles="--", lw=1.0,
+            label=f"spec ≤ {deep_db:.0f} dB",
+        )
+
+        # 허용 영역 (in-band & ≤ deep_db) 옅게 음영
+        band_mask = (freqs >= f_lo) & (freqs <= f_hi)
+        ax.fill_between(
+            freqs, deep_db, ymin,
+            where=band_mask,
+            color="#2E4172", alpha=0.04, linewidth=0,
+        )
+
+        # surrogate 예측
         ax.plot(
             freqs, pred[:, c],
-            color="#E07B5B", lw=1.8, ls="--", label="surrogate pred",
+            color="#E07B5B", lw=1.0, alpha=0.9,
+            label="surrogate pred",
         )
 
-        ax.set_title(
-            f"{lbl}  target={f0:.2f} GHz  in-band MSE={in_band_mse[c]:.2f}",
-            fontsize=9, fontweight="normal",
-        )
+        # in-band worst (가장 위에 뜨는 dB) 표시
+        if band_mask.any():
+            worst = float(pred[band_mask, c].max())
+            margin = deep_db - worst  # >0 이면 spec 만족
+            ok = "✓" if margin >= 0 else "✗"
+            title = (
+                f"{lbl}  f={f0:.2f} GHz  "
+                f"worst={worst:.1f} dB  margin={margin:+.1f}  {ok}"
+            )
+        else:
+            title = f"{lbl}  f={f0:.2f} GHz"
+
+        ax.set_title(title, fontsize=9, fontweight="normal")
         ax.set_xlabel("frequency [GHz]")
         if c == 0:
             ax.set_ylabel("|S| [dB]")
-        ax.grid(True, alpha=0.25)
+        ax.set_ylim(ymin, ymax)
+        ax.grid(True, alpha=0.18, lw=0.4)
         ax.legend(fontsize=8, loc="lower left", framealpha=0.85)
 
     plt.tight_layout()
@@ -3102,21 +3139,25 @@ def visualize_decoded_structure(
 
     sketches = tokens_to_sketches_normalized(recon_trim)
 
-    fig = plt.figure(figsize=(12, 6), facecolor="white")
+    # ── 2×2 layout (앞쪽 reconstruction viz 와 동일한 스타일) ──
+    fig = plt.figure(figsize=(13, 12), facecolor="white")
     fig.suptitle(
-        f"{title}\n{recon_trim.shape[0]} tokens · "
+        f"{title} [normalized]\n"
+        f"{recon_trim.shape[0]} tokens · "
         f"{len(sketches)} extrude · "
         f"{sum(len(s['loops_2d']) for s in sketches)} loop",
-        fontsize=11, color="#222", y=0.98,
+        fontsize=11, fontweight="normal", color="#222", y=0.985,
     )
 
     views = [
-        (1, "3D View", 28, -55),
-        (2, "Top View", 89.9, -90.0),
+        (0, 0, "Decoded — 3D View",        28,   -55),
+        (0, 1, "Decoded — 3D View (alt)",  20,    45),
+        (1, 0, "Decoded — Top View",       89.9, -90.0),
+        (1, 1, "Decoded — Side View",       5,   -90),
     ]
 
-    for slot, label, elev, azim in views:
-        ax = fig.add_subplot(1, 2, slot, projection="3d")
+    for row, col, label, elev, azim in views:
+        ax = fig.add_subplot(2, 2, row * 2 + col + 1, projection="3d")
         if not sketches:
             ax.text2D(
                 0.5, 0.5, "(empty)",
@@ -3127,7 +3168,9 @@ def visualize_decoded_structure(
             ax.view_init(elev=elev, azim=azim)
             continue
         _set_axes_and_render(ax, sketches, use_real=False)
-        _style(ax, label)
+        ne = len(sketches)
+        nl = sum(len(s["loops_2d"]) for s in sketches)
+        _style(ax, f"{label}\n{ne} extrude · {nl} loop · {recon_trim.shape[0]} token")
         ax.view_init(elev=elev, azim=azim)
 
     if sketches:
@@ -3141,7 +3184,7 @@ def visualize_decoded_structure(
             fontsize=9, framealpha=0.95,
         )
 
-    plt.tight_layout(rect=[0, 0.04, 1, 0.95])
+    plt.tight_layout(rect=[0, 0.04, 1, 0.97])
     print(f"  ✓ decoded structure figure 생성 (tokens={recon_trim.shape[0]})")
 
     return recon_trim, sketches
