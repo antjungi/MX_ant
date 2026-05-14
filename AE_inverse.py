@@ -3067,42 +3067,52 @@ def visualize_inverse_design_curve(result):
     ymin = min(pred_min - 3.0, deep_db - 5.0)
     ymax = max(pred_max + 2.0, 3.0)
 
+    band_color = "#3F6E5C"
+    spec_color = "#2E4172"
+    pred_color = "#E07B5B"
+
     for c, lbl in enumerate(RETURN_LABELS):
         ax = axes[c]
         f0 = target_freqs[c]
         f_lo, f_hi = f0 - bw / 2.0, f0 + bw / 2.0
 
-        # band 표시 (옅게)
-        ax.axvspan(
-            f_lo, f_hi,
-            color="#3F6E5C", alpha=0.06,
-            label=f"band ±{bw / 2 * 1000:.0f} MHz",
+        # surrogate 예측 (얇게)
+        ax.plot(
+            freqs, pred[:, c],
+            color=pred_color, lw=1.0, alpha=0.9,
+            label="surrogate pred",
         )
-        ax.axvline(f0, color="#3F6E5C", ls=":", lw=0.7, alpha=0.5)
 
         # spec 한계선: in-band 안에서만 ≤ deep_db
         ax.hlines(
             deep_db, f_lo, f_hi,
-            colors="#2E4172", linestyles="--", lw=1.0,
+            colors=spec_color, linestyles="-", lw=1.0,
             label=f"spec ≤ {deep_db:.0f} dB",
         )
 
-        # 허용 영역 (in-band & ≤ deep_db) 옅게 음영
+        # band 경계: 얇은 dashed 수직선만
+        for fx in (f_lo, f_hi):
+            ax.axvline(fx, color=band_color, ls="--", lw=0.6, alpha=0.55)
+
+        # 위쪽 brackets + bw label
+        bracket_y = ymax - (ymax - ymin) * 0.04
+        ax.annotate(
+            "",
+            xy=(f_lo, bracket_y), xytext=(f_hi, bracket_y),
+            arrowprops=dict(
+                arrowstyle="|-|, widthA=0.3, widthB=0.3",
+                color=band_color, lw=0.7, shrinkA=0, shrinkB=0,
+            ),
+        )
+        ax.text(
+            f0, bracket_y - (ymax - ymin) * 0.025,
+            f"{bw * 1000:.0f} MHz",
+            ha="center", va="top",
+            fontsize=8, color=band_color,
+        )
+
+        # in-band worst
         band_mask = (freqs >= f_lo) & (freqs <= f_hi)
-        ax.fill_between(
-            freqs, deep_db, ymin,
-            where=band_mask,
-            color="#2E4172", alpha=0.04, linewidth=0,
-        )
-
-        # surrogate 예측
-        ax.plot(
-            freqs, pred[:, c],
-            color="#E07B5B", lw=1.0, alpha=0.9,
-            label="surrogate pred",
-        )
-
-        # in-band worst (가장 위에 뜨는 dB) 표시
         if band_mask.any():
             worst = float(pred[band_mask, c].max())
             margin = deep_db - worst  # >0 이면 spec 만족
@@ -3119,7 +3129,7 @@ def visualize_inverse_design_curve(result):
         if c == 0:
             ax.set_ylabel("|S| [dB]")
         ax.set_ylim(ymin, ymax)
-        ax.grid(True, alpha=0.18, lw=0.4)
+        ax.grid(True, alpha=0.15, lw=0.4)
         ax.legend(fontsize=8, loc="lower left", framealpha=0.85)
 
     plt.tight_layout()
@@ -3127,26 +3137,97 @@ def visualize_inverse_design_curve(result):
 
 
 @torch.no_grad()
+def _find_nn_dequant_meta(dataset, ae, z_target, device):
+    """latent 공간에서 z_target 에 가장 가까운 training sample 의
+    JSON 으로 dequant_meta 를 만든다. 실패하면 (None, -1, inf)."""
+    all_indices = list(range(len(dataset)))
+    z_all, _ = collect_latents(ae, dataset, all_indices, device)
+
+    z_t = z_target.detach().cpu().numpy()
+    if z_t.ndim == 2:
+        z_t = z_t[0]
+
+    dists = np.linalg.norm(z_all - z_t[None, :], axis=1)
+    order = np.argsort(dists)
+
+    for cand in order:
+        ci = int(cand)
+        jd = dataset.load_json(ci)
+        if jd is None:
+            continue
+        try:
+            dq = extract_dequant_meta(jd)
+            if dq["sketches"]:
+                return dq, ci, float(dists[ci])
+        except Exception:
+            continue
+
+    return None, -1, float("inf")
+
+
+def _extend_dequant_meta(dq_meta, n_needed):
+    """sketch meta 가 부족하면 마지막 항목 복제로 확장."""
+    if dq_meta is None:
+        return None
+    sk = list(dq_meta["sketches"])
+    if not sk:
+        return dq_meta
+    while len(sk) < n_needed:
+        sk.append(dict(sk[-1]))
+    dq_meta = dict(dq_meta)
+    dq_meta["sketches"] = sk
+    return dq_meta
+
+
+@torch.no_grad()
 def visualize_decoded_structure(
     ae, z, dataset, device, title="Decoded structure",
 ):
-    """latent z → AE.generate() → normalized 3D + Top view."""
+    """latent z → AE.generate() → 앞쪽 reconstruction viz 와 동일한 스타일로 표시.
+    NN training sample 의 JSON 을 빌려서 real-coord(mm) 모드로 렌더.
+    """
     ae.eval()
 
     gen = ae.generate(z, max_gen_len=dataset.max_len)
     recon = gen[0].detach().cpu().numpy().astype(np.int32)
     recon_trim = trim_after_eos(recon)
 
-    sketches = tokens_to_sketches_normalized(recon_trim)
+    # nearest-neighbor 의 JSON 으로 실좌표 dequant meta 확보
+    dq_meta, nn_idx, nn_dist = _find_nn_dequant_meta(dataset, ae, z, device)
+    n_ext = int((recon_trim[:, 0] == EXT).sum())
+
+    if dq_meta is not None and n_ext > 0:
+        dq_meta = _extend_dequant_meta(dq_meta, max(n_ext, len(dq_meta["sketches"])))
+        sketches = tokens_to_real_sketches(recon_trim, dq_meta)
+        use_real = True
+        coord_label = "real coord (mm)"
+        try:
+            nn_name = os.path.basename(dataset.npy_files[nn_idx])
+            t_id = int(dataset.type_ids[nn_idx])
+            t_name = dataset.type_names[t_id]
+            meta_note = f"NN ref: [{t_name}] {nn_name}  (z-dist={nn_dist:.2f})"
+        except Exception:
+            meta_note = f"NN ref idx={nn_idx}  (z-dist={nn_dist:.2f})"
+    else:
+        sketches = tokens_to_sketches_normalized(recon_trim)
+        use_real = False
+        coord_label = "normalized"
+        meta_note = "no JSON metadata available — fallback to normalized"
+
+    if use_real:
+        nl_total = sum(len(s["loops_3d"]) for s in sketches)
+    else:
+        nl_total = sum(len(s["loops_2d"]) for s in sketches)
 
     # ── 2×2 layout (앞쪽 reconstruction viz 와 동일한 스타일) ──
     fig = plt.figure(figsize=(13, 12), facecolor="white")
     fig.suptitle(
-        f"{title} [normalized]\n"
+        f"{title} [{coord_label}]\n"
         f"{recon_trim.shape[0]} tokens · "
         f"{len(sketches)} extrude · "
-        f"{sum(len(s['loops_2d']) for s in sketches)} loop",
-        fontsize=11, fontweight="normal", color="#222", y=0.985,
+        f"{nl_total} loop\n"
+        f"{meta_note}",
+        fontsize=10, fontweight="normal", color="#222", y=0.985,
     )
 
     views = [
@@ -3167,9 +3248,12 @@ def visualize_decoded_structure(
             _style(ax, label)
             ax.view_init(elev=elev, azim=azim)
             continue
-        _set_axes_and_render(ax, sketches, use_real=False)
+        _set_axes_and_render(ax, sketches, use_real=use_real)
         ne = len(sketches)
-        nl = sum(len(s["loops_2d"]) for s in sketches)
+        nl = (
+            sum(len(s["loops_3d"]) for s in sketches) if use_real
+            else sum(len(s["loops_2d"]) for s in sketches)
+        )
         _style(ax, f"{label}\n{ne} extrude · {nl} loop · {recon_trim.shape[0]} token")
         ax.view_init(elev=elev, azim=azim)
 
@@ -3184,8 +3268,12 @@ def visualize_decoded_structure(
             fontsize=9, framealpha=0.95,
         )
 
-    plt.tight_layout(rect=[0, 0.04, 1, 0.97])
-    print(f"  ✓ decoded structure figure 생성 (tokens={recon_trim.shape[0]})")
+    plt.tight_layout(rect=[0, 0.04, 1, 0.96])
+    print(
+        f"  ✓ decoded structure figure 생성 "
+        f"(tokens={recon_trim.shape[0]}, mode={'real' if use_real else 'normalized'}, "
+        f"nn_idx={nn_idx}, nn_dist={nn_dist:.2f})"
+    )
 
     return recon_trim, sketches
 
