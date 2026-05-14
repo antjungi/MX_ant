@@ -3768,6 +3768,11 @@ if __name__ == "__main__":
 
     SHOW_FIGURES = True
 
+    # ★ Inverse design 켜고/끄기.
+    #   True  : 학습 + 평가 후 latent 최적화 → 디코딩 → spec 매칭 figure 까지 표시
+    #   False : 학습 + 평가만 (AE 단독 모드. 기존 AE.py 와 동등)
+    RUN_INVERSE_DESIGN = True
+
     # ★ 학습 끝나고 띄울 구조 복원 figure 개수 (sample 1개당 창 1개)
     N_PREVIEW = 2
 
@@ -3944,7 +3949,7 @@ if __name__ == "__main__":
         INV_RESTART_NOISE = 0.3        # restart 시 noise 크기
         INV_MAX_RESTARTS = 10          # 최대 restart 횟수
 
-        if cfg.show_figures:
+        if cfg.show_figures and RUN_INVERSE_DESIGN:
             try:
                 inv_result = run_inverse_design_pipeline(
                     ae=ae,
