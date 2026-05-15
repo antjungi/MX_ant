@@ -663,6 +663,98 @@ def subsection(title, ch="─"):
 
 
 # ══════════════════════════════════════════════════════════════
+# ★ Inverse design 결과 파일 저장 (txt + csv + png)
+# ══════════════════════════════════════════════════════════════
+def save_inverse_design_outputs(inv_result, save_dir, run_tag,
+                                channel_target_freqs=None,
+                                bandwidth_ghz=None,
+                                deep_db=None):
+    os.makedirs(save_dir, exist_ok=True)
+    saved = []
+
+    tokens = inv_result.get("decoded_tokens")
+    if tokens is not None and len(tokens) > 0:
+        tok_path = os.path.join(save_dir, f"inverse_{run_tag}_tokens.txt")
+        try:
+            with open(tok_path, "w", encoding="utf-8") as f:
+                f.write(f"# Inverse design decoded tokens  (run_tag={run_tag})\n")
+                if channel_target_freqs is not None:
+                    f.write(
+                        f"# Target: S11@{channel_target_freqs[0]:.2f}GHz, "
+                        f"S22@{channel_target_freqs[1]:.2f}GHz, "
+                        f"S33@{channel_target_freqs[2]:.2f}GHz"
+                    )
+                    if bandwidth_ghz is not None:
+                        f.write(f", BW=±{bandwidth_ghz / 2 * 1000:.0f}MHz")
+                    if deep_db is not None:
+                        f.write(f", spec ≤ {deep_db:.0f}dB")
+                    f.write("\n")
+                f.write(f"# n_tokens = {len(tokens)}\n")
+                f.write(f"# best_match_loss = {inv_result.get('best_loss', float('nan')):.6f}\n")
+                f.write(f"# Columns: idx | cmd_name | param0..param15 (PAD=-1)\n\n")
+                for i, row in enumerate(tokens):
+                    c = int(row[0])
+                    cmd_name = CMD_NAME.get(c, f"UNK({c})")
+                    params = " ".join(f"{int(p):5d}" for p in row[1:])
+                    f.write(f"[{i:4d}] {cmd_name:7s} | {params}\n")
+            saved.append(tok_path)
+        except Exception as e:
+            print(f"  ⚠ tokens txt 저장 실패: {type(e).__name__}: {e}")
+
+    pred = inv_result.get("best_pred_full")
+    freqs = inv_result.get("freqs_full")
+    if pred is not None and freqs is not None:
+        sparam_path = os.path.join(save_dir, f"inverse_{run_tag}_sparam.csv")
+        try:
+            with open(sparam_path, "w", encoding="utf-8") as f:
+                f.write("freq_GHz,S11_dB,S22_dB,S33_dB\n")
+                for i in range(len(freqs)):
+                    f.write(
+                        f"{float(freqs[i]):.6f},"
+                        f"{float(pred[i, 0]):.4f},"
+                        f"{float(pred[i, 1]):.4f},"
+                        f"{float(pred[i, 2]):.4f}\n"
+                    )
+            saved.append(sparam_path)
+        except Exception as e:
+            print(f"  ⚠ S-param csv 저장 실패: {type(e).__name__}: {e}")
+
+    fig_idx = 0
+    for fn in plt.get_fignums():
+        try:
+            fig = plt.figure(fn)
+            suptitle = ""
+            if getattr(fig, "_suptitle", None) is not None:
+                suptitle = fig._suptitle.get_text() or ""
+            stl = suptitle.lower()
+            if not ("inverse" in stl or "decoded" in stl or "top view" in stl):
+                continue
+            tag_part = "fig"
+            if "top view" in stl and "annotated" in stl:
+                tag_part = "topview_annotated"
+            elif "top view" in stl and "clean" in stl:
+                tag_part = "topview_clean"
+            elif "top view" in stl:
+                tag_part = "topview"
+            elif "decoded" in stl:
+                tag_part = "decoded"
+            elif "inverse design" in stl:
+                tag_part = "sparam_curve"
+            fig_idx += 1
+            fig_path = os.path.join(
+                save_dir, f"inverse_{run_tag}_{tag_part}_{fig_idx}.png",
+            )
+            fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+            saved.append(fig_path)
+        except Exception as e:
+            print(f"  ⚠ figure fig{fn} 저장 실패: {type(e).__name__}: {e}")
+
+    print(f"  ✓ inversed 폴더에 {len(saved)} 개 파일 저장:")
+    for p in saved:
+        print(f"    · {os.path.basename(p)}")
+
+
+# ══════════════════════════════════════════════════════════════
 # Geometry visualization
 # ══════════════════════════════════════════════════════════════
 def _v3(d):
@@ -4385,6 +4477,23 @@ if __name__ == "__main__":
                 import traceback as _tb
                 print(f"\n[INVERSE DESIGN] failed: {type(e).__name__}: {e}")
                 _tb.print_exc()
+                inv_result = None
+
+            # ★ 결과 파일 저장: tokens.txt, sparam.csv, figures.png
+            if inv_result is not None:
+                subsection("Saving inverse design outputs to inversed/")
+                inversed_dir = os.path.join(script_dir, "inversed")
+                try:
+                    save_inverse_design_outputs(
+                        inv_result, inversed_dir, run_tag,
+                        channel_target_freqs=INV_CHANNEL_TARGET_FREQS,
+                        bandwidth_ghz=INV_BANDWIDTH_GHZ,
+                        deep_db=INV_DEEP_DB,
+                    )
+                except Exception as e:
+                    import traceback as _tb
+                    print(f"  ⚠ save_inverse_design_outputs failed: {type(e).__name__}: {e}")
+                    _tb.print_exc()
 
         section("DONE")
         print(f"  Final eval_full RMSE : {result['eval_full']:.4f} dB")
