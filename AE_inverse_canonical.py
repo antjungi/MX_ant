@@ -424,12 +424,15 @@ def canonicalize_sketches(tokens, json_file=None, verbose=False, tag=""):
     정렬 키: (z 위치 asc, footprint area desc, x asc, y asc)
     JSON metadata 없으면 정렬 안 함 (token 만으로는 신뢰 어렵다).
 
-    Returns: (정렬된 tokens, changed_flag)
+    Returns: (정렬된 tokens, changed_flag, permutation_or_None)
+      permutation[k] = original_index → canonical position k 에 온 sketch 의
+                       원래 (JSON sequence 순서 상) index
+      reorder 안 했으면 None.
     """
     tokens = np.asarray(tokens, dtype=np.int32)
     chunks, tail = _split_sketch_chunks(tokens)
     if len(chunks) <= 1:
-        return tokens.copy(), False
+        return tokens.copy(), False, None
 
     keys = None
     details = None
@@ -449,7 +452,7 @@ def canonicalize_sketches(tokens, json_file=None, verbose=False, tag=""):
                 f"(json_keys={None if keys is None else len(keys)}, "
                 f"chunks={len(chunks)})"
             )
-        return tokens.copy(), False
+        return tokens.copy(), False, None
 
     order = sorted(range(len(chunks)), key=lambda i: keys[i])
     changed = (order != list(range(len(chunks))))
@@ -474,7 +477,44 @@ def canonicalize_sketches(tokens, json_file=None, verbose=False, tag=""):
     if out.shape[0] < L:
         pad = np.full((L - out.shape[0], 17), PAD_V, dtype=tokens.dtype)
         out = np.concatenate([out, pad], axis=0)
-    return out[:L], changed
+    return out[:L], changed, list(order)
+
+
+def _reorder_json_sequence_pairs(json_data, perm):
+    """JSON sequence 의 (Sketch, Extrude) 쌍을 permutation 순서로 재배열.
+
+    perm[k] = original sketch index that goes to canonical position k.
+    """
+    try:
+        seq = json_data.get("sequence", [])
+    except Exception:
+        return json_data
+
+    pairs = []
+    i = 0
+    while i < len(seq):
+        op = seq[i]
+        if (op.get("type") == "Sketch"
+                and i + 1 < len(seq)
+                and seq[i + 1].get("type") == "Extrude"):
+            pairs.append((seq[i], seq[i + 1]))
+            i += 2
+        else:
+            # Unpaired op (rare) — keep position
+            i += 1
+
+    if len(pairs) != len(perm):
+        return json_data  # 길이 불일치 시 그대로 반환
+
+    reordered_pairs = [pairs[p] for p in perm]
+    new_seq = []
+    for sk, ext in reordered_pairs:
+        new_seq.append(sk)
+        new_seq.append(ext)
+
+    new_data = dict(json_data)
+    new_data["sequence"] = new_seq
+    return new_data
 
 
 def select_frequency_indices(raw_n_freq, target_n_freq, freq_start, freq_end, mode="linspace"):
@@ -1525,6 +1565,7 @@ class JointDataset(Dataset):
 
         self.raw = []
         self.padded = []
+        self.canon_perms = []        # ★ per-sample permutation (None 이면 reorder 안 함)
         n_changed = 0
         n_total_canon = 0
         n_skip = 0
@@ -1532,13 +1573,14 @@ class JointDataset(Dataset):
         for i, f in enumerate(self.npy_files):
             t = np.load(f).astype(np.int32)
             t = ensure_eos_when_truncated(t, max_len)
+            perm = None
             if self.do_canonicalize:
                 jf = self.json_files[i]
                 tid = int(type_ids_arr[i]) if i < len(type_ids_arr) else -1
                 verbose = (tid not in seen_types)
                 if verbose:
                     seen_types.add(tid)
-                t_canon, was_changed = canonicalize_sketches(
+                t_canon, was_changed, perm = canonicalize_sketches(
                     t,
                     json_file=jf,
                     verbose=verbose,
@@ -1552,6 +1594,7 @@ class JointDataset(Dataset):
                 t = t_canon
             self.raw.append(t)
             self.padded.append(self._pad(t))
+            self.canon_perms.append(perm)
 
         if self.do_canonicalize:
             print(
@@ -1625,9 +1668,20 @@ class JointDataset(Dataset):
         try:
             import json as _json
             with open(jf, "r", encoding="utf-8") as f:
-                return _json.load(f)
+                data = _json.load(f)
         except Exception:
             return None
+        # ★ canonical permutation 이 있으면 JSON sequence 도 같은 순서로 재배열
+        # → 시각화 시 (tokens_to_real_sketches, json_to_real_sketches) 결과가
+        #   canonical 토큰 순서와 정확히 일치
+        perm = (
+            self.canon_perms[idx]
+            if hasattr(self, "canon_perms") and idx < len(self.canon_perms)
+            else None
+        )
+        if perm is not None:
+            data = _reorder_json_sequence_pairs(data, perm)
+        return data
 
     def __len__(self):
         return len(self.padded)
