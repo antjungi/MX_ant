@@ -4336,13 +4336,13 @@ if __name__ == "__main__":
         INV_DEEP_DB = -15.0
 
         # Tier 1 + Tier 2(a) — stronger optimizer
-        INV_N_STARTS = 32              # 8 → 32 (4배)
-        INV_N_ITERS = 2000             # 500 → 2000 (early stop 으로 줄어들 수 있음)
+        INV_N_STARTS = 64              # 32 → 64 (월드 탐색 폭 늘림)
+        INV_N_ITERS = 3000             # 2000 → 3000
         INV_LR = 5e-2
         INV_IN_BAND_WEIGHT = 10.0
         INV_OUT_BAND_WEIGHT = 0.0
-        INV_Z_PRIOR_WEIGHT = 1e-3      # 초기값
-        INV_Z_PRIOR_WEIGHT_END = 1e-5  # 종료값 (선형 감소)
+        INV_Z_PRIOR_WEIGHT = 1e-2      # 1e-3 → 1e-2 (10x 강화: z 가 학습 분포 안 머물도록)
+        INV_Z_PRIOR_WEIGHT_END = 1e-2  # 1e-5 → 1e-2 (감소 안 함, 끝까지 prior 유지)
         INV_COSINE_LR = True           # cosine LR schedule
         INV_EARLY_STOP_PATIENCE = 200  # 200 iter 정체 시 중단
         INV_RESTART_PATIENCE = 80      # 80 iter 정체 시 worst restart
