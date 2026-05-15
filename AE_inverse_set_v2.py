@@ -44,6 +44,8 @@ for _b in ("TkAgg", "Qt5Agg", "Qt6Agg", "wxAgg", "MacOSX"):
 _MPL_BACKEND = matplotlib.get_backend()
 
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 import torch
 import torch.nn as nn
@@ -102,6 +104,16 @@ CMD_NAME = {
 
 RETURN_PORT_PAIRS = ((1, 1), (2, 2), (3, 3))
 RETURN_LABELS = ["S11", "S22", "S33"]
+
+PAL_PAPER = [
+    "#2E4172",   # deep slate blue
+    "#8B5A3C",   # sienna brown
+    "#3F6E5C",   # deep teal-green
+    "#6B5B7A",   # muted mauve
+    "#555555",   # charcoal grey
+    "#8B7E3D",   # dark gold
+]
+PAL = PAL_PAPER
 
 # EXT parameter slot indices
 P_SCALE = 0
@@ -556,6 +568,623 @@ def summarize_tokens(tokens: np.ndarray, max_rows=80):
 
 
 # ══════════════════════════════════════════════════════════════
+# 3D viz / JSON helpers / sketch reconstruction
+# (AE_inverse.py 원본 그대로 가져옴, v2 dataset 에 맞춰 일부 hookup 만 조정)
+# ══════════════════════════════════════════════════════════════
+def _v3(d):
+    return np.array([d["x"], d["y"], d["z"]], dtype=float)
+
+
+def extract_dequant_meta(json_data: dict) -> dict:
+    seq = json_data["sequence"]
+    meta = json_data.get("metadata", {})
+
+    pts = []
+    for op in seq:
+        if op["type"] == "Sketch":
+            pts.append(_v3(op["plane"]["origin"]).tolist())
+    for g in meta.get("solids", []):
+        pts.append(g.get("aabb_min", [0, 0, 0]))
+        pts.append(g.get("aabb_max", [0, 0, 0]))
+    arr = np.array(pts) if pts else np.array([[0, 0, 0], [1, 1, 1]])
+    g_min3, g_max3 = arr.min(axis=0), arr.max(axis=0)
+    g_max_dim = float((g_max3 - g_min3).max())
+    if g_max_dim < 1e-8:
+        g_max_dim = 1.0
+
+    sketch_metas = []
+    all_extents = []
+
+    for op in seq:
+        if op["type"] == "Sketch":
+            profile = op.get("profile", {})
+            xs, ys = [], []
+            for loop in profile.get("children", []):
+                for e in loop.get("children", []):
+                    for key in ("start_point", "end_point", "mid_point", "center_point"):
+                        if key in e:
+                            xs.append(e[key]["x"])
+                            ys.append(e[key]["y"])
+            if xs:
+                xy_min = np.array([min(xs), min(ys)])
+                xy_max = np.array([max(xs), max(ys)])
+            else:
+                xy_min = np.array([0.0, 0.0])
+                xy_max = np.array([1.0, 1.0])
+            sk_scale = max(float((xy_max - xy_min).max()), 1e-8)
+
+            plane = op["plane"]
+            sketch_metas.append({
+                "xy_min": xy_min, "xy_max": xy_max, "sk_scale": sk_scale,
+                "origin": _v3(plane["origin"]),
+                "x_axis": _v3(plane["x_axis"]),
+                "y_axis": _v3(plane["y_axis"]),
+                "z_axis": _v3(plane["z_axis"]),
+            })
+        elif op["type"] == "Extrude":
+            all_extents.append(op["extent_one"]["distance"])
+            all_extents.append(op["extent_two"]["distance"])
+
+    max_ext = max(all_extents) if all_extents else 1.0
+    if max_ext < 1e-8:
+        max_ext = 1.0
+
+    return {
+        "g_min3": g_min3, "g_max3": g_max3, "g_max_dim": g_max_dim,
+        "max_ext": max_ext, "sketches": sketch_metas,
+    }
+
+
+def _arc_pts(sx, sy, mx, my, ex, ey, n=32):
+    D = 2 * (sx * (my - ey) + mx * (ey - sy) + ex * (sy - my))
+    if abs(D) < 1e-9:
+        t = np.linspace(0, 1, n)
+        return list(zip(sx + (ex - sx) * t, sy + (ey - sy) * t))
+    ux = ((sx ** 2 + sy ** 2) * (my - ey) + (mx ** 2 + my ** 2) * (ey - sy) + (ex ** 2 + ey ** 2) * (sy - my)) / D
+    uy = ((sx ** 2 + sy ** 2) * (ex - mx) + (mx ** 2 + my ** 2) * (sx - ex) + (ex ** 2 + ey ** 2) * (mx - sx)) / D
+    r = math.sqrt((sx - ux) ** 2 + (sy - uy) ** 2)
+    a1 = math.atan2(sy - uy, sx - ux)
+    am = math.atan2(my - uy, mx - ux)
+    a2 = math.atan2(ey - uy, ex - ux)
+
+    def fix(a, ref):
+        while a - ref > math.pi:
+            a -= 2 * math.pi
+        while a - ref < -math.pi:
+            a += 2 * math.pi
+        return a
+
+    am = fix(am, a1)
+    a2 = fix(a2, a1)
+    if not (min(a1, a2) <= am <= max(a1, a2)):
+        a2 = a2 - 2 * math.pi if a2 > a1 else a2 + 2 * math.pi
+    return [(ux + r * math.cos(a), uy + r * math.sin(a)) for a in np.linspace(a1, a2, n)]
+
+
+def _circle_pts(cx, cy, r, n=48):
+    a = np.linspace(0, 2 * math.pi, n, endpoint=False)
+    return [(cx + r * math.cos(t), cy + r * math.sin(t)) for t in a]
+
+
+def json_to_real_sketches(json_data: dict) -> list:
+    seq = json_data["sequence"]
+    sketches = []
+    i = 0
+    while i < len(seq):
+        if seq[i]["type"] == "Sketch" and i + 1 < len(seq) and seq[i + 1]["type"] == "Extrude":
+            sk = seq[i]
+            ex = seq[i + 1]
+            plane = sk["plane"]
+            origin = _v3(plane["origin"])
+            xa = _v3(plane["x_axis"])
+            ya = _v3(plane["y_axis"])
+            za = _v3(plane["z_axis"])
+            extent_one = float(ex["extent_one"]["distance"])
+            extent_two = float(ex.get("extent_two", {}).get("distance", 0.0))
+            normal = za / (np.linalg.norm(za) + 1e-12)
+
+            loops_3d = []
+            for loop in sk.get("profile", {}).get("children", []):
+                pts = []
+                for ei, e in enumerate(loop.get("children", [])):
+                    et = e["type"]
+                    if et == "Line":
+                        sp = e["start_point"]
+                        ep = e["end_point"]
+                        if ei == 0:
+                            pts.append(origin + sp["x"] * xa + sp["y"] * ya)
+                        pts.append(origin + ep["x"] * xa + ep["y"] * ya)
+                    elif et == "Arc":
+                        sp = e["start_point"]
+                        mp = e["mid_point"]
+                        ep = e["end_point"]
+                        a2d = _arc_pts(sp["x"], sp["y"], mp["x"], mp["y"], ep["x"], ep["y"])
+                        si = 0 if ei == 0 else 1
+                        for ax2, ay2 in a2d[si:]:
+                            pts.append(origin + ax2 * xa + ay2 * ya)
+                    elif et == "Circle":
+                        cp = e["center_point"]
+                        r = e["radius"]
+                        c2d = _circle_pts(cp["x"], cp["y"], r)
+                        for cx2, cy2 in c2d:
+                            pts.append(origin + cx2 * xa + cy2 * ya)
+                if len(pts) >= 2:
+                    loops_3d.append(pts)
+            if loops_3d:
+                sketches.append({
+                    "loops_3d": loops_3d,
+                    "normal": normal,
+                    "extent": extent_one,
+                    "z_axis_raw": za,
+                    "origin_z": float(origin[2]),
+                    "extent_one": extent_one,
+                    "extent_two": extent_two,
+                })
+            i += 2
+        else:
+            i += 1
+    return sketches
+
+
+def _dequant(q, lo, hi):
+    if q < 0:
+        return (lo + hi) / 2.0
+    return lo + (q / QMAX) * (hi - lo)
+
+
+def tokens_to_real_sketches(tokens: np.ndarray, dq_meta: dict) -> list:
+    sk_metas = dq_meta["sketches"]
+    max_ext = dq_meta["max_ext"]
+    sketches = []
+    cur_loops = []
+    cur_pts = []
+    sketch_idx = 0
+    cur_2d = (0.0, 0.0)
+
+    for row in tokens:
+        cmd = int(row[0])
+        p = row[1:]
+
+        if cmd == SOL:
+            if cur_pts:
+                cur_loops.append(cur_pts)
+            cur_pts = []
+            cur_2d = (0.0, 0.0)
+        elif cmd == LINE:
+            if p[0] < 0 or p[1] < 0:
+                continue
+            if sketch_idx < len(sk_metas):
+                sm = sk_metas[sketch_idx]
+                ex = _dequant(p[0], sm["xy_min"][0], sm["xy_max"][0])
+                ey = _dequant(p[1], sm["xy_min"][1], sm["xy_max"][1])
+                cur_pts.append(sm["origin"] + ex * sm["x_axis"] + ey * sm["y_axis"])
+                cur_2d = (ex, ey)
+        elif cmd == ARC:
+            if any(p[i] < 0 for i in range(4)):
+                continue
+            if sketch_idx < len(sk_metas):
+                sm = sk_metas[sketch_idx]
+                mx = _dequant(p[0], sm["xy_min"][0], sm["xy_max"][0])
+                my = _dequant(p[1], sm["xy_min"][1], sm["xy_max"][1])
+                ex = _dequant(p[2], sm["xy_min"][0], sm["xy_max"][0])
+                ey = _dequant(p[3], sm["xy_min"][1], sm["xy_max"][1])
+                sx, sy = cur_2d
+                a2d = _arc_pts(sx, sy, mx, my, ex, ey)
+                for ax2, ay2 in a2d[1:]:
+                    cur_pts.append(sm["origin"] + ax2 * sm["x_axis"] + ay2 * sm["y_axis"])
+                cur_2d = (ex, ey)
+        elif cmd == CIRCLE:
+            if any(p[i] < 0 for i in range(3)):
+                continue
+            if sketch_idx < len(sk_metas):
+                sm = sk_metas[sketch_idx]
+                cx = _dequant(p[0], sm["xy_min"][0], sm["xy_max"][0])
+                cy = _dequant(p[1], sm["xy_min"][1], sm["xy_max"][1])
+                r = (p[2] / QMAX) * sm["sk_scale"]
+                for x2, y2 in _circle_pts(cx, cy, r):
+                    cur_pts.append(sm["origin"] + x2 * sm["x_axis"] + y2 * sm["y_axis"])
+        elif cmd == EXT:
+            if cur_pts:
+                cur_loops.append(cur_pts)
+            cur_pts = []
+            if cur_loops and sketch_idx < len(sk_metas):
+                sm = sk_metas[sketch_idx]
+                e1_val = _dequant(p[P_E1], 0, max_ext)
+                e2_val = _dequant(p[P_E2], 0, max_ext) if int(p[P_E2]) >= 0 else 0.0
+                z_axis_raw = sm["z_axis"]
+                normal = z_axis_raw / (np.linalg.norm(z_axis_raw) + 1e-12)
+                vl = [lp for lp in cur_loops if len(lp) >= 2]
+                if vl:
+                    sketches.append({
+                        "loops_3d": vl,
+                        "normal": normal,
+                        "extent": e1_val,
+                        "z_axis_raw": z_axis_raw,
+                        "origin_z": float(sm["origin"][2]),
+                        "extent_one": float(e1_val),
+                        "extent_two": float(e2_val),
+                    })
+            cur_loops = []
+            sketch_idx += 1
+        elif cmd == EOS:
+            break
+
+    return sketches
+
+
+def tokens_to_sketches_normalized(tokens: np.ndarray) -> list:
+    sketches = []
+    cur_loops = []
+    cur_pts = []
+    cur_2d = (0.0, 0.0)
+    for row in tokens:
+        cmd = int(row[0])
+        p = row[1:]
+        if cmd not in CMD_NAME:
+            continue
+        if cmd == SOL:
+            if cur_pts:
+                cur_loops.append(cur_pts)
+            cur_pts = []
+            cur_2d = (0.0, 0.0)
+        elif cmd == LINE:
+            if p[0] < 0 or p[1] < 0:
+                continue
+            ex, ey = p[0] / QMAX, p[1] / QMAX
+            cur_pts.append((ex, ey))
+            cur_2d = (ex, ey)
+        elif cmd == ARC:
+            if any(p[i] < 0 for i in range(4)):
+                continue
+            mx, my = p[0] / QMAX, p[1] / QMAX
+            ex, ey = p[2] / QMAX, p[3] / QMAX
+            sx, sy = cur_2d
+            a2d = _arc_pts(sx, sy, mx, my, ex, ey)
+            for ax2, ay2 in a2d[1:]:
+                cur_pts.append((ax2, ay2))
+            cur_2d = (ex, ey)
+        elif cmd == CIRCLE:
+            if any(p[i] < 0 for i in range(3)):
+                continue
+            cx, cy = p[0] / QMAX, p[1] / QMAX
+            r = (p[2] / QMAX) * 0.45
+            for x2, y2 in _circle_pts(cx, cy, r):
+                cur_pts.append((x2, y2))
+        elif cmd == EXT:
+            if cur_pts:
+                cur_loops.append(cur_pts)
+            cur_pts = []
+
+            def gp(i):
+                return p[i] / QMAX if p[i] >= 0 else 0.5
+
+            if cur_loops:
+                sketches.append({
+                    "loops_2d": cur_loops,
+                    "pos": (gp(P_PX), gp(P_PY), gp(P_PZ)),
+                    "scale": max(gp(P_SCALE), 0.05),
+                    "e1": max(gp(P_E1), 0.03),
+                })
+            cur_loops = []
+        elif cmd == EOS:
+            break
+    return sketches
+
+
+def render_3d_real(ax, sketches: list) -> list:
+    all_pts = []
+    for idx, sk in enumerate(sketches):
+        color = PAL[idx % len(PAL)]
+        normal = np.array(sk["normal"])
+        extent = sk["extent"]
+        for loop_pts in sk["loops_3d"]:
+            if len(loop_pts) < 2:
+                continue
+            bot = [np.array(p) for p in loop_pts]
+            top = [p + normal * extent for p in bot]
+            all_pts.extend([p.tolist() for p in bot])
+            all_pts.extend([p.tolist() for p in top])
+
+            def outline(pts, lw=1.6, la=0.95):
+                xs = [p[0] for p in pts]
+                ys = [p[1] for p in pts]
+                zs = [p[2] for p in pts]
+                ax.plot(
+                    xs + [xs[0]], ys + [ys[0]], zs + [zs[0]],
+                    color=color, lw=lw, alpha=la,
+                    solid_capstyle="round", solid_joinstyle="round",
+                )
+
+            outline(bot, lw=1.8, la=0.95)
+            outline(top, lw=1.2, la=0.75)
+
+            step = max(1, len(bot) // 12)
+            for i in range(0, len(bot), step):
+                b, t = bot[i], top[i]
+                ax.plot(
+                    [b[0], t[0]], [b[1], t[1]], [b[2], t[2]],
+                    color=color, lw=0.8, alpha=0.50,
+                )
+            if len(bot) >= 3:
+                bl = [b.tolist() for b in bot]
+                tl = [t.tolist() for t in top]
+                for face, a in [(bl, 0.35), (tl, 0.40)]:
+                    pf = Poly3DCollection([face], alpha=a)
+                    pf.set_facecolor(color)
+                    pf.set_edgecolor("none")
+                    ax.add_collection3d(pf)
+                ss = max(1, len(bot) // 20)
+                for i in range(0, len(bot), ss):
+                    j = (i + ss) % len(bot)
+                    ps = Poly3DCollection(
+                        [[bot[i].tolist(), bot[j].tolist(),
+                          top[j].tolist(), top[i].tolist()]],
+                        alpha=0.22,
+                    )
+                    ps.set_facecolor(color)
+                    ps.set_edgecolor("none")
+                    ax.add_collection3d(ps)
+    return all_pts
+
+
+def render_3d_normalized(ax, sketches: list) -> list:
+    all_pts = []
+    for idx, sk in enumerate(sketches):
+        color = PAL[idx % len(PAL)]
+        px, py, pz = sk["pos"]
+        size = sk["scale"] * 2.2
+        e1 = sk["e1"] * 1.8
+        ox = (px - 0.5) * 2
+        oy = (py - 0.5) * 2
+        oz = pz * 2
+        for loop_pts in sk["loops_2d"]:
+            if len(loop_pts) < 2:
+                continue
+            bot = [((x - 0.5) * size + ox, (y - 0.5) * size + oy, oz) for x, y in loop_pts]
+            top = [(b[0], b[1], b[2] + e1) for b in bot]
+            all_pts.extend(bot)
+            all_pts.extend(top)
+
+            def outline(pts, lw=1.6, la=0.95):
+                xs = [p[0] for p in pts]
+                ys = [p[1] for p in pts]
+                zs = [p[2] for p in pts]
+                ax.plot(
+                    xs + [xs[0]], ys + [ys[0]], zs + [zs[0]],
+                    color=color, lw=lw, alpha=la,
+                    solid_capstyle="round", solid_joinstyle="round",
+                )
+
+            outline(bot, lw=1.8, la=0.95)
+            outline(top, lw=1.2, la=0.75)
+            step = max(1, len(bot) // 12)
+            for i in range(0, len(bot), step):
+                b, t = bot[i], top[i]
+                ax.plot(
+                    [b[0], t[0]], [b[1], t[1]], [b[2], t[2]],
+                    color=color, lw=0.8, alpha=0.50,
+                )
+            if len(bot) >= 3:
+                for face, a in [(bot, 0.35), (top, 0.40)]:
+                    pf = Poly3DCollection([face], alpha=a)
+                    pf.set_facecolor(color)
+                    pf.set_edgecolor("none")
+                    ax.add_collection3d(pf)
+                ss = max(1, len(bot) // 20)
+                for i in range(0, len(bot), ss):
+                    j = (i + ss) % len(bot)
+                    ps = Poly3DCollection([[bot[i], bot[j], top[j], top[i]]], alpha=0.22)
+                    ps.set_facecolor(color)
+                    ps.set_edgecolor("none")
+                    ax.add_collection3d(ps)
+    return all_pts
+
+
+def _equal_axes(ax):
+    lims = np.array([ax.get_xlim3d(), ax.get_ylim3d(), ax.get_zlim3d()])
+    extents = lims[:, 1] - lims[:, 0]
+    max_ext = float(extents.max()) if extents.size else 1.0
+    floor = max(max_ext * 0.02, 1e-3)
+    extents = np.maximum(extents, floor)
+    try:
+        ax.set_box_aspect(tuple(extents))
+    except Exception:
+        pass
+
+
+def _style(ax, title):
+    try:
+        ax.set_proj_type("ortho")
+    except Exception:
+        pass
+    ax.set_facecolor("white")
+    for pane in (ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane):
+        pane.fill = False
+        pane.set_edgecolor((1, 1, 1, 0))
+    ax.grid(False)
+    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+        axis.line.set_color((1, 1, 1, 0))
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_zticks([])
+    ax.set_xlabel("")
+    ax.set_ylabel("")
+    ax.set_zlabel("")
+    ax.set_title(title, color="#222", fontsize=9.5, fontweight="normal", pad=8)
+
+
+def _set_axes_and_render(ax, sketches, use_real):
+    pts = render_3d_real(ax, sketches) if use_real else render_3d_normalized(ax, sketches)
+    if pts:
+        arr = np.array(pts)
+        ext = arr.max(axis=0) - arr.min(axis=0)
+        pad = max(float(ext.max()) * 0.18, 0.1)
+        ax.set_xlim(arr[:, 0].min() - pad, arr[:, 0].max() + pad)
+        ax.set_ylim(arr[:, 1].min() - pad, arr[:, 1].max() + pad)
+        ax.set_zlim(arr[:, 2].min() - pad, arr[:, 2].max() + pad)
+        _equal_axes(ax)
+    else:
+        ax.text2D(
+            0.5, 0.5, "no geometry",
+            color="#888", ha="center", va="center",
+            fontsize=12, transform=ax.transAxes,
+        )
+    return pts
+
+
+def _compute_sketch_centers(sketches, use_real):
+    centers = []
+    for sk in sketches:
+        if use_real:
+            pts_all = []
+            for loop in sk.get("loops_3d", []):
+                pts_all.extend([np.asarray(p, dtype=float) for p in loop])
+            if not pts_all:
+                centers.append(None)
+                continue
+            arr = np.stack(pts_all, axis=0)
+            normal = np.asarray(sk.get("normal", [0, 0, 1]), dtype=float)
+            extent = float(sk.get("extent", 0.0))
+            bot_c = arr.mean(axis=0)
+            c = bot_c + normal * (extent / 2.0)
+        else:
+            pts2d = []
+            for loop in sk.get("loops_2d", []):
+                pts2d.extend(loop)
+            if not pts2d:
+                centers.append(None)
+                continue
+            arr2d = np.array(pts2d, dtype=float)
+            px, py, pz = sk["pos"]
+            size = sk["scale"] * 2.2
+            e1 = sk["e1"] * 1.8
+            ox = (px - 0.5) * 2.0
+            oy = (py - 0.5) * 2.0
+            oz = pz * 2.0
+            cx_2d = arr2d[:, 0].mean()
+            cy_2d = arr2d[:, 1].mean()
+            cx = (cx_2d - 0.5) * size + ox
+            cy = (cy_2d - 0.5) * size + oy
+            cz = oz + e1 / 2.0
+            c = np.array([cx, cy, cz], dtype=float)
+        centers.append(c)
+    return centers
+
+
+def _annotate_centers(ax, centers, with_coords=True, with_label=True):
+    for i, c in enumerate(centers):
+        if c is None:
+            continue
+        color = PAL[i % len(PAL)]
+        ax.scatter(
+            [float(c[0])], [float(c[1])], [float(c[2])],
+            s=55, c=color, marker="o",
+            edgecolors="black", linewidths=0.8,
+            zorder=2000, depthshade=False,
+        )
+        if with_coords or with_label:
+            if with_coords:
+                txt = f"  S{i+1} ({c[0]:.1f},{c[1]:.1f},{c[2]:.1f})"
+            else:
+                txt = f"  S{i+1}"
+            ax.text(
+                float(c[0]), float(c[1]), float(c[2]),
+                txt,
+                fontsize=6.5, color="#111",
+                bbox=dict(
+                    boxstyle="round,pad=0.15",
+                    fc=(1, 1, 1, 0.82),
+                    ec=(0.6, 0.6, 0.6, 0.6),
+                    lw=0.3,
+                ),
+                zorder=2000,
+            )
+
+
+def _print_sketch_centers(centers, use_real):
+    if not centers:
+        return
+    unit = "mm" if use_real else "norm"
+    print(f"\n  Sketch centers ({len(centers)} entries, {unit}):")
+    for i, c in enumerate(centers):
+        if c is None:
+            print(f"    [sketch {i+1}] (empty)")
+        else:
+            print(
+                f"    [sketch {i+1}] center = "
+                f"({c[0]:8.3f}, {c[1]:8.3f}, {c[2]:8.3f}) {unit}"
+            )
+
+
+def show_comparison(orig_tok, recon_tok, fname, json_data=None):
+    orig_tok = trim_after_eos(orig_tok)
+    recon_tok = trim_after_eos(recon_tok)
+    use_real = json_data is not None
+
+    if use_real:
+        orig_sk = json_to_real_sketches(json_data)
+        dq_meta = extract_dequant_meta(json_data)
+        recon_sk = tokens_to_real_sketches(recon_tok, dq_meta)
+    else:
+        orig_sk = tokens_to_sketches_normalized(orig_tok)
+        recon_sk = tokens_to_sketches_normalized(recon_tok)
+
+    if use_real:
+        nl_o = sum(len(s["loops_3d"]) for s in orig_sk)
+        nl_r = sum(len(s["loops_3d"]) for s in recon_sk)
+    else:
+        nl_o = sum(len(s["loops_2d"]) for s in orig_sk)
+        nl_r = sum(len(s["loops_2d"]) for s in recon_sk)
+    ne_o = len(orig_sk)
+    ne_r = len(recon_sk)
+
+    coord_label = "real coord (mm)" if use_real else "normalized"
+
+    fig = plt.figure(figsize=(15, 14), facecolor="white")
+    fig.suptitle(
+        f"Geometry Comparison [{coord_label}]\n{fname}",
+        fontsize=11, fontweight="normal", color="#222", y=0.985,
+    )
+
+    views = [
+        (0, 0, "Original — 3D View",          orig_sk,  28, -55),
+        (0, 1, "Reconstruction — 3D View",    recon_sk, 28, -55),
+        (1, 0, "Original — Top View",         orig_sk,  89.9, -90.0),
+        (1, 1, "Reconstruction — Top View",   recon_sk, 89.9, -90.0),
+    ]
+    for row, col, label, sk, elev, azim in views:
+        ax = fig.add_subplot(2, 2, row * 2 + col + 1, projection="3d")
+        if not sk:
+            ax.text2D(
+                0.5, 0.5, "(empty)",
+                color="#888", ha="center", va="center",
+                fontsize=11, transform=ax.transAxes,
+            )
+            _style(ax, label)
+            ax.view_init(elev=elev, azim=azim)
+            continue
+        _set_axes_and_render(ax, sk, use_real)
+        ne = ne_o if "Original" in label else ne_r
+        nl = nl_o if "Original" in label else nl_r
+        tok = orig_tok if "Original" in label else recon_tok
+        _style(ax, f"{label}\n{ne} extrude · {nl} loop · {tok.shape[0]} token")
+        ax.view_init(elev=elev, azim=azim)
+
+    n_leg = max(ne_o, ne_r)
+    if n_leg:
+        fig.legend(
+            handles=[mpatches.Patch(color=PAL[i % len(PAL)], label=f"Sketch {i+1}")
+                     for i in range(n_leg)],
+            loc="lower center", ncol=min(n_leg, 6),
+            facecolor="white", edgecolor="#ddd", labelcolor="#444",
+            fontsize=9, framealpha=0.95,
+        )
+
+    plt.tight_layout(rect=[0, 0.04, 1, 0.97])
+    print(f"  ✓ comparison figure created: {fname}")
+
+
+# ══════════════════════════════════════════════════════════════
 # Frequency / interpolation
 # ══════════════════════════════════════════════════════════════
 def select_frequency_indices(
@@ -850,6 +1479,12 @@ class BodySetJointDataset(Dataset):
         self.npy_files = list(npy_files)
         self.type_names = list(type_names) if type_names else ["type1"]
 
+        # JSON 메타 (실좌표 mm 변환용). 없으면 None.
+        self.json_files = []
+        for f in self.npy_files:
+            jf = f.replace("_tokens.npy", "_deepcad.json")
+            self.json_files.append(jf if os.path.exists(jf) else None)
+
         self.freqs = np.asarray(freqs, dtype=np.float32)
         self.freqs_full = np.asarray(freqs_full, dtype=np.float32)
         self.freq_idx = np.asarray(freq_idx, dtype=np.int64)
@@ -952,6 +1587,17 @@ class BodySetJointDataset(Dataset):
 
     def __len__(self):
         return len(self.npy_files)
+
+    def load_json(self, idx):
+        jf = self.json_files[idx] if idx < len(self.json_files) else None
+        if jf is None:
+            return None
+        try:
+            import json as _json
+            with open(jf, "r", encoding="utf-8") as f:
+                return _json.load(f)
+        except Exception:
+            return None
 
     def __getitem__(self, idx):
         return (
@@ -2559,6 +3205,604 @@ def visualize_sparam_predictions(
 
 
 @torch.no_grad()
+def visualize_reconstruction(ae, dataset, indices, device, max_samples=2):
+    """body-set AE 의 reconstruction 을 3D 로 비교 (original vs decoded).
+    v2 AE API 에 맞춰 encode(body_tok, body_pres) 로 호출."""
+    ae.eval()
+    sel = list(indices)[:max_samples]
+    if not sel:
+        print("  ⚠ visualize_reconstruction: 표시할 sample 없음")
+        return []
+
+    figs = []
+    for k, idx in enumerate(sel):
+        body_tok = torch.tensor(
+            dataset.body_tokens[idx],
+            dtype=torch.float32,
+        ).unsqueeze(0).to(device)
+
+        body_pres = torch.tensor(
+            dataset.body_present[idx],
+            dtype=torch.float32,
+        ).unsqueeze(0).to(device)
+
+        z = ae.encode(body_tok, body_pres)
+
+        n_true = int(dataset.body_present[idx].sum())
+        gen_seq = ae.generate(z, force_topk=n_true)[0]
+        recon = np.asarray(gen_seq, dtype=np.int32)
+
+        orig = dataset.raw_tokens[idx]
+
+        try:
+            t_id = int(dataset.type_ids[idx])
+            t_name = dataset.type_names[t_id]
+        except Exception:
+            t_name = "?"
+
+        try:
+            base = os.path.basename(dataset.npy_files[idx])
+        except Exception:
+            base = f"sample_{idx}"
+        fname = f"[{t_name}] {base}"
+
+        json_data = None
+        try:
+            json_data = dataset.load_json(idx)
+        except Exception:
+            json_data = None
+
+        try:
+            show_comparison(
+                orig_tok=orig,
+                recon_tok=recon,
+                fname=fname,
+                json_data=json_data,
+            )
+            figs.append(plt.gcf())
+            mode = "real" if json_data is not None else "normalized"
+            print(
+                f"  · recon viz [{k+1}/{len(sel)}]: idx={idx} type={t_name} "
+                f"mode={mode}  orig_tok={len(trim_after_eos(orig))} "
+                f"recon_tok={len(trim_after_eos(recon))}"
+            )
+        except Exception as e:
+            import traceback as _tb
+            print(
+                f"  ⚠ recon viz [{k+1}/{len(sel)}] failed "
+                f"(idx={idx}): {type(e).__name__}: {e}"
+            )
+            _tb.print_exc()
+
+    return figs
+
+
+def visualize_reconstruction_per_type(ae, dataset, val_idx_per_type, type_names, device, max_per_type=1):
+    """타입별로 reconstruction figure 한 장씩 (val 셋에서)."""
+    for ti, tname in enumerate(type_names):
+        idxs = val_idx_per_type.get(ti, [])
+        if not idxs:
+            continue
+        subsection(f"Reconstruction figures — [{tname}]")
+        try:
+            visualize_reconstruction(
+                ae,
+                dataset,
+                idxs[:max_per_type],
+                device,
+                max_samples=max_per_type,
+            )
+        except Exception as e:
+            print(f"  ⚠ per-type viz failed [{tname}]: {type(e).__name__}: {e}")
+
+
+def analyze_latent_space(z_all, type_ids=None, type_names=None):
+    """latent z 의 PCA / t-SNE / cumulative var 진단 figure."""
+    N, D = z_all.shape
+    type_ids = np.asarray(type_ids) if type_ids is not None else np.zeros(N, dtype=int)
+    type_names = list(type_names) if type_names else ["all"]
+    n_types = len(type_names)
+
+    colors_t = ["#4C9BE8", "#E05C5C", "#6DBF67", "#F4A340", "#A57CC1", "#4ECBCB"]
+
+    try:
+        from sklearn.decomposition import PCA
+    except ImportError:
+        print("  ⚠ sklearn 없음: latent 분석 skip (pip install scikit-learn)")
+        return
+
+    try:
+        pca = PCA(n_components=min(2, D))
+        z_pca = pca.fit_transform(z_all)
+        pca_full = PCA(n_components=min(N - 1, D))
+        pca_full.fit(z_all)
+        cumvar = np.cumsum(pca_full.explained_variance_ratio_)
+        ev2 = pca.explained_variance_ratio_
+    except Exception as e:
+        print(f"  ⚠ PCA 실패: {type(e).__name__}: {e}")
+        return
+
+    z_tsne = None
+    try:
+        from sklearn.manifold import TSNE
+        if N >= 10:
+            perp = min(30, max(5, N // 4))
+            z_tsne = TSNE(
+                n_components=2, perplexity=perp,
+                random_state=0, init="pca", learning_rate="auto",
+            ).fit_transform(z_all)
+    except Exception as e:
+        print(f"  ⚠ t-SNE skip: {type(e).__name__}: {e}")
+
+    n_panels = 2 + (1 if z_tsne is not None else 0)
+    fig, axes = plt.subplots(
+        1, n_panels, figsize=(5 * n_panels, 4.5), facecolor="white",
+    )
+    if n_panels == 1:
+        axes = [axes]
+    pi = 0
+
+    ax = axes[pi]; pi += 1
+    for ti in range(n_types):
+        m = (type_ids == ti)
+        if not m.any():
+            continue
+        ax.scatter(
+            z_pca[m, 0], z_pca[m, 1],
+            c=colors_t[ti % len(colors_t)],
+            s=18, alpha=0.7,
+            label=type_names[ti], edgecolor="none",
+        )
+    ax.set_title(f"PCA  (var={ev2[0]:.2f}+{ev2[1]:.2f})", fontweight="normal")
+    ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
+    ax.grid(True, alpha=0.2)
+    if n_types > 1:
+        ax.legend(fontsize=9)
+
+    if z_tsne is not None:
+        ax = axes[pi]; pi += 1
+        for ti in range(n_types):
+            m = (type_ids == ti)
+            if not m.any():
+                continue
+            ax.scatter(
+                z_tsne[m, 0], z_tsne[m, 1],
+                c=colors_t[ti % len(colors_t)],
+                s=18, alpha=0.7,
+                label=type_names[ti], edgecolor="none",
+            )
+        ax.set_title("t-SNE", fontweight="normal")
+        ax.set_xlabel("dim 1"); ax.set_ylabel("dim 2")
+        ax.grid(True, alpha=0.2)
+        if n_types > 1:
+            ax.legend(fontsize=9)
+
+    ax = axes[pi]; pi += 1
+    ax.plot(
+        np.arange(1, len(cumvar) + 1), cumvar,
+        lw=1.8, color="#4C9BE8", marker="o", markersize=3,
+    )
+    for thr, c in [(0.5, "#94A3B8"), (0.9, "#E07B5B"), (0.95, "#3F6E5C")]:
+        ax.axhline(thr, ls="--", color=c, lw=1, alpha=0.6)
+        if (cumvar >= thr).any():
+            idx = int(np.argmax(cumvar >= thr)) + 1
+            ax.text(idx, thr, f" dim{idx}", color=c, fontsize=8, va="bottom")
+    ax.set_xlabel("# PCA dim")
+    ax.set_ylabel("cum explained var")
+    ax.set_title(f"Latent intrinsic dim  (D={D})", fontweight="normal")
+    ax.set_ylim(0, 1.02)
+    ax.grid(True, alpha=0.2)
+
+    plt.tight_layout()
+    print("  ✓ latent 분석 figure 생성 (PCA + t-SNE + cumvar)")
+
+
+def extract_decoded_dimensions(tokens, dq_meta):
+    """Decoded tokens → 실좌표(mm) dimension list. ARC/CIRCLE 의 원래 R/Ø 보존."""
+    if dq_meta is None:
+        return []
+
+    sk_metas = dq_meta["sketches"]
+    max_ext = dq_meta["max_ext"]
+
+    dims = []
+    cur_2d = (0.0, 0.0)
+    loop_first_2d = None
+    sketch_idx = 0
+
+    for row in tokens:
+        cmd = int(row[0])
+        p = row[1:]
+
+        if sketch_idx >= len(sk_metas):
+            if cmd == EOS:
+                break
+            if cmd == EXT:
+                sketch_idx += 1
+            continue
+
+        sm = sk_metas[sketch_idx]
+
+        if cmd == SOL:
+            cur_2d = (0.0, 0.0)
+            loop_first_2d = None
+        elif cmd == LINE:
+            if p[0] < 0 or p[1] < 0:
+                continue
+            ex = _dequant(p[0], sm["xy_min"][0], sm["xy_max"][0])
+            ey = _dequant(p[1], sm["xy_min"][1], sm["xy_max"][1])
+            sx, sy = cur_2d
+            if loop_first_2d is None:
+                loop_first_2d = (sx, sy)
+            p_s_3d = sm["origin"] + sx * sm["x_axis"] + sy * sm["y_axis"]
+            p_e_3d = sm["origin"] + ex * sm["x_axis"] + ey * sm["y_axis"]
+            length = float(np.linalg.norm(p_e_3d - p_s_3d))
+            dims.append({
+                "kind": "line",
+                "sketch_idx": sketch_idx,
+                "p_start_3d": p_s_3d,
+                "p_end_3d": p_e_3d,
+                "length": length,
+            })
+            cur_2d = (ex, ey)
+        elif cmd == ARC:
+            if any(p[i] < 0 for i in range(4)):
+                continue
+            mx = _dequant(p[0], sm["xy_min"][0], sm["xy_max"][0])
+            my = _dequant(p[1], sm["xy_min"][1], sm["xy_max"][1])
+            ex = _dequant(p[2], sm["xy_min"][0], sm["xy_max"][0])
+            ey = _dequant(p[3], sm["xy_min"][1], sm["xy_max"][1])
+            sx, sy = cur_2d
+
+            mid_3d = sm["origin"] + mx * sm["x_axis"] + my * sm["y_axis"]
+            p_s_3d = sm["origin"] + sx * sm["x_axis"] + sy * sm["y_axis"]
+            p_e_3d = sm["origin"] + ex * sm["x_axis"] + ey * sm["y_axis"]
+
+            D = 2 * (sx * (my - ey) + mx * (ey - sy) + ex * (sy - my))
+            if abs(D) < 1e-9:
+                length = float(np.linalg.norm(p_e_3d - p_s_3d))
+                dims.append({
+                    "kind": "line",
+                    "sketch_idx": sketch_idx,
+                    "p_start_3d": p_s_3d,
+                    "p_end_3d": p_e_3d,
+                    "length": length,
+                })
+            else:
+                ux = ((sx ** 2 + sy ** 2) * (my - ey)
+                      + (mx ** 2 + my ** 2) * (ey - sy)
+                      + (ex ** 2 + ey ** 2) * (sy - my)) / D
+                uy = ((sx ** 2 + sy ** 2) * (ex - mx)
+                      + (mx ** 2 + my ** 2) * (sx - ex)
+                      + (ex ** 2 + ey ** 2) * (mx - sx)) / D
+                r = math.sqrt((sx - ux) ** 2 + (sy - uy) ** 2)
+                a1 = math.atan2(sy - uy, sx - ux)
+                a2 = math.atan2(ey - uy, ex - ux)
+                am = math.atan2(my - uy, mx - ux)
+                def _fix(a, ref):
+                    while a - ref > math.pi:
+                        a -= 2 * math.pi
+                    while a - ref < -math.pi:
+                        a += 2 * math.pi
+                    return a
+                am_f = _fix(am, a1)
+                a2_f = _fix(a2, a1)
+                if not (min(a1, a2_f) <= am_f <= max(a1, a2_f)):
+                    a2_f = a2_f - 2 * math.pi if a2_f > a1 else a2_f + 2 * math.pi
+                sweep = abs(a2_f - a1)
+                arc_len = r * sweep
+                dims.append({
+                    "kind": "arc",
+                    "sketch_idx": sketch_idx,
+                    "p_start_3d": p_s_3d,
+                    "p_mid_3d": mid_3d,
+                    "p_end_3d": p_e_3d,
+                    "radius": float(r),
+                    "sweep_deg": float(math.degrees(sweep)),
+                    "arc_length": float(arc_len),
+                })
+            cur_2d = (ex, ey)
+        elif cmd == CIRCLE:
+            if any(p[i] < 0 for i in range(3)):
+                continue
+            cx = _dequant(p[0], sm["xy_min"][0], sm["xy_max"][0])
+            cy = _dequant(p[1], sm["xy_min"][1], sm["xy_max"][1])
+            r = (p[2] / QMAX) * sm["sk_scale"]
+            c_3d = sm["origin"] + cx * sm["x_axis"] + cy * sm["y_axis"]
+            dims.append({
+                "kind": "circle",
+                "sketch_idx": sketch_idx,
+                "center_3d": c_3d,
+                "radius": float(r),
+                "diameter": float(2 * r),
+            })
+        elif cmd == EXT:
+            e1_val = _dequant(p[P_E1], 0, max_ext)
+            e2_val = (
+                _dequant(p[P_E2], 0, max_ext)
+                if int(p[P_E2]) >= 0 else 0.0
+            )
+            z_raw = sm["z_axis"]
+            normal = z_raw / (np.linalg.norm(z_raw) + 1e-12)
+            ref_3d = sm["origin"]
+            top_3d = ref_3d + normal * e1_val
+            dims.append({
+                "kind": "extrude",
+                "sketch_idx": sketch_idx,
+                "p_start_3d": ref_3d,
+                "p_end_3d": top_3d,
+                "label_pos_3d": (ref_3d + top_3d) / 2.0,
+                "length": float(e1_val),
+                "extent_one": float(e1_val),
+                "extent_two": float(e2_val),
+            })
+            sketch_idx += 1
+            cur_2d = (0.0, 0.0)
+            loop_first_2d = None
+        elif cmd == EOS:
+            break
+
+    return dims
+
+
+def _format_dim_label(d):
+    k = d["kind"]
+    if k == "line":
+        return f"{d['length']:.1f}"
+    if k == "circle":
+        return f"Ø{d['diameter']:.1f}"
+    if k == "arc":
+        return f"R{d['radius']:.1f}"
+    if k == "extrude":
+        return f"h={d['length']:.1f}"
+    return ""
+
+
+def _annotate_dimensions(ax, dims):
+    if not dims:
+        return
+    label_kwargs = dict(
+        fontsize=6.5,
+        color="#111",
+        ha="center", va="center",
+        zorder=1000,
+    )
+    bbox_kw = dict(
+        boxstyle="round,pad=0.15",
+        fc=(1, 1, 1, 0.78),
+        ec=(0.7, 0.7, 0.7, 0.6),
+        lw=0.3,
+    )
+
+    for d in dims:
+        k = d["kind"]
+        txt = _format_dim_label(d)
+        if not txt:
+            continue
+        if k == "line":
+            pos = (d["p_start_3d"] + d["p_end_3d"]) / 2.0
+        elif k == "circle":
+            pos = d["center_3d"]
+        elif k == "arc":
+            pos = d["p_mid_3d"]
+        elif k == "extrude":
+            pos = d["label_pos_3d"]
+        else:
+            continue
+        ax.text(
+            float(pos[0]), float(pos[1]), float(pos[2]),
+            txt, bbox=bbox_kw, **label_kwargs,
+        )
+
+
+def _print_decoded_dimensions(dims):
+    if not dims:
+        print("  (no dimensions extracted)")
+        return
+    by_sk = {}
+    for d in dims:
+        by_sk.setdefault(d["sketch_idx"], []).append(d)
+    print(f"\n  Decoded dimensions ({len(dims)} entries, mm):")
+    for sk_i in sorted(by_sk.keys()):
+        print(f"    [sketch {sk_i + 1}]")
+        for d in by_sk[sk_i]:
+            k = d["kind"]
+            if k == "line":
+                print(f"      LINE     length = {d['length']:7.3f} mm")
+            elif k == "circle":
+                print(f"      CIRCLE   Ø = {d['diameter']:7.3f} mm   (R={d['radius']:.3f})")
+            elif k == "arc":
+                print(
+                    f"      ARC      R = {d['radius']:7.3f} mm   "
+                    f"sweep={d['sweep_deg']:6.1f}°   arc_len={d['arc_length']:.3f}"
+                )
+            elif k == "extrude":
+                print(
+                    f"      EXTRUDE  height = {d['extent_one']:7.3f} mm   "
+                    f"(ext2={d['extent_two']:.3f})"
+                )
+
+
+@torch.no_grad()
+def _find_nn_dequant_meta(dataset, ae, z_target, device):
+    """latent 공간에서 z_target 에 가장 가까운 sample 의 JSON 으로 dequant_meta 생성."""
+    all_indices = list(range(len(dataset)))
+    z_all, _ = collect_latents(ae, dataset, all_indices, device)
+
+    z_t = z_target.detach().cpu().numpy()
+    if z_t.ndim == 2:
+        z_t = z_t[0]
+
+    dists = np.linalg.norm(z_all - z_t[None, :], axis=1)
+    order = np.argsort(dists)
+
+    for cand in order:
+        ci = int(cand)
+        jd = dataset.load_json(ci)
+        if jd is None:
+            continue
+        try:
+            dq = extract_dequant_meta(jd)
+            if dq["sketches"]:
+                return dq, ci, float(dists[ci])
+        except Exception:
+            continue
+
+    return None, -1, float("inf")
+
+
+def _extend_dequant_meta(dq_meta, n_needed):
+    if dq_meta is None:
+        return None
+    sk = list(dq_meta["sketches"])
+    if not sk:
+        return dq_meta
+    while len(sk) < n_needed:
+        sk.append(dict(sk[-1]))
+    dq_meta = dict(dq_meta)
+    dq_meta["sketches"] = sk
+    return dq_meta
+
+
+@torch.no_grad()
+def visualize_decoded_structure(
+    ae, z, dataset, device, title="Decoded structure",
+    separate_windows=False,
+    force_topk=None,
+):
+    """latent z → AE.generate() → 3D 시각화 (real-coord if JSON 가능, else normalized)."""
+    ae.eval()
+
+    gen = ae.generate(z, force_topk=force_topk)
+    recon = np.asarray(gen[0], dtype=np.int32)
+    recon_trim = trim_after_eos(recon)
+
+    dq_meta, nn_idx, nn_dist = _find_nn_dequant_meta(dataset, ae, z, device)
+    n_ext = int((recon_trim[:, 0] == EXT).sum())
+
+    if dq_meta is not None and n_ext > 0:
+        dq_meta = _extend_dequant_meta(dq_meta, max(n_ext, len(dq_meta["sketches"])))
+        sketches = tokens_to_real_sketches(recon_trim, dq_meta)
+        use_real = True
+        coord_label = "real coord (mm)"
+        try:
+            nn_name = os.path.basename(dataset.npy_files[nn_idx])
+            t_id = int(dataset.type_ids[nn_idx])
+            t_name = dataset.type_names[t_id]
+            meta_note = f"NN ref: [{t_name}] {nn_name}  (z-dist={nn_dist:.2f})"
+        except Exception:
+            meta_note = f"NN ref idx={nn_idx}  (z-dist={nn_dist:.2f})"
+    else:
+        sketches = tokens_to_sketches_normalized(recon_trim)
+        use_real = False
+        coord_label = "normalized"
+        meta_note = "no JSON metadata available — fallback to normalized"
+
+    if use_real:
+        nl_total = sum(len(s["loops_3d"]) for s in sketches)
+        dims = extract_decoded_dimensions(recon_trim, dq_meta)
+        _print_decoded_dimensions(dims)
+    else:
+        nl_total = sum(len(s["loops_2d"]) for s in sketches)
+        dims = []
+        print("  (dimensions not annotated — normalized mode, no real-coord meta)")
+
+    centers = _compute_sketch_centers(sketches, use_real)
+    _print_sketch_centers(centers, use_real)
+
+    views = [
+        ("Decoded — 3D View",        28,   -55),
+        ("Decoded — 3D View (alt)",  20,    45),
+        ("Decoded — Top View",       89.9, -90.0),
+        ("Decoded — Side View",       5,   -90),
+    ]
+
+    ne = len(sketches)
+    nl = (
+        sum(len(s["loops_3d"]) for s in sketches) if use_real
+        else sum(len(s["loops_2d"]) for s in sketches)
+    )
+    info_line = f"{recon_trim.shape[0]} tokens · {ne} extrude · {nl_total} loop"
+
+    def _draw_one(ax, label, elev, azim, annotate=True):
+        if not sketches:
+            ax.text2D(
+                0.5, 0.5, "(empty)",
+                color="#888", ha="center", va="center",
+                fontsize=11, transform=ax.transAxes,
+            )
+            _style(ax, label)
+            ax.view_init(elev=elev, azim=azim)
+            return
+        _set_axes_and_render(ax, sketches, use_real=use_real)
+        if annotate:
+            if use_real and dims:
+                _annotate_dimensions(ax, dims)
+            _annotate_centers(ax, centers, with_coords=use_real, with_label=True)
+        _style(
+            ax,
+            f"{label}\n{ne} extrude · {nl} loop · {recon_trim.shape[0]} token",
+        )
+        ax.view_init(elev=elev, azim=azim)
+
+    if separate_windows:
+        for label, elev, azim in views:
+            fig = plt.figure(figsize=(10, 9), facecolor="white")
+            fig.suptitle(
+                f"{title} [{coord_label}]\n{info_line}\n{meta_note}",
+                fontsize=10, fontweight="normal", color="#222", y=0.985,
+            )
+            ax = fig.add_subplot(1, 1, 1, projection="3d")
+            _draw_one(ax, label, elev, azim)
+            if sketches:
+                fig.legend(
+                    handles=[
+                        mpatches.Patch(color=PAL[i % len(PAL)], label=f"Sketch {i + 1}")
+                        for i in range(len(sketches))
+                    ],
+                    loc="lower center", ncol=min(len(sketches), 6),
+                    facecolor="white", edgecolor="#ddd", labelcolor="#444",
+                    fontsize=9, framealpha=0.95,
+                )
+            plt.tight_layout(rect=[0, 0.04, 1, 0.94])
+        n_figs_created = 4
+    else:
+        top_label, top_elev, top_azim = "Decoded — Top View", 89.9, -90.0
+
+        def _make_top_fig(annotate, suffix):
+            fig_top = plt.figure(figsize=(12, 11), facecolor="white")
+            fig_top.suptitle(
+                f"{title}  —  TOP VIEW {suffix}[{coord_label}]\n{info_line}\n{meta_note}",
+                fontsize=11, fontweight="normal", color="#222", y=0.985,
+            )
+            ax_top = fig_top.add_subplot(1, 1, 1, projection="3d")
+            _draw_one(ax_top, top_label, top_elev, top_azim, annotate=annotate)
+            if sketches:
+                fig_top.legend(
+                    handles=[
+                        mpatches.Patch(color=PAL[i % len(PAL)], label=f"Sketch {i + 1}")
+                        for i in range(len(sketches))
+                    ],
+                    loc="lower center", ncol=min(len(sketches), 6),
+                    facecolor="white", edgecolor="#ddd", labelcolor="#444",
+                    fontsize=10, framealpha=0.95,
+                )
+            plt.tight_layout(rect=[0, 0.05, 1, 0.94])
+
+        _make_top_fig(annotate=True, suffix="(annotated) ")
+        _make_top_fig(annotate=False, suffix="(clean) ")
+        n_figs_created = 2
+
+    print(
+        f"  ✓ decoded structure figure 생성 "
+        f"(tokens={recon_trim.shape[0]}, mode={'real' if use_real else 'normalized'}, "
+        f"nn_idx={nn_idx}, nn_dist={nn_dist:.2f}, figs={n_figs_created})"
+    )
+
+    return recon_trim, sketches, (dq_meta if use_real else None)
+
+
+@torch.no_grad()
 def print_reconstruction_examples(ae, dataset, indices, device, n_preview=3):
     subsection("Body-set reconstruction examples")
 
@@ -2834,6 +4078,45 @@ def train_bodyset_model(
 
         except Exception as e:
             print(f"  ⚠ visualize_sparam_predictions failed: {type(e).__name__}: {e}")
+
+        # ── 타입별 reconstruction 3D figure (각 타입 1장씩) ──
+        try:
+            visualize_reconstruction_per_type(
+                ae,
+                dataset,
+                val_idx_per_type,
+                type_names,
+                device,
+                max_per_type=1,
+            )
+
+        except Exception as e:
+            print(f"  ⚠ visualize_reconstruction_per_type failed: {type(e).__name__}: {e}")
+
+        # ── latent space 분포 (PCA / t-SNE / cumvar) ──
+        try:
+            subsection("Latent space analysis")
+
+            indices_for_latent = (
+                val_idx if len(val_idx) >= 10 else (val_idx + train_idx)[:max(len(val_idx), 200)]
+            )
+
+            z_for_plot, type_ids_for_plot = collect_latents(
+                ae,
+                dataset,
+                indices_for_latent,
+                device,
+                batch_size=32,
+            )
+
+            analyze_latent_space(
+                z_for_plot,
+                type_ids=type_ids_for_plot,
+                type_names=type_names,
+            )
+
+        except Exception as e:
+            print(f"  ⚠ analyze_latent_space failed: {type(e).__name__}: {e}")
 
         try:
             print_reconstruction_examples(
@@ -3211,6 +4494,24 @@ def run_inverse_design_pipeline(ae, mlp, dataset, device):
 
     except Exception as e:
         print(f"  ⚠ inverse curve figure failed: {type(e).__name__}: {e}")
+
+    # ── inverse-designed z 로부터 디코딩된 구조의 3D 시각화 ──
+    if result["best_z"] is not None:
+        try:
+            subsection("Inverse-designed decoded structure")
+            visualize_decoded_structure(
+                ae,
+                result["best_z"],
+                dataset,
+                device,
+                title="Inverse-designed structure",
+                separate_windows=False,
+            )
+
+        except Exception as e:
+            import traceback as _tb
+            print(f"  ⚠ visualize_decoded_structure failed: {type(e).__name__}: {e}")
+            _tb.print_exc()
 
     return result
 
