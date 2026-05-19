@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DeepCAD AE + Return-3 Surrogate  —  named-role enforcement
-==========================================================
+DeepCAD AE  —  base + JSON-name injection (minimal)
+===================================================
 
-base = AE_inverse.py.  학습 / 시퀀스 순서 / 토큰 vocab 모두 그대로.
-이 파일이 추가하는 것:
+base = AE_inverse.py.  학습/모델/loss/시퀀스 포맷/디코딩 다 그대로.
 
-  ★ JSON metadata.solids[i].name 을 그대로 role 라벨로 사용
-    (HFSS 의 solid 이름이 STEP 추출 시 보존돼 있음. k-means / 수동 라벨링 불필요)
+★ 유일한 변경:
+  데이터 로드 시 각 sketch chunk 의 SOL 토큰의 param[0] 슬롯에
+  JSON metadata.solids[i].name → 정수 role_id 를 채워 넣음.
 
-  ★ 학습 데이터의 sketch 들에서 role 별 평균 feature center 계산
-    → 디코딩 후 NN 매칭으로 chunk 의 role 식별
+  - SOL 의 param[0] 은 base 에서 항상 PAD 였음 (loss masking 됨)
+  - 거기에 role_id 채우면 인코더가 그 정보를 같이 보고
+    디코더도 그 자리에 role_id 를 예측하도록 자연스럽게 학습됨
+  - 모델 아키텍처, loss, generate, vocab 모두 변경 없음
+  - 시퀀스 길이/구조 동일
+  - 이름 없는 sample 은 PAD 유지 (학습 무시)
 
-  ★ Required role 강제 (디코딩 후)
-    - presence_ratio >= essential_threshold (default 0.95) 이거나
-      cfg.required_roles 명시된 role 은 디코딩 결과에 반드시 포함되어야 함
-    - 누락된 required role 은 그 role 의 학습 template chunk 로 자동 보강
-    - 예: frame, port_1~3, gnd_1~3 무조건 / camera 는 있어도 없어도 OK
-
-학습 로직 / 모델 / 시퀀스 포맷 / canonicalization 은 base 와 100% 동일.
-이름은 디코딩 단계의 "안전망" 으로만 쓰여 base 의 reconstruction 품질을
-훼손하지 않음.
+원래 base 코드와의 차이는 거의 없음 — dataset.__init__ 의 몇 십 줄만 추가.
 """
 
 import matplotlib
@@ -183,15 +179,6 @@ class CFG:
     # aux numeric
     aux_numeric: bool = True
     aux_hidden_mult: float = 2.0
-
-    # ★ Named-role enforcement (이 파일의 새 기능)
-    #   JSON metadata.solids[i].name 을 role 라벨로 사용.
-    #   디코딩 후 누락된 required role 은 학습 template chunk 로 자동 보강.
-    use_json_names: bool = True              # 이름 없으면 자동 off
-    essential_threshold: float = 0.95        # 이 비율 이상 sample 에 등장 = required
-    role_assign_max_dist: float = 2.5        # decoded chunk → role 할당 거리 임계 (standardized)
-    required_roles: tuple = ()               # 명시적 required role 이름들 (빈 tuple = 자동 감지만)
-    optional_roles: tuple = ("camera",)      # 자동 감지에서 제외할 role 이름들
 
     # loss weights
     w_cmd: float = 1.0
@@ -762,296 +749,6 @@ def json_to_real_sketches(json_data: dict) -> list:
         else:
             i += 1
     return sketches
-
-
-# ══════════════════════════════════════════════════════════════
-# ★ Named-role machinery
-#    JSON metadata.solids[i].name 을 그대로 role 로 사용.
-#    학습/시퀀스 포맷은 건드리지 않고 디코딩 단계에서만 사용.
-# ══════════════════════════════════════════════════════════════
-def _split_sketch_chunks(tokens):
-    """tokens 를 sketch 청크 (SOL...EXT) + tail(EOS/padding) 로 분리."""
-    cmd_seq = tokens[:, 0]
-    chunks = []
-    start = 0
-    last_idx = len(tokens)
-    for i in range(len(tokens)):
-        c = int(cmd_seq[i])
-        if c == EXT:
-            chunks.append(tokens[start:i + 1].copy())
-            start = i + 1
-        elif c == EOS or c < 0:
-            last_idx = i
-            break
-    tail = (
-        tokens[last_idx:].copy() if last_idx < len(tokens)
-        else np.zeros((0, 17), dtype=tokens.dtype)
-    )
-    return chunks, tail
-
-
-def _extract_sketch_features_from_json(json_data):
-    """JSON 의 real-coord 점들로부터 sketch 별 8-dim feature 추출.
-
-    feat = (cx, cy, cz, area, log_area, bbox_max, bbox_mid, bbox_min)
-    """
-    try:
-        sketches = json_to_real_sketches(json_data)
-    except Exception:
-        return None
-    if not sketches:
-        return None
-    feats = []
-    for sk in sketches:
-        all_pts = []
-        for loop in sk.get("loops_3d", []):
-            for p in loop:
-                all_pts.append(np.asarray(p, dtype=float))
-        if not all_pts:
-            feats.append(None)
-            continue
-        arr = np.stack(all_pts, axis=0)
-        bbox_ext = (arr.max(0) - arr.min(0)).tolist()
-        sorted_ext = sorted(bbox_ext, reverse=True)
-        bd_max = float(sorted_ext[0])
-        bd_mid = float(sorted_ext[1]) if len(sorted_ext) > 1 else 0.0
-        bd_min = float(sorted_ext[2]) if len(sorted_ext) > 2 else 0.0
-        footprint = bd_max * bd_mid
-        centroid = arr.mean(0)
-        feat = np.array([
-            float(centroid[0]), float(centroid[1]), float(centroid[2]),
-            float(footprint),
-            float(math.log(max(footprint, 1e-6) + 1.0)),
-            bd_max, bd_mid, bd_min,
-        ], dtype=np.float32)
-        feats.append(feat)
-    return feats
-
-
-def _extract_features_from_decoded(decoded_tokens, dq_meta):
-    """디코딩 토큰 → 3D real-coord → sketch 별 8-dim feature."""
-    if dq_meta is None:
-        return None
-    try:
-        real_sketches = tokens_to_real_sketches(decoded_tokens, dq_meta)
-    except Exception:
-        return None
-    if not real_sketches:
-        return None
-    feats = []
-    for sk in real_sketches:
-        all_pts = []
-        for loop in sk.get("loops_3d", []):
-            for p in loop:
-                all_pts.append(np.asarray(p, dtype=float))
-        if not all_pts:
-            feats.append(None)
-            continue
-        arr = np.stack(all_pts, axis=0)
-        bbox_ext = (arr.max(0) - arr.min(0)).tolist()
-        sorted_ext = sorted(bbox_ext, reverse=True)
-        bd_max = float(sorted_ext[0])
-        bd_mid = float(sorted_ext[1]) if len(sorted_ext) > 1 else 0.0
-        bd_min = float(sorted_ext[2]) if len(sorted_ext) > 2 else 0.0
-        footprint = bd_max * bd_mid
-        centroid = arr.mean(0)
-        feat = np.array([
-            float(centroid[0]), float(centroid[1]), float(centroid[2]),
-            float(footprint),
-            float(math.log(max(footprint, 1e-6) + 1.0)),
-            bd_max, bd_mid, bd_min,
-        ], dtype=np.float32)
-        feats.append(feat)
-    return feats
-
-
-def build_role_centers_from_names(all_sample_features, all_sample_names, verbose=True):
-    """이름 별 평균 feature center 계산.
-
-    Args:
-        all_sample_features: list (N_samples), each = list of 8-dim feat (or None)
-        all_sample_names: list (N_samples), each = list of str names (or None)
-
-    Returns:
-        name_to_id: dict {str: int}
-        role_centers: (K, F) standardized
-        scaler: sklearn StandardScaler
-        per_sample_roles: list of [str or None] (실제 이름 그대로)
-    """
-    try:
-        from sklearn.preprocessing import StandardScaler
-    except ImportError:
-        if verbose:
-            print("  ⚠ sklearn 미설치 — named-role centers skip")
-        return {}, None, None, [None] * len(all_sample_features)
-
-    all_names_set = set()
-    for names in all_sample_names:
-        if names is None:
-            continue
-        for n in names:
-            if n:
-                all_names_set.add(n)
-    if not all_names_set:
-        if verbose:
-            print("  ⚠ no names found — named-role disabled")
-        return {}, None, None, [None] * len(all_sample_features)
-
-    name_to_id = {n: i for i, n in enumerate(sorted(all_names_set))}
-
-    per_sample_roles = []
-    for names in all_sample_names:
-        if names is None:
-            per_sample_roles.append(None)
-            continue
-        per_sample_roles.append([n if (n and n in name_to_id) else None for n in names])
-
-    flat_feats = []
-    flat_labels = []
-    for feats, names in zip(all_sample_features, all_sample_names):
-        if feats is None or names is None:
-            continue
-        for f, n in zip(feats, names):
-            if f is None or not n or n not in name_to_id:
-                continue
-            flat_feats.append(f)
-            flat_labels.append(name_to_id[n])
-    if not flat_feats:
-        return name_to_id, None, None, per_sample_roles
-
-    X = np.asarray(flat_feats, dtype=np.float32)
-    scaler = StandardScaler().fit(X)
-    Xs = scaler.transform(X)
-    K = len(name_to_id)
-    centers = np.zeros((K, Xs.shape[1]), dtype=np.float32)
-    counts = np.zeros(K, dtype=np.int64)
-    for x, lbl in zip(Xs, flat_labels):
-        centers[lbl] += x
-        counts[lbl] += 1
-    for k in range(K):
-        if counts[k] > 0:
-            centers[k] /= counts[k]
-
-    if verbose:
-        print(f"\n  ★ Named-role centers: K={K} role(s) from JSON metadata")
-        print(f"  {'id':>3s} {'name':<14s} {'count':>6s} "
-              f"{'x':>7s} {'y':>7s} {'z':>7s} {'area':>10s}")
-        print("  " + "-" * 60)
-        id_to_name = {i: n for n, i in name_to_id.items()}
-        for k in range(K):
-            if counts[k] == 0:
-                continue
-            mask = np.asarray(flat_labels) == k
-            m = X[mask].mean(0)
-            print(
-                f"  {k:>3d} {id_to_name[k]!r:<14s} {int(counts[k]):>6d} "
-                f"{m[0]:>7.1f} {m[1]:>7.1f} {m[2]:>7.1f} {m[3]:>10.1f}"
-            )
-        print()
-    return name_to_id, centers, scaler, per_sample_roles
-
-
-def analyze_role_presence(per_sample_roles, n_total_samples,
-                          essential_threshold=0.95,
-                          explicit_required=(), explicit_optional=()):
-    """role 별 등장 비율 분석 → required / optional 자동 결정."""
-    counts = {}
-    for roles in per_sample_roles:
-        if roles is None:
-            continue
-        unique_in_sample = set(r for r in roles if r is not None)
-        for r in unique_in_sample:
-            counts[r] = counts.get(r, 0) + 1
-    presence = {r: c / max(n_total_samples, 1) for r, c in counts.items()}
-    auto_required = {
-        r for r, ratio in presence.items()
-        if ratio >= essential_threshold and r not in explicit_optional
-    }
-    required = set(auto_required) | set(explicit_required)
-    required -= set(explicit_optional)
-    return sorted(required), presence
-
-
-def collect_role_templates(per_sample_roles, raw_tokens_list, role_names):
-    """각 role 마다 학습 데이터의 sketch chunk 들 수집."""
-    templates = {r: [] for r in role_names}
-    for s_idx, roles in enumerate(per_sample_roles):
-        if roles is None:
-            continue
-        tokens = raw_tokens_list[s_idx]
-        chunks, _tail = _split_sketch_chunks(tokens)
-        for k, r in enumerate(roles):
-            if r is None or r not in templates:
-                continue
-            if k < len(chunks):
-                templates[r].append(chunks[k].copy())
-    return templates
-
-
-def enforce_required_roles_in_decoded(
-    decoded_tokens, dq_meta,
-    required_roles, role_templates,
-    name_to_id, role_centers, role_scaler,
-    role_assign_max_dist=2.5, verbose=True,
-):
-    """디코딩 토큰에 required role 들이 모두 들어있는지 확인,
-    누락된 role 은 학습 template chunk 로 보강.
-    """
-    if (dq_meta is None or role_scaler is None or role_centers is None
-            or not required_roles or not name_to_id):
-        return decoded_tokens, {"added": [], "missing": [], "present": []}
-
-    chunks, tail = _split_sketch_chunks(decoded_tokens)
-    decoded_feats = _extract_features_from_decoded(decoded_tokens, dq_meta)
-    if decoded_feats is None:
-        decoded_feats = []
-
-    id_to_name = {i: n for n, i in name_to_id.items()}
-    present_roles = set()
-    centers = np.asarray(role_centers)
-    for i, feat in enumerate(decoded_feats):
-        if feat is None:
-            continue
-        feat_scaled = role_scaler.transform(feat[None, :])
-        dists = np.linalg.norm(centers - feat_scaled, axis=1)
-        nn_id = int(np.argmin(dists))
-        if float(dists[nn_id]) < role_assign_max_dist:
-            present_roles.add(id_to_name[nn_id])
-
-    missing = [r for r in required_roles if r not in present_roles]
-    present = [r for r in required_roles if r in present_roles]
-
-    if verbose:
-        print(f"  ★ named-role check: present={present}, missing={missing}")
-
-    if not missing:
-        return decoded_tokens, {"added": [], "missing": [], "present": present}
-
-    added = []
-    rng = np.random.default_rng(0)
-    add_chunks = []
-    for r in missing:
-        tpl_list = role_templates.get(r, [])
-        if not tpl_list:
-            if verbose:
-                print(f"    [{r}]: no template, skip")
-            continue
-        pick = int(rng.integers(0, len(tpl_list)))
-        add_chunks.append(tpl_list[pick])
-        added.append(r)
-        if verbose:
-            print(f"    [{r}]: enforced (template, {tpl_list[pick].shape[0]} tokens)")
-
-    if not add_chunks:
-        return decoded_tokens, {"added": added, "missing": missing, "present": present}
-
-    out_parts = chunks + add_chunks + ([tail] if tail.size else [])
-    out = np.concatenate(out_parts, axis=0)
-    L = len(decoded_tokens)
-    if out.shape[0] < L:
-        pad = np.full((L - out.shape[0], 17), PAD_V, dtype=decoded_tokens.dtype)
-        out = np.concatenate([out, pad], axis=0)
-    return out[:L], {"added": added, "missing": missing, "present": present}
 
 
 def _dequant(q, lo, hi):
@@ -1778,10 +1475,6 @@ class JointDataset(Dataset):
         interp_matrix,
         type_ids=None,
         type_names=None,
-        use_json_names=True,
-        essential_threshold=0.95,
-        explicit_required=(),
-        explicit_optional=("camera",),
     ):
         self.npy_files = list(npy_files)
         self.max_len = max_len
@@ -1791,80 +1484,49 @@ class JointDataset(Dataset):
             jf = f.replace("_tokens.npy", "_deepcad.json")
             self.json_files.append(jf if os.path.exists(jf) else None)
 
+        # ★ JSON metadata.solids[i].name → global role_id 매핑 구축
+        #    (sketch chunk 순서 = solid 순서 가정. STEP exporter 기준)
+        per_sample_names = []
+        for jf in self.json_files:
+            if jf is None or not os.path.exists(jf):
+                per_sample_names.append(None)
+                continue
+            try:
+                import json as _json
+                with open(jf, "r", encoding="utf-8") as f:
+                    jd = _json.load(f)
+                solids_meta = jd.get("metadata", {}).get("solids", [])
+                names = [str(s.get("name", "")) for s in solids_meta]
+                per_sample_names.append(names if any(names) else None)
+            except Exception:
+                per_sample_names.append(None)
+
+        all_names_set = set()
+        for names in per_sample_names:
+            if names is None:
+                continue
+            for n in names:
+                if n:
+                    all_names_set.add(n)
+        self.role_name_to_id = {n: i for i, n in enumerate(sorted(all_names_set))}
+        n_with_names = sum(1 for n in per_sample_names if n is not None)
+        if self.role_name_to_id:
+            print(f"  [named] {len(self.role_name_to_id)} unique role(s) "
+                  f"from {n_with_names}/{len(self.npy_files)} samples with JSON names")
+            for n, i in sorted(self.role_name_to_id.items(), key=lambda kv: kv[1]):
+                print(f"    role_id={i:>2d}  {n!r}")
+        else:
+            print(f"  [named] no JSON names — SOL.param[0] stays PAD (base behavior)")
+
         self.raw = []
         self.padded = []
 
-        for f in self.npy_files:
+        for f, names in zip(self.npy_files, per_sample_names):
             t = np.load(f).astype(np.int32)
             t = ensure_eos_when_truncated(t, max_len)
+            t = self._inject_role_ids_into_sol(t, names)
             self.raw.append(t)
             self.padded.append(self._pad(t))
-
-        # ★ Named-role machinery (학습엔 영향 없음, 디코딩 안전망만)
-        self.use_json_names = bool(use_json_names)
-        self.role_name_to_id = {}
-        self.role_centers = None
-        self.role_scaler = None
-        self.per_sample_role_names = [None] * len(self.npy_files)
-        self.required_roles = []
-        self.role_presence = {}
-        self.role_templates = {}
-
-        if self.use_json_names:
-            print(f"\n  Named-role: reading JSON metadata names...")
-            all_sample_features = []
-            all_sample_names = []
-            for jf in self.json_files:
-                if jf is None or not os.path.exists(jf):
-                    all_sample_features.append(None)
-                    all_sample_names.append(None)
-                    continue
-                try:
-                    import json as _json
-                    with open(jf, "r", encoding="utf-8") as f:
-                        jd = _json.load(f)
-                    all_sample_features.append(_extract_sketch_features_from_json(jd))
-                    solids_meta = jd.get("metadata", {}).get("solids", [])
-                    names = [str(s.get("name", "")) for s in solids_meta]
-                    if not names or not any(names):
-                        names = None
-                    all_sample_names.append(names)
-                except Exception:
-                    all_sample_features.append(None)
-                    all_sample_names.append(None)
-
-            n_with_names = sum(1 for n in all_sample_names if n is not None)
-            print(f"    found names in {n_with_names}/{len(self.npy_files)} samples")
-
-            if n_with_names >= max(1, int(0.5 * len(self.npy_files))):
-                (self.role_name_to_id, self.role_centers, self.role_scaler,
-                 self.per_sample_role_names) = build_role_centers_from_names(
-                    all_sample_features, all_sample_names, verbose=True,
-                )
-                self.required_roles, self.role_presence = analyze_role_presence(
-                    self.per_sample_role_names,
-                    n_total_samples=len(self.npy_files),
-                    essential_threshold=essential_threshold,
-                    explicit_required=tuple(explicit_required),
-                    explicit_optional=tuple(explicit_optional),
-                )
-                print(f"  ★ Role presence (fraction of samples containing each role):")
-                for r, ratio in sorted(self.role_presence.items(),
-                                       key=lambda kv: -kv[1]):
-                    tag = "★ REQUIRED" if r in self.required_roles else ""
-                    print(f"    {r!r}: {ratio*100:5.1f}%  {tag}")
-                print(f"  Required roles: {self.required_roles}")
-                if explicit_optional:
-                    print(f"  Optional roles (forced non-required): "
-                          f"{list(explicit_optional)}")
-
-                self.role_templates = collect_role_templates(
-                    self.per_sample_role_names, self.raw,
-                    role_names=set(self.role_presence.keys()),
-                )
-                print(f"  Templates collected for {len(self.role_templates)} role(s)\n")
-            else:
-                print(f"  → too few samples with names, skip named-role enforcement\n")
 
         self.sparam_db = sparam_db.astype(np.float32)
         self.freqs = np.asarray(freqs, dtype=np.float32)
@@ -1917,6 +1579,35 @@ class JointDataset(Dataset):
         print(f"    full frequency shape    : {self.freqs_full.shape}")
         print(f"    full freq range         : {self.freqs_full[0]:.4f} ~ {self.freqs_full[-1]:.4f} GHz")
         print(f"    interp matrix shape     : {self.interp_matrix.shape}")
+
+    def _inject_role_ids_into_sol(self, tokens, names):
+        """각 sketch chunk (SOL...EXT) 의 모든 SOL 토큰의 param[0] 에 role_id 채움.
+
+        chunk 순서 = solid 순서 가정. names[k] = k 번째 chunk 의 role name.
+        names 없거나 매핑 안 되는 sketch 는 PAD 유지 (base 동작).
+        """
+        if not self.role_name_to_id or not names:
+            return tokens
+        out = tokens.copy()
+        cmd = out[:, 0]
+        chunk_idx = -1
+        in_chunk = False
+        for i in range(out.shape[0]):
+            c = int(cmd[i])
+            if c == EOS or c < 0:
+                break
+            if c == SOL:
+                if not in_chunk:
+                    chunk_idx += 1
+                    in_chunk = True
+                if 0 <= chunk_idx < len(names):
+                    nm = names[chunk_idx]
+                    rid = self.role_name_to_id.get(nm)
+                    if rid is not None:
+                        out[i, 1] = int(rid)
+            elif c == EXT:
+                in_chunk = False
+        return out
 
     def _pad(self, t):
         L = t.shape[0]
@@ -3159,10 +2850,6 @@ def load_multitype_data(cfg, script_dir):
         interp_matrix=interp_matrix,
         type_ids=type_ids,
         type_names=type_names,
-        use_json_names=getattr(cfg, "use_json_names", True),
-        essential_threshold=getattr(cfg, "essential_threshold", 0.95),
-        explicit_required=getattr(cfg, "required_roles", ()),
-        explicit_optional=getattr(cfg, "optional_roles", ("camera",)),
     )
 
     return dataset, all_npy, type_ids, type_names, sparam_db, max_len
@@ -3276,10 +2963,6 @@ def train_fixed_medium_var(
     print(f"  Surrogate form      : pred = common_curve + residual(z)")
     print(f"  VICReg fixed        : w_var={cfg.w_var}, w_cov={cfg.w_cov}, target={cfg.vicreg_var_target}")
     print(f"  Aux numeric         : {cfg.aux_numeric}")
-    print(f"  Named-role enforce  : use_json_names={getattr(cfg, 'use_json_names', True)} "
-          f"thresh={getattr(cfg, 'essential_threshold', 0.95)} "
-          f"explicit_req={list(getattr(cfg, 'required_roles', ()))} "
-          f"opt={list(getattr(cfg, 'optional_roles', ('camera',)))}")
     print(f"  selected output dim : {cfg.n_freq * 3}")
     print(f"  full target dim     : {cfg.raw_n_freq * 3}")
 
@@ -4329,25 +4012,6 @@ def visualize_decoded_structure(
 
     if dq_meta is not None and n_ext > 0:
         dq_meta = _extend_dequant_meta(dq_meta, max(n_ext, len(dq_meta["sketches"])))
-
-        # ★ Named-role enforcement (이 파일의 새 기능)
-        if (getattr(dataset, "required_roles", None)
-                and getattr(dataset, "role_scaler", None) is not None):
-            recon_trim, _info = enforce_required_roles_in_decoded(
-                recon_trim, dq_meta,
-                required_roles=dataset.required_roles,
-                role_templates=dataset.role_templates,
-                name_to_id=dataset.role_name_to_id,
-                role_centers=dataset.role_centers,
-                role_scaler=dataset.role_scaler,
-                role_assign_max_dist=2.5,
-                verbose=True,
-            )
-            n_ext_after = int((recon_trim[:, 0] == EXT).sum())
-            if n_ext_after > len(dq_meta["sketches"]):
-                dq_meta = _extend_dequant_meta(dq_meta, n_ext_after)
-            n_ext = n_ext_after
-
         sketches = tokens_to_real_sketches(recon_trim, dq_meta)
         use_real = True
         coord_label = "real coord (mm)"
