@@ -179,6 +179,10 @@ class CFG:
     # ★ canonical ordering (data preprocessing only)
     canonicalize_sketches: bool = True
 
+    # ★ Latent noise injection (학습 중 decoder 부드럽게)
+    #   0.0 = 사용 안 함. 권장: 0.05 ~ 0.15
+    latent_noise_std: float = 0.1
+
     # aux numeric
     aux_numeric: bool = True
     aux_hidden_mult: float = 2.0
@@ -1850,11 +1854,13 @@ class DeepCADBaselineAE(nn.Module):
         n_freq_bands,
         aux_numeric,
         aux_hidden_mult,
+        latent_noise_std=0.0,
     ):
         super().__init__()
 
         assert d_model % nhead == 0
 
+        self.latent_noise_std = float(latent_noise_std)
         self.max_len = max_len
         self.d_model = d_model
         self.d_param = d_param
@@ -2142,8 +2148,16 @@ class DeepCADBaselineAE(nn.Module):
 
     def forward(self, x):
         z = self.encode(x)
-        cmd_logits, prm_logits = self.decode_teacher(z, x)
+        # ★ Latent noise injection (학습 중에만)
+        #   decoder 가 z 주변 영역에서 일관된 출력을 학습하도록 강제 → cascade error ↓
+        #   inverse design 시 boundary z 에서도 그럴듯한 구조 디코딩
+        if self.training and getattr(self, "latent_noise_std", 0.0) > 0:
+            z_for_dec = z + torch.randn_like(z) * float(self.latent_noise_std)
+        else:
+            z_for_dec = z
+        cmd_logits, prm_logits = self.decode_teacher(z_for_dec, x)
         aux = self.aux_numeric_predict(z)
+        # z 자체는 noise 없이 반환 (surrogate / VICReg 는 깨끗한 z 사용)
         return cmd_logits, prm_logits, aux, z
 
 
@@ -3090,6 +3104,7 @@ def train_fixed_medium_var(
         n_freq_bands=cfg.n_freq_bands,
         aux_numeric=cfg.aux_numeric,
         aux_hidden_mult=cfg.aux_hidden_mult,
+        latent_noise_std=getattr(cfg, "latent_noise_std", 0.0),
     ).to(device)
 
     mlp = SparamCommonResidualMLP(
@@ -3115,6 +3130,8 @@ def train_fixed_medium_var(
     print(f"  Canonical sketches  : "
           f"{getattr(cfg, 'canonicalize_sketches', True)} "
           f"(z asc, footprint area desc)")
+    print(f"  Latent noise std    : {getattr(cfg, 'latent_noise_std', 0.0)} "
+          f"({'ON, decoder smoothing' if getattr(cfg, 'latent_noise_std', 0.0) > 0 else 'OFF'})")
     print(f"  selected output dim : {cfg.n_freq * 3}")
     print(f"  full target dim     : {cfg.raw_n_freq * 3}")
 
