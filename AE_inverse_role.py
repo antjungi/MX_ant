@@ -182,6 +182,11 @@ class CFG:
     canonicalize_sketches: bool = True
     role_n_clusters: int = 8                 # ★ role discovery: k-means cluster 수
 
+    # ★ Essential cluster enforcement
+    enforce_essentials: bool = True          # 디코딩 후 누락된 essential cluster 자동 보강
+    essential_threshold: float = 0.95        # 이 fraction 이상 sample 에 등장 = essential
+    essential_assign_max_dist: float = 2.5   # decoded sketch cluster 할당 거리 임계 (standardized)
+
     # ★ Latent noise injection (학습 중 decoder 부드럽게)
     #   0.0 = 사용 안 함. 권장: 0.05 ~ 0.15
     latent_noise_std: float = 0.1
@@ -697,6 +702,170 @@ def canonicalize_by_roles(tokens, role_ids, sketch_features=None,
         )
 
     return out[:L], changed, list(order)
+
+
+def analyze_cluster_essentiality(per_sample_roles, n_total_samples, threshold=0.95):
+    """각 cluster 가 몇 % sample 에 등장하는지 분석.
+
+    Returns:
+        essential_cluster_ids: list[int] — threshold 이상 sample 에 등장한 cluster IDs
+        presence_summary: dict {cluster_id: fraction}
+    """
+    cluster_counts = {}
+    for roles in per_sample_roles:
+        if roles is None:
+            continue
+        unique_in_sample = set(r for r in roles if r is not None)
+        for c in unique_in_sample:
+            cluster_counts[c] = cluster_counts.get(c, 0) + 1
+
+    presence = {}
+    essential = []
+    for c_id in sorted(cluster_counts.keys()):
+        ratio = cluster_counts[c_id] / max(n_total_samples, 1)
+        presence[c_id] = ratio
+        if ratio >= threshold:
+            essential.append(c_id)
+    return essential, presence
+
+
+def extract_template_chunks_per_cluster(per_sample_roles, raw_tokens_list, cluster_ids):
+    """각 cluster_id 에 대해 학습 데이터에서 대표 sketch chunk 들 수집.
+
+    Returns: dict {cluster_id: list of (sample_idx, sketch_idx, chunk_tokens)}
+    """
+    templates = {c: [] for c in cluster_ids}
+    for s_idx, roles in enumerate(per_sample_roles):
+        if roles is None:
+            continue
+        tokens = raw_tokens_list[s_idx]
+        chunks, _tail = _split_sketch_chunks(tokens)
+        for k, c_id in enumerate(roles):
+            if c_id is None or c_id not in templates:
+                continue
+            if k < len(chunks):
+                templates[c_id].append((s_idx, k, chunks[k].copy()))
+    return templates
+
+
+def _extract_features_from_decoded(decoded_tokens, dq_meta):
+    """디코딩된 토큰을 3D real-coord 로 변환 후 sketch 별 feature vector 추출.
+    Phase 1 의 _extract_sketch_features_from_json 와 동일 형식.
+
+    Returns: list of np.array (each 8-dim) or [None for each empty/invalid sketch]
+    """
+    if dq_meta is None:
+        return None
+    try:
+        real_sketches = tokens_to_real_sketches(decoded_tokens, dq_meta)
+    except Exception:
+        return None
+    if not real_sketches:
+        return None
+
+    feats = []
+    for sk in real_sketches:
+        all_pts = []
+        for loop in sk.get("loops_3d", []):
+            for p in loop:
+                all_pts.append(np.asarray(p, dtype=float))
+        if not all_pts:
+            feats.append(None)
+            continue
+        arr = np.stack(all_pts, axis=0)
+        bbox_ext = (arr.max(0) - arr.min(0)).tolist()
+        sorted_ext = sorted(bbox_ext, reverse=True)
+        bd_max = float(sorted_ext[0])
+        bd_mid = float(sorted_ext[1]) if len(sorted_ext) > 1 else 0.0
+        bd_min = float(sorted_ext[2]) if len(sorted_ext) > 2 else 0.0
+        footprint = bd_max * bd_mid
+        centroid = arr.mean(0)
+        feat = np.array([
+            float(centroid[0]), float(centroid[1]), float(centroid[2]),
+            float(footprint),
+            float(math.log(max(footprint, 1e-6) + 1.0)),
+            bd_max, bd_mid, bd_min,
+        ], dtype=np.float32)
+        feats.append(feat)
+    return feats
+
+
+def enforce_essential_clusters_in_decoded(
+    decoded_tokens, dq_meta,
+    essential_cluster_ids, cluster_templates,
+    role_scaler, role_cluster_centers,
+    max_assign_dist=2.5,        # standardized space 에서 임계 (cluster 너무 멀면 unassigned)
+    verbose=True,
+):
+    """디코딩된 토큰에 essential cluster 가 모두 포함되어 있는지 확인,
+    누락된 cluster 는 학습 template 에서 sketch chunk 를 가져와 삽입.
+    """
+    if (dq_meta is None or role_scaler is None or role_cluster_centers is None
+            or not essential_cluster_ids):
+        return decoded_tokens, {"added": 0, "missing": [], "present": []}
+
+    chunks, tail = _split_sketch_chunks(decoded_tokens)
+    decoded_feats = _extract_features_from_decoded(decoded_tokens, dq_meta)
+    if decoded_feats is None:
+        decoded_feats = []
+
+    # 각 디코딩된 sketch 의 cluster 할당
+    centers = np.asarray(role_cluster_centers)
+    decoded_clusters = set()
+    for i, feat in enumerate(decoded_feats):
+        if feat is None:
+            continue
+        feat_scaled = role_scaler.transform(feat[None, :])  # (1, F)
+        dists = np.linalg.norm(centers - feat_scaled, axis=1)
+        nn_c = int(np.argmin(dists))
+        nn_d = float(dists[nn_c])
+        if nn_d < max_assign_dist:
+            decoded_clusters.add(nn_c)
+        # 너무 먼 경우 unassigned (가짜 sketch 일 수 있음)
+
+    # 누락된 essential
+    missing = [c for c in essential_cluster_ids if c not in decoded_clusters]
+    present = [c for c in essential_cluster_ids if c in decoded_clusters]
+
+    if verbose:
+        print(
+            f"  ★ essential check: present={present}, missing={missing} "
+            f"(of essentials={essential_cluster_ids})"
+        )
+
+    if not missing:
+        return decoded_tokens, {"added": 0, "missing": [], "present": present}
+
+    # 누락된 cluster 마다 template 에서 chunk 가져와 삽입
+    added_chunks = []
+    rng = np.random.default_rng(0)
+    for c_id in missing:
+        templ_list = cluster_templates.get(c_id, [])
+        if not templ_list:
+            if verbose:
+                print(f"    cluster {c_id}: no template available, skip")
+            continue
+        pick = rng.integers(0, len(templ_list))
+        _, _, chunk = templ_list[pick]
+        added_chunks.append(chunk)
+        if verbose:
+            print(f"    cluster {c_id}: enforced (template chunk, {chunk.shape[0]} tokens)")
+
+    if not added_chunks:
+        return decoded_tokens, {"added": 0, "missing": missing, "present": present}
+
+    # 기존 chunks 뒤, tail 앞에 삽입
+    out_parts = chunks + added_chunks + ([tail] if tail.size else [])
+    out = np.concatenate(out_parts, axis=0)
+    L = len(decoded_tokens)
+    if out.shape[0] < L:
+        pad = np.full((L - out.shape[0], 17), PAD_V, dtype=decoded_tokens.dtype)
+        out = np.concatenate([out, pad], axis=0)
+    return out[:L], {
+        "added": len(added_chunks),
+        "missing": missing,
+        "present": present,
+    }
 
 
 def select_frequency_indices(raw_n_freq, target_n_freq, freq_start, freq_end, mode="linspace"):
@@ -1865,6 +2034,7 @@ class JointDataset(Dataset):
             )
             self.role_cluster_centers = cluster_centers
             self.role_scaler = scaler
+            self.per_sample_roles = per_sample_roles
 
             # Phase 1 검증용: type 별 첫 sample 의 role 분포 print
             print("  Per-type role assignment (first sample of each type):")
@@ -1924,6 +2094,28 @@ class JointDataset(Dataset):
             print(
                 f"  ★ role-canonical: reordered {n_changed}/{n_total_canon} sequences "
                 f"(skipped no-json: {n_skip})\n"
+            )
+
+        # ★ Essential cluster analysis + template chunk 추출
+        self.essential_cluster_ids = []
+        self.cluster_templates = {}
+        if self.do_canonicalize and self.role_cluster_centers is not None:
+            essential, presence = analyze_cluster_essentiality(
+                self.per_sample_roles,
+                n_total_samples=len(self.npy_files),
+                threshold=0.95,
+            )
+            self.essential_cluster_ids = essential
+            print("  ★ Cluster presence (fraction of samples containing each cluster):")
+            for c_id, ratio in sorted(presence.items()):
+                tag = "★ ESSENTIAL" if c_id in essential else ""
+                print(f"    cluster {c_id}: {ratio*100:5.1f}%  {tag}")
+            print(f"  Essential clusters: {essential}\n")
+
+            # Templates 추출 — essential cluster 들 + 일부 nonessential 도 (도움 되는 경우)
+            self.cluster_templates = extract_template_chunks_per_cluster(
+                self.per_sample_roles, self.raw,
+                cluster_ids=set(essential) | set(presence.keys()),
             )
 
         self.sparam_db = sparam_db.astype(np.float32)
@@ -4581,7 +4773,26 @@ def visualize_decoded_structure(
             dedup_pos_tol_mm=2.0,
             verbose=True,
         )
-        # cleanup 후 EXT 개수 재계산
+        # ★ Essential cluster enforcement: 학습 데이터에서 항상 등장하는 component
+        #   가 누락됐다면 template chunk 로 보강
+        if (hasattr(dataset, "essential_cluster_ids")
+                and dataset.essential_cluster_ids
+                and getattr(dataset, "role_scaler", None) is not None):
+            recon_trim, _ess_info = enforce_essential_clusters_in_decoded(
+                recon_trim, dq_meta,
+                essential_cluster_ids=dataset.essential_cluster_ids,
+                cluster_templates=dataset.cluster_templates,
+                role_scaler=dataset.role_scaler,
+                role_cluster_centers=dataset.role_cluster_centers,
+                max_assign_dist=2.5,
+                verbose=True,
+            )
+            # essential 추가됐으면 dq_meta 도 늘림
+            n_ext_after = int((recon_trim[:, 0] == EXT).sum())
+            if n_ext_after > len(dq_meta["sketches"]):
+                dq_meta = _extend_dequant_meta(dq_meta, n_ext_after)
+
+        # cleanup + enforce 후 EXT 개수 재계산
         n_ext = int((recon_trim[:, 0] == EXT).sum())
         sketches = tokens_to_real_sketches(recon_trim, dq_meta)
         use_real = True
