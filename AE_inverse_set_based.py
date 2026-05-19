@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DeepCAD AE + Return-3 Common-Curve Residual Surrogate  —  role discovery
-========================================================================
+DeepCAD AE + Return-3 Common-Curve Residual Surrogate  —  set-based decoder
+===========================================================================
 
-Role discovery 변경점 (base = AE_inverse_canonical.py):
-  - 데이터 전처리 단계에서 ★ k-means clustering 으로 sketch role 자동 발견 ★
-  - 각 sketch 의 feature vector (xy/z centroid, footprint area, bbox extent) 추출
-  - 모든 학습 sample 의 sketch 들을 한꺼번에 cluster → 같은 cluster = 같은 role
-  - Canonical 순서: role_id asc, x asc, y asc
+핵심 아이디어:
+  - Decoder 가 sketch sequence 가 아닌 ★ K 개 sketch slot 의 set 을 출력 ★
+  - 순서 학습 X, 각 slot 이 학습 중 자동 specialize (DETR 스타일)
+  - Role 정보로 decoder 를 가두지 않음 — slot 은 그냥 K 개
 
-기존 canonical 과의 차이:
-  - 기존: z 위치만 보고 정렬 (heuristic)
-  - 새 방식: 학습 데이터 분포 자체에서 role 발견 (data-driven)
-      → "top feeds", "right feeds", "frame", "extra square", "extra curved" 같은
-        role 이 자동 cluster 형성
-      → 같은 role 의 sketch 가 모든 sample 에서 같은 position 영역에 배치됨
+3 가지 개선 (이전 set_based 실패 보완):
+  1) Phase 1 cluster centers → slot query 초기화
+     · 학습 데이터 분포 근처에서 시작 → 빠른 수렴
+     · 학습 중에는 query 가 자유롭게 update
+  2) Curriculum loss
+     · 초반 epochs: summary regression + is_active 만 학습 (slot 위치 잡기)
+     · 그 다음: token CE 추가 (구조 생성)
+  3) Hungarian matching cost 강화
+     · summary distance + cluster compatibility soft bonus
+
+→ Pure set decoder (role conditioning 없이) + 학습 안정성.
 
 요구사항:
-  - scikit-learn (k-means 용): pip install scikit-learn
-  - sklearn 없으면 자동 fallback (canonical 순서 안 함)
+  - scikit-learn, scipy
 """
 
 import matplotlib
@@ -101,6 +104,11 @@ CMD_NAME = {
 RETURN_PORT_PAIRS = ((1, 1), (2, 2), (3, 3))
 RETURN_LABELS = ["S11", "S22", "S33"]
 
+# ★ Set-based decoder 상수
+N_SKETCH_SLOTS = 10              # K — slot 수
+MAX_TOKENS_PER_SKETCH = 48       # sketch 한 개의 최대 토큰 수
+SUMMARY_DIM = 4                  # (pz, px, py, log_area) — Hungarian matching 용
+
 
 # ── Param slot indices in EXT token ──
 P_SCALE = 0
@@ -178,13 +186,25 @@ class CFG:
     n_pool: int = 12
     n_freq_bands: int = 6
 
-    # ★ canonical ordering (data preprocessing only)
-    canonicalize_sketches: bool = True
-    role_n_clusters: int = 8                 # ★ role discovery: k-means cluster 수
+    # ★ Set-based decoder
+    n_slots: int = 10
+    max_tokens_per_sketch: int = 48
+    set_dec_n_layers: int = 3
 
-    # ★ Latent noise injection (학습 중 decoder 부드럽게)
-    #   0.0 = 사용 안 함. 권장: 0.05 ~ 0.15
-    latent_noise_std: float = 0.1
+    # ★ Phase 1: role discovery for slot init only (no role conditioning)
+    use_role_init: bool = True               # cluster centers 로 slot query 초기화
+    role_n_clusters: int = 10                # K — slot 수와 동일하게
+    canonicalize_sketches: bool = False      # set-based 는 reorder 안 함
+
+    # ★ Curriculum loss (set-based 학습 안정)
+    curriculum_warmup_epochs: int = 10       # token CE 없이 summary/active 만
+    curriculum_ramp_epochs: int = 10         # warmup 후 token weight 0→1 ramp
+
+    # ★ Hungarian matching
+    matching_cluster_bonus: float = 0.3      # 같은 cluster slot↔target 매칭 시 cost 감소량
+
+    # Latent noise injection (학습 중 decoder 부드럽게)
+    latent_noise_std: float = 0.0            # set-based 는 우선 off
 
     # aux numeric
     aux_numeric: bool = True
@@ -195,6 +215,8 @@ class CFG:
     w_prm: float = 1.0
     w_aux: float = 2.0
     w_sparam: float = 5.0
+    w_active: float = 0.5     # ★ set-based: is_active BCE
+    w_summary: float = 1.0    # ★ set-based: summary regression
 
     # dB loss scale
     db_loss_scale: float = 20.0
@@ -356,7 +378,54 @@ def ensure_eos_when_truncated(t, max_len):
 
 
 # ══════════════════════════════════════════════════════════════
-# ★ Canonical ordering (data preprocessing only)
+# ★ Set-based: token → per-sketch chunks + summary
+# ══════════════════════════════════════════════════════════════
+def _ext_row_summary(ext_row):
+    """EXT 토큰 row → 4-dim summary (pz, px, py, log_area).  Hungarian matching 용."""
+    scale = int(ext_row[1 + P_SCALE])
+    e1 = int(ext_row[1 + P_E1])
+    e2 = int(ext_row[1 + P_E2])
+    px = int(ext_row[1 + P_PX])
+    py = int(ext_row[1 + P_PY])
+    pz = int(ext_row[1 + P_PZ])
+    sv = scale / QMAX if scale >= 0 else 0.5
+    e1v = e1 / QMAX if e1 >= 0 else 0.1
+    e2v = e2 / QMAX if e2 >= 0 else 0.0
+    pxv = px / QMAX if px >= 0 else 0.5
+    pyv = py / QMAX if py >= 0 else 0.5
+    pzv = pz / QMAX if pz >= 0 else 0.5
+    area = sv * sv * (e1v + e2v) + 1e-6
+    return np.array([pzv, pxv, pyv, math.log(area)], dtype=np.float32)
+
+
+def split_tokens_into_sketches(t, max_tokens_per_sketch, n_slots):
+    """전체 token sequence → per-sketch padded tokens + summary + count."""
+    t = np.asarray(t, dtype=np.int32)
+    cmd_seq = t[:, 0]
+    sketch_chunks = []
+    start = 0
+    for i in range(len(t)):
+        c = int(cmd_seq[i])
+        if c == EXT:
+            sketch_chunks.append(t[start:i + 1].copy())
+            start = i + 1
+        elif c == EOS or c < 0:
+            break
+    n_sk = min(len(sketch_chunks), n_slots)
+    sk_tokens = np.full(
+        (n_slots, max_tokens_per_sketch, 17), PAD_V, dtype=np.int32,
+    )
+    sk_summary = np.zeros((n_slots, SUMMARY_DIM), dtype=np.float32)
+    for k in range(n_sk):
+        chunk = sketch_chunks[k]
+        L_sk = min(len(chunk), max_tokens_per_sketch)
+        sk_tokens[k, :L_sk] = chunk[:L_sk]
+        sk_summary[k] = _ext_row_summary(chunk[-1])
+    return sk_tokens, sk_summary, n_sk
+
+
+# ══════════════════════════════════════════════════════════════
+# ★ Canonical ordering (Phase 1 role discovery utilities — used for slot init)
 # ══════════════════════════════════════════════════════════════
 def _split_sketch_chunks(tokens):
     """tokens 를 sketch 청크 (SOL ... EXT) 리스트 + tail(EOS/padding) 로 분리."""
@@ -1818,13 +1887,19 @@ class JointDataset(Dataset):
         interp_matrix,
         type_ids=None,
         type_names=None,
-        canonicalize=True,
-        role_n_clusters=8,
+        canonicalize=False,           # set-based: 기본 reorder 안 함
+        role_n_clusters=10,
+        use_role_init=True,           # cluster 발견은 하되 slot init 용
+        n_slots=N_SKETCH_SLOTS,
+        max_tokens_per_sketch=MAX_TOKENS_PER_SKETCH,
     ):
         self.npy_files = list(npy_files)
         self.max_len = max_len
         self.do_canonicalize = bool(canonicalize)
+        self.use_role_init = bool(use_role_init)
         self.role_n_clusters = int(role_n_clusters)
+        self.n_slots = int(n_slots)
+        self.max_tokens_per_sketch = int(max_tokens_per_sketch)
 
         self.json_files = []
         for f in self.npy_files:
@@ -1840,9 +1915,9 @@ class JointDataset(Dataset):
         seen_types = set()
 
         # ──────────────────────────────────────────────────────
-        # ★ Phase 1: 모든 sample 의 sketch features 추출 + k-means clustering
+        # ★ Phase 1: cluster centers for slot init (no token reorder)
         # ──────────────────────────────────────────────────────
-        if self.do_canonicalize:
+        if self.use_role_init:
             print(f"\n  Phase 1: extracting sketch features for {len(self.npy_files)} samples...")
             all_sample_features = []
             for jf in self.json_files:
@@ -1865,66 +1940,46 @@ class JointDataset(Dataset):
             )
             self.role_cluster_centers = cluster_centers
             self.role_scaler = scaler
-
-            # Phase 1 검증용: type 별 첫 sample 의 role 분포 print
-            print("  Per-type role assignment (first sample of each type):")
-            shown_types = set()
-            for i in range(len(self.npy_files)):
-                tid = int(type_ids_arr[i]) if i < len(type_ids_arr) else -1
-                if tid in shown_types:
-                    continue
-                shown_types.add(tid)
-                if per_sample_roles[i] is None:
-                    print(f"    type{tid} sample{i}: (no roles)")
-                else:
-                    rids = per_sample_roles[i]
-                    print(f"    type{tid} sample{i}: roles={rids}")
+            self.per_sample_roles = per_sample_roles
+            self.all_sample_features = all_sample_features
         else:
             all_sample_features = [None] * len(self.npy_files)
             per_sample_roles = [None] * len(self.npy_files)
             self.role_cluster_centers = None
             self.role_scaler = None
+            self.per_sample_roles = per_sample_roles
+            self.all_sample_features = all_sample_features
 
         self.raw = []
         self.padded = []
-        self.canon_perms = []
-        n_changed = 0
-        n_total_canon = 0
-        n_skip = 0
+        self.canon_perms = []         # set-based 는 사용 안 함, 호환용
+        # ★ set-based per-sketch 미리 split
+        self.sk_tokens = []
+        self.sk_summary = []
+        self.sk_count = []
+        self.sk_cluster_ids = []      # 각 sketch 의 cluster id (Hungarian bonus 용)
 
         for i, f in enumerate(self.npy_files):
             t = np.load(f).astype(np.int32)
             t = ensure_eos_when_truncated(t, max_len)
-            perm = None
-            if self.do_canonicalize:
-                tid = int(type_ids_arr[i]) if i < len(type_ids_arr) else -1
-                verbose = (tid not in seen_types)
-                if verbose:
-                    seen_types.add(tid)
-
-                if per_sample_roles[i] is None:
-                    n_skip += 1
-                else:
-                    t_canon, was_changed, perm = canonicalize_by_roles(
-                        t,
-                        role_ids=per_sample_roles[i],
-                        sketch_features=all_sample_features[i],
-                        verbose=verbose,
-                        tag=f"sample{i}/type{tid}",
-                    )
-                    n_total_canon += 1
-                    if was_changed:
-                        n_changed += 1
-                    t = t_canon
             self.raw.append(t)
             self.padded.append(self._pad(t))
-            self.canon_perms.append(perm)
-
-        if self.do_canonicalize:
-            print(
-                f"  ★ role-canonical: reordered {n_changed}/{n_total_canon} sequences "
-                f"(skipped no-json: {n_skip})\n"
+            self.canon_perms.append(None)
+            # per-sketch split
+            sk_t, sk_s, n_sk = split_tokens_into_sketches(
+                t, self.max_tokens_per_sketch, self.n_slots,
             )
+            self.sk_tokens.append(sk_t)
+            self.sk_summary.append(sk_s)
+            self.sk_count.append(n_sk)
+            # cluster ids for actual sketches in this sample (rest is -1)
+            cids = np.full((self.n_slots,), -1, dtype=np.int64)
+            if per_sample_roles[i] is not None:
+                roles = per_sample_roles[i]
+                for k in range(min(len(roles), self.n_slots)):
+                    if roles[k] is not None:
+                        cids[k] = int(roles[k])
+            self.sk_cluster_ids.append(cids)
 
         self.sparam_db = sparam_db.astype(np.float32)
         self.freqs = np.asarray(freqs, dtype=np.float32)
@@ -2011,11 +2066,16 @@ class JointDataset(Dataset):
         return len(self.padded)
 
     def __getitem__(self, idx):
+        # 8-tuple (set-based)
         return (
-            torch.tensor(self.padded[idx], dtype=torch.float32),
-            torch.tensor(self.sparam_db[idx], dtype=torch.float32),
-            torch.tensor(self.sparam_db_full[idx], dtype=torch.float32),
-            torch.tensor(int(self.type_ids[idx]), dtype=torch.long),
+            torch.tensor(self.padded[idx], dtype=torch.float32),           # 0: encoder input
+            torch.tensor(self.sparam_db[idx], dtype=torch.float32),         # 1
+            torch.tensor(self.sparam_db_full[idx], dtype=torch.float32),    # 2
+            torch.tensor(int(self.type_ids[idx]), dtype=torch.long),        # 3
+            torch.tensor(self.sk_tokens[idx], dtype=torch.float32),         # 4: (K, L_sk, 17)
+            torch.tensor(self.sk_summary[idx], dtype=torch.float32),        # 5: (K, SUMMARY_DIM)
+            torch.tensor(int(self.sk_count[idx]), dtype=torch.long),        # 6
+            torch.tensor(self.sk_cluster_ids[idx], dtype=torch.long),       # 7: (K,) cluster id per sketch
         )
 
 
@@ -2066,6 +2126,10 @@ class SinPosEnc(nn.Module):
 
 
 class DeepCADBaselineAE(nn.Module):
+    """Set-based AE: encoder → z → SetDecoder → K (sk_latent, is_active, summary)
+    각 sk_latent 은 PerSketchAutoregDecoder 로 토큰 풀이.
+    ★ Phase 1 cluster centers 가 slot query 초기값으로 (학습 가능, role conditioning X).
+    """
     def __init__(
         self,
         max_len,
@@ -2082,13 +2146,14 @@ class DeepCADBaselineAE(nn.Module):
         n_freq_bands,
         aux_numeric,
         aux_hidden_mult,
-        latent_noise_std=0.0,
+        n_slots=N_SKETCH_SLOTS,
+        max_tokens_per_sketch=MAX_TOKENS_PER_SKETCH,
+        set_dec_n_layers=3,
+        slot_init=None,
     ):
         super().__init__()
-
         assert d_model % nhead == 0
 
-        self.latent_noise_std = float(latent_noise_std)
         self.max_len = max_len
         self.d_model = d_model
         self.d_param = d_param
@@ -2096,47 +2161,37 @@ class DeepCADBaselineAE(nn.Module):
         self.mem_tokens = mem_tokens
         self.n_pool = int(n_pool)
         self.n_freq_bands = int(n_freq_bands)
+        self.n_slots = int(n_slots)
+        self.max_tokens_per_sketch = int(max_tokens_per_sketch)
 
-        self.cmd_emb = nn.Embedding(
-            N_CMD + 1, d_model, padding_idx=PAD_CMD_INDEX,
-        )
-
+        # Token embedding (encoder + per-sketch decoder 공유)
+        self.cmd_emb = nn.Embedding(N_CMD + 1, d_model, padding_idx=PAD_CMD_INDEX)
         self.param_embs = nn.ModuleList([
             nn.Embedding(N_QUANT + 1, d_param, padding_idx=PAD_PARAM_INDEX)
             for _ in range(N_ARGS)
         ])
-
         if self.n_freq_bands > 0:
-            freq_bands = (
-                2.0 ** torch.arange(self.n_freq_bands, dtype=torch.float32)
-            ) * math.pi
+            freq_bands = (2.0 ** torch.arange(self.n_freq_bands, dtype=torch.float32)) * math.pi
             self.register_buffer("fourier_freqs", freq_bands)
             param_proj_in = N_ARGS * d_param + N_ARGS * 2 * self.n_freq_bands
         else:
             self.fourier_freqs = None
             param_proj_in = N_ARGS * d_param
-
         self.param_proj = nn.Linear(param_proj_in, d_model)
         self.emb_norm = nn.LayerNorm(d_model)
+        self.pos_enc = SinPosEnc(d_model, max_len=max_len + 16, dropout=dropout)
 
-        self.pos_enc = SinPosEnc(
-            d_model, max_len=max_len + 16, dropout=dropout,
-        )
-
+        # Encoder
         enc_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=nhead,
-            dim_feedforward=d_ff, dropout=dropout,
-            batch_first=True, norm_first=True,
+            d_model=d_model, nhead=nhead, dim_feedforward=d_ff,
+            dropout=dropout, batch_first=True, norm_first=True,
         )
-        self.encoder = nn.TransformerEncoder(
-            enc_layer, num_layers=n_enc, norm=nn.LayerNorm(d_model),
-        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_enc, norm=nn.LayerNorm(d_model))
 
         if self.n_pool >= 2:
             self.pool_queries = nn.Parameter(torch.randn(self.n_pool, d_model) * 0.02)
             self.pool_attn = nn.MultiheadAttention(
-                embed_dim=d_model, num_heads=nhead,
-                dropout=dropout, batch_first=True,
+                embed_dim=d_model, num_heads=nhead, dropout=dropout, batch_first=True,
             )
             self.pool_norm = nn.LayerNorm(d_model)
             self.to_z = nn.Linear(self.n_pool * d_model, latent)
@@ -2146,49 +2201,58 @@ class DeepCADBaselineAE(nn.Module):
             self.pool_norm = None
             self.to_z = nn.Linear(d_model, latent)
 
-        self.from_z = nn.Linear(latent, mem_tokens * d_model)
-
-        dec_layer = nn.TransformerDecoderLayer(
-            d_model=d_model, nhead=nhead,
-            dim_feedforward=d_ff, dropout=dropout,
-            batch_first=True, norm_first=True,
+        # ★ Set decoder: z → K slot outputs
+        self.set_from_z = nn.Linear(latent, mem_tokens * d_model)
+        set_dec_layer = nn.TransformerDecoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=d_ff,
+            dropout=dropout, batch_first=True, norm_first=True,
         )
-        self.decoder = nn.TransformerDecoder(
-            dec_layer, num_layers=n_dec, norm=nn.LayerNorm(d_model),
+        self.set_decoder = nn.TransformerDecoder(
+            set_dec_layer, num_layers=set_dec_n_layers, norm=nn.LayerNorm(d_model),
         )
 
-        self.bos = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        # ★ Slot queries — Phase 1 cluster centers 로 초기화 가능
+        if slot_init is not None:
+            slot_init_t = torch.as_tensor(slot_init, dtype=torch.float32)
+            if slot_init_t.shape != (self.n_slots, d_model):
+                raise ValueError(
+                    f"slot_init shape {tuple(slot_init_t.shape)} != ({self.n_slots}, {d_model})"
+                )
+            self.sketch_queries = nn.Parameter(slot_init_t.clone())
+        else:
+            self.sketch_queries = nn.Parameter(torch.randn(self.n_slots, d_model) * 0.02)
 
+        self.is_active_head = nn.Linear(d_model, 1)
+        self.summary_head = nn.Linear(d_model, SUMMARY_DIM)
+
+        # ★ Per-sketch token decoder (slots 공유)
+        self.sk_to_mem = nn.Linear(d_model, mem_tokens * d_model)
+        self.sk_pos_enc = SinPosEnc(d_model, max_len=self.max_tokens_per_sketch + 4, dropout=dropout)
+        sk_dec_layer = nn.TransformerDecoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=d_ff,
+            dropout=dropout, batch_first=True, norm_first=True,
+        )
+        self.sk_decoder = nn.TransformerDecoder(
+            sk_dec_layer, num_layers=n_dec, norm=nn.LayerNorm(d_model),
+        )
+        self.sk_bos = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
         self.cmd_head = nn.Linear(d_model, N_CMD)
         self.param_head = nn.Linear(d_model, N_ARGS * N_QUANT)
 
-        if aux_numeric:
-            aux_h = max(int(latent * aux_hidden_mult), 64)
-            aux_out = max_len * N_ARGS
-            self.aux_numeric_head = nn.Sequential(
-                nn.Linear(latent, aux_h),
-                nn.LayerNorm(aux_h),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(aux_h, aux_out),
-                nn.Sigmoid(),
-            )
-        else:
-            self.aux_numeric_head = None
-
+        self.aux_numeric_head = None
         self._init_weights()
 
     def _init_weights(self):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
+        # ★ sketch_queries 는 cluster init 이 있으면 그 값 유지 — xavier 덮어쓰지 않음
+        # (위에서 nn.Parameter(slot_init_t.clone()) 했으면 xavier 적용 안 됨, 1-dim 아니라서)
 
     def _content_embed(self, x):
         cmd = x[:, :, 0].long()
         params = x[:, :, 1:].long()
-
         pad_mask = cmd < 0
-
         cmd_idx = cmd.clone()
         cmd_idx[pad_mask] = PAD_CMD_INDEX
         cmd_idx = cmd_idx.clamp(0, PAD_CMD_INDEX)
@@ -2197,196 +2261,172 @@ class DeepCADBaselineAE(nn.Module):
         param_idx = params.clone()
         param_idx[param_idx < 0] = PAD_PARAM_INDEX
         param_idx = param_idx.clamp(0, PAD_PARAM_INDEX)
-
-        slot_embs = [
-            self.param_embs[s](param_idx[:, :, s])
-            for s in range(N_ARGS)
-        ]
+        slot_embs = [self.param_embs[s](param_idx[:, :, s]) for s in range(N_ARGS)]
         param_concat = torch.cat(slot_embs, dim=-1)
 
         if self.n_freq_bands > 0 and self.fourier_freqs is not None:
             p_int = param_idx.clone()
             pad_p = params < 0
             p_int[pad_p] = 0
-
             p_f = p_int.float() / float(QMAX)
             ang = p_f.unsqueeze(-1) * self.fourier_freqs.view(1, 1, 1, -1)
-
-            sin_p = torch.sin(ang)
-            cos_p = torch.cos(ang)
-
+            sin_p = torch.sin(ang); cos_p = torch.cos(ang)
             mask = 1.0 - pad_p.unsqueeze(-1).float()
-            sin_p = sin_p * mask
-            cos_p = cos_p * mask
-
+            sin_p = sin_p * mask; cos_p = cos_p * mask
             B, L, _ = params.shape
-            fourier = torch.cat([sin_p, cos_p], dim=-1)
-            fourier = fourier.reshape(B, L, N_ARGS * 2 * self.n_freq_bands)
-
+            fourier = torch.cat([sin_p, cos_p], dim=-1).reshape(B, L, N_ARGS * 2 * self.n_freq_bands)
             param_concat = torch.cat([param_concat, fourier], dim=-1)
 
         param_e = self.param_proj(param_concat)
-
         emb = self.emb_norm(cmd_e + param_e)
         emb = emb * (~pad_mask).unsqueeze(-1)
-
         return emb, pad_mask
 
     def encode(self, x):
         emb, pad_mask = self._content_embed(x)
         emb = self.pos_enc(emb)
         h = self.encoder(emb, src_key_padding_mask=pad_mask)
-
         if self.n_pool >= 2:
             B = h.size(0)
             q = self.pool_queries.unsqueeze(0).expand(B, -1, -1)
-            pooled, _ = self.pool_attn(
-                q, h, h, key_padding_mask=pad_mask, need_weights=False,
-            )
-            pooled = self.pool_norm(pooled)
-            pooled = pooled.reshape(B, self.n_pool * self.d_model)
+            pooled, _ = self.pool_attn(q, h, h, key_padding_mask=pad_mask, need_weights=False)
+            pooled = self.pool_norm(pooled).reshape(B, self.n_pool * self.d_model)
             z = self.to_z(pooled)
         else:
             valid = (~pad_mask).float().unsqueeze(-1)
             pooled = (h * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1.0)
             z = self.to_z(pooled)
-
         return z
 
-    def _memory_from_z(self, z):
-        return self.from_z(z).view(
-            z.size(0), self.mem_tokens, self.d_model,
-        )
+    def decode_set(self, z):
+        """z (B, latent) → (sk_latents, is_active_logits, summaries)."""
+        B = z.size(0)
+        memory = self.set_from_z(z).view(B, self.mem_tokens, self.d_model)
+        queries = self.sketch_queries.unsqueeze(0).expand(B, -1, -1)
+        out = self.set_decoder(queries, memory)  # (B, K, d_model)
+        is_active = self.is_active_head(out).squeeze(-1)
+        summaries = self.summary_head(out)
+        return out, is_active, summaries
 
-    def decode_teacher(self, z, teacher):
-        B, L, _ = teacher.shape
-
-        memory = self._memory_from_z(z)
-        bos = self.bos.expand(B, 1, self.d_model)
-
-        prev_emb, prev_pad = self._content_embed(teacher[:, :-1, :])
-        tgt = self.pos_enc(torch.cat([bos, prev_emb], dim=1))
-
+    def decode_per_sketch_teacher(self, sk_latents, target_sk_tokens):
+        """Per-slot teacher-forced decoding.
+        sk_latents: (B, K, d_model)  — reordered by matching
+        target_sk_tokens: (B, K, L_sk, 17)
+        """
+        B, K, L_sk, _ = target_sk_tokens.shape
+        BK = B * K
+        device = target_sk_tokens.device
+        sk_lats_flat = sk_latents.reshape(BK, self.d_model)
+        tgt_flat = target_sk_tokens.reshape(BK, L_sk, 17)
+        memory = self.sk_to_mem(sk_lats_flat).view(BK, self.mem_tokens, self.d_model)
+        bos = self.sk_bos.expand(BK, 1, self.d_model)
+        prev_emb, prev_pad = self._content_embed(tgt_flat[:, :-1, :])
+        tgt = self.sk_pos_enc(torch.cat([bos, prev_emb], dim=1))
         tgt_pad = torch.cat([
-            torch.zeros((B, 1), dtype=torch.bool, device=teacher.device),
-            prev_pad,
+            torch.zeros((BK, 1), dtype=torch.bool, device=device), prev_pad,
         ], dim=1)
-
-        out = self.decoder(
+        out = self.sk_decoder(
             tgt=tgt, memory=memory,
-            tgt_mask=causal_mask(L, teacher.device),
+            tgt_mask=causal_mask(L_sk, device),
             tgt_key_padding_mask=tgt_pad,
         )
-
-        cmd_logits = self.cmd_head(out)
-        prm_logits = self.param_head(out).view(B, L, N_ARGS, N_QUANT)
-
+        cmd_logits = self.cmd_head(out).reshape(B, K, L_sk, N_CMD)
+        prm_logits = self.param_head(out).reshape(B, K, L_sk, N_ARGS, N_QUANT)
         return cmd_logits, prm_logits
 
     def aux_numeric_predict(self, z):
-        if self.aux_numeric_head is None:
-            return None
-        B = z.size(0)
-        out = self.aux_numeric_head(z)
-        return out.view(B, self.max_len, N_ARGS)
+        return None
 
     @torch.no_grad()
-    def generate(self, z, max_gen_len=None):
-        if max_gen_len is None:
-            max_gen_len = self.max_len
-
-        B = z.size(0)
-        device = z.device
-
-        memory = self._memory_from_z(z)
-        bos = self.bos.expand(B, 1, self.d_model)
-
+    def _gen_one_sketch(self, sk_lat):
+        device = sk_lat.device
+        memory = self.sk_to_mem(sk_lat).view(1, self.mem_tokens, self.d_model)
+        bos = self.sk_bos.expand(1, 1, self.d_model)
         steps = []
-        finished = torch.zeros(B, dtype=torch.bool, device=device)
-
-        for _ in range(max_gen_len):
+        for _ in range(self.max_tokens_per_sketch):
             if not steps:
                 tc = bos
-                tp = torch.zeros((B, 1), dtype=torch.bool, device=device)
+                tp = torch.zeros((1, 1), dtype=torch.bool, device=device)
             else:
                 prev = torch.stack(steps, dim=1).float()
                 pe, pp = self._content_embed(prev)
                 tc = torch.cat([bos, pe], dim=1)
                 tp = torch.cat([
-                    torch.zeros((B, 1), dtype=torch.bool, device=device),
-                    pp,
+                    torch.zeros((1, 1), dtype=torch.bool, device=device), pp,
                 ], dim=1)
-
-            ti = self.pos_enc(tc)
+            ti = self.sk_pos_enc(tc)
             Lc = ti.size(1)
-
-            out = self.decoder(
+            out = self.sk_decoder(
                 tgt=ti, memory=memory,
                 tgt_mask=causal_mask(Lc, device),
                 tgt_key_padding_mask=tp,
             )
-
             last = out[:, -1, :]
             cmd_logits = self.cmd_head(last)
-            prm_logits = self.param_head(last).view(B, N_ARGS, N_QUANT)
-
+            prm_logits = self.param_head(last).view(1, N_ARGS, N_QUANT)
             next_cmd = torch.argmax(cmd_logits, dim=-1)
             next_prm = torch.argmax(prm_logits, dim=-1)
-
-            next_tok = torch.full((B, 17), PAD_V, dtype=torch.long, device=device)
+            nc = int(next_cmd.item())
+            next_tok = torch.full((1, 17), PAD_V, dtype=torch.long, device=device)
             next_tok[:, 0] = next_cmd
-
-            for cid in range(N_CMD):
-                n_valid = VALID_PAR.get(cid, 0)
-                if n_valid <= 0:
-                    continue
-                mask = next_cmd == cid
-                if mask.any():
-                    next_tok[mask, 1:1 + n_valid] = next_prm[mask, :n_valid]
-
-            if finished.any():
-                next_tok[finished] = PAD_V
-                next_tok[finished, 0] = EOS
-
+            n_valid = VALID_PAR.get(nc, 0)
+            if n_valid > 0:
+                next_tok[:, 1:1 + n_valid] = next_prm[:, :n_valid]
             steps.append(next_tok)
-            finished = finished | (next_cmd == EOS)
-
-            if bool(finished.all()):
+            if nc == EXT or nc == EOS:
                 break
-
         if not steps:
-            return torch.zeros((B, 0, 17), dtype=torch.long, device=device)
-
+            return np.zeros((0, 17), dtype=np.int32)
         rt = torch.stack(steps, dim=1)
-        rn = rt.detach().cpu().numpy().astype(np.int32)
-        cleaned = []
+        return rt[0].detach().cpu().numpy().astype(np.int32)
 
-        for i in range(rn.shape[0]):
-            s = trim_after_eos(rn[i])
-            pad_len = rn.shape[1] - s.shape[0]
-            if pad_len > 0:
-                s = np.concatenate([
-                    s, np.full((pad_len, 17), PAD_V, dtype=np.int32),
-                ], axis=0)
-            cleaned.append(s)
+    @torch.no_grad()
+    def generate(self, z, max_gen_len=None):
+        """Set-based generation: K slot → activate → concat."""
+        B = z.size(0)
+        device = z.device
+        sk_latents, is_active_logits, _ = self.decode_set(z)
+        is_active = (torch.sigmoid(is_active_logits) > 0.5)
+        if max_gen_len is None:
+            max_gen_len = self.n_slots * self.max_tokens_per_sketch + 4
 
-        return torch.tensor(
-            np.stack(cleaned, axis=0), dtype=torch.long, device=device,
-        )
+        result_list = []
+        for b in range(B):
+            active_idx = is_active[b].nonzero(as_tuple=True)[0].tolist()
+            chunks = []
+            for k in active_idx:
+                sk_lat = sk_latents[b:b + 1, k]
+                tok = self._gen_one_sketch(sk_lat)
+                if tok.shape[0] == 0:
+                    continue
+                if int(tok[-1, 0]) != EXT:
+                    ext_row = np.full((1, 17), PAD_V, dtype=np.int32)
+                    ext_row[0, 0] = EXT
+                    tok = np.concatenate([tok, ext_row], axis=0)
+                chunks.append(tok)
+            if chunks:
+                flat = np.concatenate(chunks, axis=0)
+                eos_row = np.full((1, 17), PAD_V, dtype=np.int32)
+                eos_row[0, 0] = EOS
+                flat = np.concatenate([flat, eos_row], axis=0)
+            else:
+                flat = np.zeros((0, 17), dtype=np.int32)
+                eos_row = np.full((1, 17), PAD_V, dtype=np.int32)
+                eos_row[0, 0] = EOS
+                flat = np.concatenate([flat, eos_row], axis=0)
+            if flat.shape[0] < max_gen_len:
+                pad = np.full((max_gen_len - flat.shape[0], 17), PAD_V, dtype=np.int32)
+                flat = np.concatenate([flat, pad], axis=0)
+            else:
+                flat = flat[:max_gen_len]
+            result_list.append(flat)
+        out = np.stack(result_list, axis=0)
+        return torch.tensor(out, dtype=torch.long, device=device)
 
     def forward(self, x):
         z = self.encode(x)
-        # ★ Latent noise injection (학습 중에만)
-        #   decoder 가 z 주변 영역에서 일관된 출력을 학습하도록 강제 → cascade error ↓
-        #   inverse design 시 boundary z 에서도 그럴듯한 구조 디코딩
-        if self.training and getattr(self, "latent_noise_std", 0.0) > 0:
-            z_for_dec = z + torch.randn_like(z) * float(self.latent_noise_std)
-        else:
-            z_for_dec = z
-        cmd_logits, prm_logits = self.decode_teacher(z_for_dec, x)
-        aux = self.aux_numeric_predict(z)
-        # z 자체는 noise 없이 반환 (surrogate / VICReg 는 깨끗한 z 사용)
-        return cmd_logits, prm_logits, aux, z
+        sk_latents, is_active_logits, summaries = self.decode_set(z)
+        return sk_latents, is_active_logits, summaries, z
 
 
 # ══════════════════════════════════════════════════════════════
@@ -2489,6 +2529,183 @@ def sparam_full_interp_loss(pred_sel_db, true_sel_db, true_full_db, interp_w, cf
         "rmse_db_sel": float(sel_rmse_db.item()),
     }
     return full_loss, comp, pred_full_db
+
+
+# ══════════════════════════════════════════════════════════════
+# ★ Set-based: Hungarian matching + cluster bonus + reorder + loss
+# ══════════════════════════════════════════════════════════════
+def hungarian_match_with_clusters(
+    pred_summaries, target_summaries, n_sketches,
+    target_cluster_ids=None, slot_init_cluster_ids=None,
+    cluster_bonus=0.3,
+):
+    """Hungarian matching pred slot ↔ target sketch.
+
+    cost = ||pred_summary - target_summary||
+          - cluster_bonus  (slot 의 init cluster id == target 의 cluster id 인 경우)
+    """
+    try:
+        from scipy.optimize import linear_sum_assignment
+    except ImportError:
+        B, K, _ = pred_summaries.shape
+        device = pred_summaries.device
+        n_sk_np = n_sketches.detach().cpu().numpy()
+        matching = np.full((B, K), -1, dtype=np.int64)
+        for b in range(B):
+            n = int(n_sk_np[b])
+            for k in range(min(K, n)):
+                matching[b, k] = k
+        return torch.tensor(matching, device=device, dtype=torch.long)
+
+    B, K, _ = pred_summaries.shape
+    device = pred_summaries.device
+    pred_np = pred_summaries.detach().cpu().numpy()
+    target_np = target_summaries.detach().cpu().numpy()
+    n_sk_np = n_sketches.detach().cpu().numpy()
+
+    target_cids = (
+        target_cluster_ids.detach().cpu().numpy()
+        if target_cluster_ids is not None else None
+    )
+    slot_init_cids = slot_init_cluster_ids  # (K,) numpy or None
+
+    matching = np.full((B, K), -1, dtype=np.int64)
+    for b in range(B):
+        n_sk = int(n_sk_np[b])
+        if n_sk == 0:
+            continue
+        # base cost = L2 distance in summary space
+        cost = np.linalg.norm(
+            pred_np[b, :, None, :] - target_np[b, None, :n_sk, :], axis=-1,
+        )  # (K, n_sk)
+        # cluster bonus
+        if target_cids is not None and slot_init_cids is not None:
+            for k in range(K):
+                for m in range(n_sk):
+                    if slot_init_cids[k] == int(target_cids[b, m]):
+                        cost[k, m] -= cluster_bonus
+        row_ind, col_ind = linear_sum_assignment(cost)
+        for r, c in zip(row_ind, col_ind):
+            if r < K and c < n_sk:
+                matching[b, r] = c
+    return torch.tensor(matching, device=device, dtype=torch.long)
+
+
+def reorder_targets_by_matching(
+    target_sk_tokens, target_summaries, target_cluster_ids, matching,
+):
+    """matching 에 따라 target sketch 를 slot 순서로 재배치."""
+    B, K, L_sk, _ = target_sk_tokens.shape
+    device = target_sk_tokens.device
+    reord_tokens = torch.full_like(target_sk_tokens, PAD_V)
+    reord_summaries = torch.zeros_like(target_summaries)
+    reord_cluster_ids = torch.full_like(target_cluster_ids, -1)
+    slot_matched = torch.zeros((B, K), dtype=torch.bool, device=device)
+
+    mat_np = matching.detach().cpu().numpy()
+    for b in range(B):
+        for k in range(K):
+            tgt_idx = int(mat_np[b, k])
+            if tgt_idx >= 0:
+                reord_tokens[b, k] = target_sk_tokens[b, tgt_idx]
+                reord_summaries[b, k] = target_summaries[b, tgt_idx]
+                reord_cluster_ids[b, k] = target_cluster_ids[b, tgt_idx]
+                slot_matched[b, k] = True
+    return reord_tokens, reord_summaries, reord_cluster_ids, slot_matched
+
+
+def set_based_ae_loss(
+    ae,
+    sk_latents, is_active_logits, pred_summaries,
+    target_sk_tokens, target_summaries, target_cluster_ids,
+    n_sketches,
+    cfg, epoch=0, slot_init_cluster_ids=None,
+):
+    """Set-based AE loss with curriculum.
+
+    epoch 사용:
+      epoch < warmup            → token CE weight = 0
+      warmup ≤ epoch < warmup+ramp → linear 0→1
+      epoch ≥ warmup+ramp       → token CE weight = 1
+    """
+    B, K, L_sk, _ = target_sk_tokens.shape
+    device = target_sk_tokens.device
+
+    # Curriculum token weight
+    warmup = int(getattr(cfg, "curriculum_warmup_epochs", 10))
+    ramp = int(getattr(cfg, "curriculum_ramp_epochs", 10))
+    if epoch < warmup:
+        token_w = 0.0
+    elif epoch < warmup + ramp:
+        token_w = (epoch - warmup) / max(1, ramp)
+    else:
+        token_w = 1.0
+
+    # Hungarian matching
+    with torch.no_grad():
+        matching = hungarian_match_with_clusters(
+            pred_summaries, target_summaries, n_sketches,
+            target_cluster_ids=target_cluster_ids,
+            slot_init_cluster_ids=slot_init_cluster_ids,
+            cluster_bonus=float(getattr(cfg, "matching_cluster_bonus", 0.3)),
+        )
+
+    reord_tokens, reord_summaries, reord_cids, slot_matched = reorder_targets_by_matching(
+        target_sk_tokens, target_summaries, target_cluster_ids, matching,
+    )
+
+    # Token decode (only if token_w > 0 — saves compute during warmup)
+    cmd_loss = sk_latents.new_zeros(())
+    prm_loss = sk_latents.new_zeros(())
+    if token_w > 0:
+        cmd_logits, prm_logits = ae.decode_per_sketch_teacher(sk_latents, reord_tokens)
+        target_cmd = reord_tokens[..., 0].long()
+        cmd_valid = (target_cmd >= 0) & slot_matched.unsqueeze(-1)
+        tcmd_c = target_cmd.clamp(0, N_CMD - 1)
+        cmd_ce = F.cross_entropy(
+            cmd_logits.reshape(-1, N_CMD),
+            tcmd_c.reshape(-1),
+            reduction="none",
+        ).reshape(B, K, L_sk)
+        cmd_loss = (cmd_ce * cmd_valid.float()).sum() / (cmd_valid.float().sum() + 1e-8)
+
+        target_prm = reord_tokens[..., 1:].long()
+        prm_valid = (target_prm >= 0) & slot_matched.view(B, K, 1, 1)
+        tprm_c = target_prm.clamp(0, N_QUANT - 1)
+        prm_ce = F.cross_entropy(
+            prm_logits.reshape(-1, N_QUANT),
+            tprm_c.reshape(-1),
+            reduction="none",
+        ).reshape(B, K, L_sk, N_ARGS)
+        prm_loss = (prm_ce * prm_valid.float()).sum() / (prm_valid.float().sum() + 1e-8)
+
+    # is_active BCE
+    slot_idx = torch.arange(K, device=device).unsqueeze(0).expand(B, -1)
+    is_active_gt = (slot_idx < n_sketches.unsqueeze(1)).float()
+    active_loss = F.binary_cross_entropy_with_logits(is_active_logits, is_active_gt)
+
+    # Summary L2 on matched slots
+    sum_mask = slot_matched.unsqueeze(-1).float()
+    summary_loss = ((pred_summaries - reord_summaries) ** 2 * sum_mask).sum() / (
+        sum_mask.sum() * SUMMARY_DIM + 1e-8
+    )
+
+    w_active = float(getattr(cfg, "w_active", 0.5))
+    w_summary = float(getattr(cfg, "w_summary", 1.0))
+    total = (
+        token_w * (cfg.w_cmd * cmd_loss + cfg.w_prm * prm_loss)
+        + w_active * active_loss
+        + w_summary * summary_loss
+    )
+
+    return total, {
+        "cmd": float(cmd_loss.item()),
+        "prm": float(prm_loss.item()),
+        "active": float(active_loss.item()),
+        "summary": float(summary_loss.item()),
+        "token_w": token_w,
+        "ae_total": float(total.item()),
+    }
 
 
 def vicreg_z_loss(z, var_target=1.0, eps=1e-4):

@@ -3217,6 +3217,11 @@ def inverse_design_optimize(
     in_band_count = masks_t.float().sum(dim=0).clamp(min=1.0).unsqueeze(0)
     out_band_count = (~masks_t).float().sum(dim=0).clamp(min=1.0).unsqueeze(0)
 
+    # ★ z trajectory 추적 (PCA 시각화 용)
+    track_every = max(1, n_iters // 50)
+    z_trajectory = [z.detach().cpu().numpy().copy()]
+    track_iters = [0]
+
     last_improve_iter = 0
     last_restart_iter = -10 ** 9
     restart_count = 0
@@ -3285,6 +3290,11 @@ def inverse_design_optimize(
 
         loss.backward()
         optimizer.step()
+
+        # ★ z snapshot for PCA trajectory
+        if (it + 1) % track_every == 0:
+            z_trajectory.append(z.detach().cpu().numpy().copy())
+            track_iters.append(it + 1)
 
         with torch.no_grad():
             bi = int(torch.argmin(match_per).item())
@@ -3379,7 +3389,156 @@ def inverse_design_optimize(
         "iters_used": iters_used,
         "restart_count": restart_count,
         "early_stopped": early_stopped,
+        "z_trajectory": z_trajectory,
+        "track_iters": track_iters,
     }
+
+
+def visualize_inverse_z_on_pca(
+    z_train, type_ids_train, type_names,
+    z_trajectory, track_iters, best_start_idx,
+):
+    """학습 z 의 PCA / t-SNE 위에 inverse design z 궤적 시각화.
+
+    Args:
+        z_train: (N, D) training latents
+        type_ids_train: (N,) type IDs
+        type_names: list of type names
+        z_trajectory: list of (n_starts, D) numpy arrays, snapshot per iter
+        track_iters: list of iteration indices for each snapshot
+        best_start_idx: which start was best (highlighted)
+    """
+    try:
+        from sklearn.decomposition import PCA
+    except ImportError:
+        print("  ⚠ sklearn 없음 — inverse z trajectory viz skip")
+        return
+    if not z_trajectory:
+        print("  ⚠ z_trajectory 비어있음 — skip")
+        return
+
+    z_train_np = np.asarray(z_train, dtype=np.float32)
+    type_ids_np = np.asarray(type_ids_train, dtype=np.int64)
+    N, D = z_train_np.shape
+
+    # PCA fit on training z (analyze_latent_space 와 동일 축)
+    pca = PCA(n_components=2).fit(z_train_np)
+    z_train_pca = pca.transform(z_train_np)
+    ev2 = pca.explained_variance_ratio_
+
+    # Project trajectories
+    n_snaps = len(z_trajectory)
+    n_starts = z_trajectory[0].shape[0]
+    # traj_pca shape: (n_snaps, n_starts, 2)
+    traj_pca = np.stack(
+        [pca.transform(z_snap) for z_snap in z_trajectory], axis=0,
+    )
+
+    # t-SNE: training z 로만 fit (parametric 아니라 inverse z project 못 함)
+    z_tsne_train = None
+    try:
+        from sklearn.manifold import TSNE
+        if N >= 10:
+            perp = min(30, max(5, N // 4))
+            z_tsne_train = TSNE(
+                n_components=2, perplexity=perp,
+                random_state=0, init="pca", learning_rate="auto",
+            ).fit_transform(z_train_np)
+    except Exception:
+        z_tsne_train = None
+
+    # 1개 figure, 1~2 panel (PCA + 옵션 t-SNE for reference only)
+    if z_tsne_train is not None:
+        fig, axes = plt.subplots(1, 2, figsize=(15, 7), facecolor="white")
+    else:
+        fig, ax_only = plt.subplots(1, 1, figsize=(10, 8), facecolor="white")
+        axes = [ax_only]
+    fig.suptitle(
+        "Inverse design latent trajectory  —  "
+        f"projected onto training PCA  ({n_starts} starts, {n_snaps} snapshots)",
+        fontsize=11, color="#222",
+    )
+
+    colors_t = ["#4C9BE8", "#E05C5C", "#6DBF67", "#F4A340", "#A57CC1", "#4ECBCB"]
+    n_types = len(type_names) if type_names is not None else int(type_ids_np.max()) + 1
+
+    # ── Panel 1: PCA ──
+    ax = axes[0]
+    for ti in range(n_types):
+        m = (type_ids_np == ti)
+        if not m.any():
+            continue
+        tname = type_names[ti] if type_names and ti < len(type_names) else f"type{ti}"
+        ax.scatter(
+            z_train_pca[m, 0], z_train_pca[m, 1],
+            c=colors_t[ti % len(colors_t)], s=15, alpha=0.35,
+            label=f"train {tname}", edgecolor="none",
+        )
+
+    # 각 multi-start trajectory 표시
+    for k in range(n_starts):
+        xs = traj_pca[:, k, 0]
+        ys = traj_pca[:, k, 1]
+        is_best = (k == best_start_idx)
+        if is_best:
+            ax.plot(xs, ys, color="#FF1744", lw=1.8, alpha=0.95, zorder=10)
+            ax.scatter(xs[0], ys[0], marker="o", s=60, color="#FF1744",
+                       edgecolor="black", linewidths=0.8, zorder=11,
+                       label="best start")
+            ax.scatter(xs[-1], ys[-1], marker="*", s=300, color="#FF1744",
+                       edgecolor="black", linewidths=1.2, zorder=12,
+                       label="best end")
+        else:
+            ax.plot(xs, ys, color="#666666", lw=0.5, alpha=0.4, zorder=5)
+            ax.scatter(xs[0], ys[0], marker="o", s=15, color="#666666",
+                       alpha=0.5, zorder=6)
+            ax.scatter(xs[-1], ys[-1], marker="X", s=25, color="#333333",
+                       alpha=0.7, zorder=7)
+    ax.set_title(f"PCA (var={ev2[0]:.2f}+{ev2[1]:.2f})", fontweight="normal")
+    ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
+    ax.grid(True, alpha=0.2)
+    ax.legend(fontsize=8, loc="best", framealpha=0.85)
+
+    # ── Panel 2: t-SNE (reference only) ──
+    if z_tsne_train is not None:
+        ax = axes[1]
+        for ti in range(n_types):
+            m = (type_ids_np == ti)
+            if not m.any():
+                continue
+            tname = type_names[ti] if type_names and ti < len(type_names) else f"type{ti}"
+            ax.scatter(
+                z_tsne_train[m, 0], z_tsne_train[m, 1],
+                c=colors_t[ti % len(colors_t)], s=15, alpha=0.5,
+                label=tname, edgecolor="none",
+            )
+        # inverse z 의 NN training sample 찾아서 그 좌표에 마커
+        z_best_final = z_trajectory[-1][best_start_idx]
+        dists = np.linalg.norm(z_train_np - z_best_final[None, :], axis=1)
+        nn_idx = int(np.argmin(dists))
+        ax.scatter(
+            z_tsne_train[nn_idx, 0], z_tsne_train[nn_idx, 1],
+            marker="*", s=300, color="#FF1744",
+            edgecolor="black", linewidths=1.2, zorder=15,
+            label=f"NN (idx={nn_idx})",
+        )
+        ax.annotate(
+            "best z NN",
+            xy=(z_tsne_train[nn_idx, 0], z_tsne_train[nn_idx, 1]),
+            xytext=(10, 10), textcoords="offset points",
+            fontsize=10, color="#FF1744",
+            arrowprops=dict(arrowstyle="->", color="#FF1744", lw=1),
+        )
+        ax.set_title("t-SNE  (best z 의 NN training sample 표시)", fontweight="normal")
+        ax.set_xlabel("dim 1"); ax.set_ylabel("dim 2")
+        ax.grid(True, alpha=0.2)
+        ax.legend(fontsize=8, loc="best", framealpha=0.85)
+
+    plt.tight_layout()
+    print(
+        f"  ✓ inverse z trajectory figure 생성 "
+        f"(n_starts={n_starts}, n_snaps={n_snaps})"
+    )
 
 
 def visualize_inverse_design_curve(result):
@@ -3978,6 +4137,25 @@ def run_inverse_design_pipeline(
     except Exception as e:
         import traceback as _tb
         print(f"  ⚠ visualize_inverse_design_curve failed: {type(e).__name__}: {e}")
+        _tb.print_exc()
+
+    # ★ Inverse z trajectory on training PCA (latent space 위치 추적)
+    subsection("Inverse design — z trajectory on training PCA")
+    try:
+        all_indices = list(range(len(dataset)))
+        z_train_all, tids_train_all = collect_latents(ae, dataset, all_indices, device)
+        type_names_local = list(dataset.type_names) if hasattr(dataset, "type_names") else None
+        visualize_inverse_z_on_pca(
+            z_train=z_train_all,
+            type_ids_train=tids_train_all,
+            type_names=type_names_local,
+            z_trajectory=result.get("z_trajectory", []),
+            track_iters=result.get("track_iters", []),
+            best_start_idx=int(result.get("best_start_idx", 0)),
+        )
+    except Exception as e:
+        import traceback as _tb
+        print(f"  ⚠ visualize_inverse_z_on_pca failed: {type(e).__name__}: {e}")
         _tb.print_exc()
 
     subsection("Inverse design — decoded structure figure")
