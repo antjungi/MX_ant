@@ -191,6 +191,10 @@ class CFG:
     aux_numeric: bool = True
     aux_hidden_mult: float = 2.0
 
+    # ★ ROLE 토큰화 + 같은 role coplanar chunk 자동 병합
+    use_json_names: bool = True              # JSON metadata names → ROLE 토큰 삽입
+    merge_same_role_chunks: bool = True      # 같은 role + 같은 plane + 같은 extrude → 1 chunk(multi-loop)
+
     # loss weights
     w_cmd: float = 1.0
     w_prm: float = 1.0
@@ -669,6 +673,189 @@ def extract_dequant_meta(json_data: dict) -> dict:
         "g_min3": g_min3, "g_max3": g_max3, "g_max_dim": g_max_dim,
         "max_ext": max_ext, "sketches": sketch_metas,
     }
+
+
+# ══════════════════════════════════════════════════════════════
+# ★ JSON merging (same-role + coplanar + same extrude → multi-loop) + retokenizer
+# ══════════════════════════════════════════════════════════════
+_BOOL_MAP_TOK  = {"NewBody": 0, "Join": 1, "Cut": 2, "Intersect": 3}
+_ETYPE_MAP_TOK = {"OneSide": 0, "Symmetric": 1, "TwoSide": 2}
+
+
+def _q01_tok(v):
+    return int(round(float(np.clip(v, 0.0, 1.0)) * QMAX))
+
+
+def _norm_tok(v, lo, hi):
+    if hi - lo < 1e-8:
+        return 0.0
+    return float(np.clip((v - lo) / (hi - lo), 0.0, 1.0))
+
+
+def json_to_tokens(json_data):
+    """JSON dict → (N, 17) int32 token array.  extract_dequant_meta 활용."""
+    meta = extract_dequant_meta(json_data)
+    g_min3, g_max3, g_max_dim = meta["g_min3"], meta["g_max3"], meta["g_max_dim"]
+    max_ext = meta["max_ext"]
+    sk_metas = meta["sketches"]
+
+    def row(cmd, *args):
+        r = [PAD_V] * (1 + N_ARGS)
+        r[0] = cmd
+        for i, v in enumerate(args):
+            r[1 + i] = int(v)
+        return r
+
+    rows = []
+    seq = json_data["sequence"]
+    sk_idx = 0
+    for op in seq:
+        if op["type"] == "Sketch":
+            sm = sk_metas[sk_idx]
+            xy_min, xy_max, sk_scale = sm["xy_min"], sm["xy_max"], sm["sk_scale"]
+
+            def q2d(x, y):
+                return (_q01_tok(_norm_tok(x, xy_min[0], xy_max[0])),
+                        _q01_tok(_norm_tok(y, xy_min[1], xy_max[1])))
+
+            def qr(r):
+                return _q01_tok(_norm_tok(r, 0.0, sk_scale))
+
+            for loop in op.get("profile", {}).get("children", []):
+                rows.append(row(SOL))
+                for e in loop.get("children", []):
+                    et = e["type"]
+                    if et == "Line":
+                        qx, qy = q2d(e["end_point"]["x"], e["end_point"]["y"])
+                        rows.append(row(LINE, qx, qy))
+                    elif et == "Arc":
+                        qmx, qmy = q2d(e["mid_point"]["x"], e["mid_point"]["y"])
+                        qex, qey = q2d(e["end_point"]["x"], e["end_point"]["y"])
+                        rows.append(row(ARC, qmx, qmy, qex, qey))
+                    elif et == "Circle":
+                        qcx, qcy = q2d(e["center_point"]["x"], e["center_point"]["y"])
+                        rows.append(row(CIRCLE, qcx, qcy, qr(e["radius"])))
+            sk_idx += 1
+        elif op["type"] == "Extrude":
+            sm = sk_metas[sk_idx - 1] if sk_idx > 0 else sk_metas[0]
+            origin = sm["origin"]
+            q_sk_scale = _q01_tok(_norm_tok(sm["sk_scale"] / g_max_dim, 0.0, 1.0))
+            q_ox = _q01_tok(_norm_tok(origin[0], g_min3[0], g_max3[0]))
+            q_oy = _q01_tok(_norm_tok(origin[1], g_min3[1], g_max3[1]))
+            q_oz = _q01_tok(_norm_tok(origin[2], g_min3[2], g_max3[2]))
+            e1 = op["extent_one"]["distance"]
+            e2 = op.get("extent_two", {}).get("distance", 0.0)
+            q_e1 = _q01_tok(_norm_tok(e1, 0.0, max_ext))
+            q_e2 = _q01_tok(_norm_tok(e2, 0.0, max_ext))
+            q_bool = _BOOL_MAP_TOK.get(op.get("operation", "NewBody"), 0)
+            q_etype = _ETYPE_MAP_TOK.get(op.get("extent_type", "OneSide"), 0)
+            rows.append(row(EXT, q_sk_scale, q_ox, q_oy, q_oz,
+                            q_e1, q_e2, q_bool, q_etype))
+    rows.append(row(EOS))
+    return np.asarray(rows, dtype=np.int32)
+
+
+def merge_coplanar_same_role_sketches(json_data, names,
+                                       plane_tol=1e-3, extent_tol=1e-3,
+                                       verbose=False):
+    """JSON sequence 에서 연속된 Sketch+Extrude pair 중
+    같은 role + coplanar + 같은 extrude 인 것들을 1개의 Sketch (multi-loop) + 1개의 Extrude 로 병합.
+
+    Args:
+        json_data: original JSON dict
+        names: list of role names per (Sketch, Extrude) pair, 길이 = n_pairs
+
+    Returns:
+        new_json_data: 병합 결과 (원본 unchanged)
+        new_names: 병합 후 pair 들의 role name 리스트
+        n_merged: 줄어든 chunk 수 (양수면 merge 발생)
+    """
+    seq = json_data["sequence"]
+    pairs = []
+    extra_ops = []
+    i = 0
+    while i < len(seq):
+        if (seq[i].get("type") == "Sketch" and i + 1 < len(seq)
+                and seq[i + 1].get("type") == "Extrude"):
+            idx = len(pairs)
+            nm = names[idx] if (names is not None and idx < len(names)) else None
+            pairs.append((seq[i], seq[i + 1], nm))
+            i += 2
+        else:
+            extra_ops.append(seq[i])
+            i += 1
+
+    def planes_match(p1, p2):
+        for k in ("origin", "x_axis", "y_axis", "z_axis"):
+            v1 = _v3(p1[k]); v2 = _v3(p2[k])
+            if np.linalg.norm(v1 - v2) > plane_tol:
+                return False
+        return True
+
+    def extrudes_match(e1, e2):
+        d1 = float(e1.get("extent_one", {}).get("distance", 0.0))
+        d2 = float(e2.get("extent_one", {}).get("distance", 0.0))
+        if abs(d1 - d2) > extent_tol:
+            return False
+        s1 = float(e1.get("extent_two", {}).get("distance", 0.0))
+        s2 = float(e2.get("extent_two", {}).get("distance", 0.0))
+        if abs(s1 - s2) > extent_tol:
+            return False
+        if e1.get("extent_type", "OneSide") != e2.get("extent_type", "OneSide"):
+            return False
+        return True
+
+    merged = []
+    new_names = []
+    j = 0
+    while j < len(pairs):
+        sk, ex, nm = pairs[j]
+        loops = list(sk.get("profile", {}).get("children", []))
+        k = j + 1
+        while k < len(pairs):
+            sk2, ex2, nm2 = pairs[k]
+            if (nm is not None and nm == nm2
+                    and planes_match(sk["plane"], sk2["plane"])
+                    and extrudes_match(ex, ex2)):
+                for lp in sk2.get("profile", {}).get("children", []):
+                    new_lp = dict(lp)
+                    new_lp["is_outer"] = True   # 이 단계의 모든 loop = 별도 outer
+                    if "children" in lp:
+                        new_lp["children"] = list(lp["children"])
+                    loops.append(new_lp)
+                k += 1
+            else:
+                break
+
+        if k > j + 1:
+            fixed_loops = []
+            for lp in loops:
+                new_lp = dict(lp)
+                new_lp["is_outer"] = True
+                if "children" in lp:
+                    new_lp["children"] = list(lp["children"])
+                fixed_loops.append(new_lp)
+            new_sk = dict(sk)
+            new_sk["profile"] = dict(sk.get("profile", {}))
+            new_sk["profile"]["children"] = fixed_loops
+            merged.append((new_sk, ex, nm))
+            if verbose:
+                print(f"    merged role={nm!r}: {k - j} chunks → 1 chunk "
+                      f"({len(fixed_loops)} loops total)")
+        else:
+            merged.append((sk, ex, nm))
+        new_names.append(nm)
+        j = k
+
+    new_seq = list(extra_ops)
+    for sk, ex, _nm in merged:
+        new_seq.append(sk)
+        new_seq.append(ex)
+    new_json = dict(json_data)
+    new_json["sequence"] = new_seq
+
+    n_merged = len(pairs) - len(merged)
+    return new_json, new_names, n_merged
 
 
 def _arc_pts(sx, sy, mx, my, ex, ey, n=32):
@@ -1486,9 +1673,12 @@ class JointDataset(Dataset):
         interp_matrix,
         type_ids=None,
         type_names=None,
+        merge_same_role_chunks=True,
     ):
         self.npy_files = list(npy_files)
         self.max_len = max_len
+        self.merge_same_role_chunks = bool(merge_same_role_chunks)
+        self.merged_json_cache = [None] * len(self.npy_files)
 
         self.json_files = []
         for f in self.npy_files:
@@ -1532,10 +1722,41 @@ class JointDataset(Dataset):
         self.raw = []
         self.padded = []
         n_inserted_total = 0
+        n_merge_total = 0
+        n_samples_merged = 0
 
-        for f, names in zip(self.npy_files, per_sample_names):
-            t = np.load(f).astype(np.int32)
-            t, n_inserted = self._insert_role_tokens(t, names)
+        for i, (f, names) in enumerate(zip(self.npy_files, per_sample_names)):
+            jf = self.json_files[i]
+            t = None
+            updated_names = names
+
+            # ★ JSON 레벨에서 same-role + coplanar + same-extrude chunk 자동 병합
+            if (self.merge_same_role_chunks and names is not None
+                    and jf is not None and os.path.exists(jf)):
+                try:
+                    import json as _json
+                    with open(jf, "r", encoding="utf-8") as fh:
+                        jd_orig = _json.load(fh)
+                    jd_merged, new_names, n_merged = merge_coplanar_same_role_sketches(
+                        jd_orig, names, verbose=(i < 3),
+                    )
+                    if n_merged > 0:
+                        t = json_to_tokens(jd_merged)
+                        updated_names = new_names
+                        self.merged_json_cache[i] = jd_merged
+                        n_merge_total += n_merged
+                        n_samples_merged += 1
+                        if i < 3:
+                            print(f"    sample {i}: {len(names)} → {len(new_names)} chunks "
+                                  f"(merged {n_merged})")
+                except Exception as e:
+                    print(f"    [warn] sample {i}: merge failed: {e}")
+                    t = None
+
+            if t is None:
+                t = np.load(f).astype(np.int32)
+
+            t, n_inserted = self._insert_role_tokens(t, updated_names)
             n_inserted_total += n_inserted
             t = ensure_eos_when_truncated(t, max_len)
             self.raw.append(t)
@@ -1544,6 +1765,10 @@ class JointDataset(Dataset):
         if self.role_name_to_id:
             print(f"  [roletoken] inserted {n_inserted_total} ROLE tokens "
                   f"across {len(self.npy_files)} samples")
+        if self.merge_same_role_chunks:
+            print(f"  [roletoken] merged {n_merge_total} chunks across "
+                  f"{n_samples_merged}/{len(self.npy_files)} samples "
+                  f"(same role + coplanar + same extrude → multi-loop)")
 
         self.sparam_db = sparam_db.astype(np.float32)
         self.freqs = np.asarray(freqs, dtype=np.float32)
@@ -1644,6 +1869,11 @@ class JointDataset(Dataset):
         return np.concatenate([t, pad], axis=0).astype(np.float32)
 
     def load_json(self, idx):
+        # ★ merge 가 적용된 sample 은 캐시된 병합 JSON 반환 (재토큰화와 일관)
+        if 0 <= idx < len(self.merged_json_cache):
+            cached = self.merged_json_cache[idx]
+            if cached is not None:
+                return cached
         jf = self.json_files[idx] if idx < len(self.json_files) else None
         if jf is None:
             return None
@@ -2882,6 +3112,7 @@ def load_multitype_data(cfg, script_dir):
         interp_matrix=interp_matrix,
         type_ids=type_ids,
         type_names=type_names,
+        merge_same_role_chunks=getattr(cfg, "merge_same_role_chunks", True),
     )
 
     return dataset, all_npy, type_ids, type_names, sparam_db, max_len
