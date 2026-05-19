@@ -183,7 +183,8 @@ class CFG:
 
     # ★ canonical ordering (data preprocessing only)
     canonicalize_sketches: bool = True
-    role_n_clusters: int = 8                 # ★ role discovery: k-means cluster 수
+    role_n_clusters: int = 8                 # ★ role discovery: k-means cluster 수 (fallback)
+    use_json_names: bool = True              # JSON metadata.solids[i].name 으로 role 결정 (k-means 우선)
 
     # ★ Essential cluster enforcement
     enforce_essentials: bool = True          # 디코딩 후 누락된 essential cluster 자동 보강
@@ -713,7 +714,104 @@ def canonicalize_by_roles(tokens, role_ids, sketch_features=None,
     return out[:L], changed, list(order)
 
 
-def analyze_cluster_essentiality(per_sample_roles, n_total_samples, threshold=0.95):
+def build_name_based_role_clusters(all_sample_features, all_sample_names, verbose=True):
+    """JSON metadata 의 solid 이름을 그대로 role 로 사용 (k-means 대신).
+
+    이름 기반이라 노이즈 0 — 같은 이름은 같은 cluster, 끝.
+    cluster center 는 그 role 의 모든 학습 sketch feature 의 평균 (snap 시 NN 매칭용).
+
+    Args:
+        all_sample_features: list (N_samples), 각 원소는 list of 8-dim feat (or None)
+        all_sample_names: list (N_samples), 각 원소는 list of str names (or None)
+
+    Returns:
+        per_sample_role_ids: list, 각 원소는 list of int cluster_id (or None)
+        cluster_centers: (K, F) numpy or None — standardized space
+        scaler: StandardScaler or None
+        cluster_id_to_name: dict {int: str} — 결과 해석용
+    """
+    try:
+        from sklearn.preprocessing import StandardScaler
+    except ImportError:
+        if verbose:
+            print("  ⚠ sklearn 미설치 — name-based clustering skip")
+        return [None] * len(all_sample_features), None, None, {}
+
+    # 1) 모든 unique 이름 수집 → cluster_id 매핑 (정렬 순)
+    all_names_set = set()
+    for names in all_sample_names:
+        if names is None:
+            continue
+        for n in names:
+            if n:
+                all_names_set.add(n)
+    if not all_names_set:
+        if verbose:
+            print("  ⚠ no names found — name-based clustering skip")
+        return [None] * len(all_sample_features), None, None, {}
+
+    name_to_id = {n: i for i, n in enumerate(sorted(all_names_set))}
+    cluster_id_to_name = {i: n for n, i in name_to_id.items()}
+    K = len(name_to_id)
+
+    # 2) per_sample_roles
+    per_sample_roles = []
+    for names in all_sample_names:
+        if names is None:
+            per_sample_roles.append(None)
+            continue
+        roles = [name_to_id.get(n) if n else None for n in names]
+        per_sample_roles.append(roles)
+
+    # 3) feature 평균으로 cluster center 계산 (snap 단계의 NN 매칭용)
+    flat_feats = []
+    flat_labels = []
+    for feats, names in zip(all_sample_features, all_sample_names):
+        if feats is None or names is None:
+            continue
+        for f, n in zip(feats, names):
+            if f is None or not n or n not in name_to_id:
+                continue
+            flat_feats.append(f)
+            flat_labels.append(name_to_id[n])
+    if not flat_feats:
+        if verbose:
+            print("  ⚠ no feature/name pairs — skip center computation")
+        return per_sample_roles, None, None, cluster_id_to_name
+
+    X = np.asarray(flat_feats, dtype=np.float32)
+    scaler = StandardScaler().fit(X)
+    Xs = scaler.transform(X)
+
+    centers = np.zeros((K, Xs.shape[1]), dtype=np.float32)
+    counts = np.zeros(K, dtype=np.int64)
+    for x, lbl in zip(Xs, flat_labels):
+        centers[lbl] += x
+        counts[lbl] += 1
+    for k in range(K):
+        if counts[k] > 0:
+            centers[k] /= counts[k]
+
+    if verbose:
+        print(f"\n  ★ Name-based role discovery: K={K} cluster(s) from JSON names")
+        print(f"  {'id':>3s} {'name':<16s} {'count':>6s} "
+              f"{'x_cen':>7s} {'y_cen':>7s} {'z_cen':>7s} {'area':>10s}")
+        print("  " + "-" * 64)
+        for k in range(K):
+            if counts[k] == 0:
+                continue
+            mask = np.asarray(flat_labels) == k
+            m = X[mask].mean(0)
+            print(
+                f"  {k:>3d} {cluster_id_to_name[k]!r:<16s} {int(counts[k]):>6d} "
+                f"{m[0]:>7.1f} {m[1]:>7.1f} {m[2]:>7.1f} {m[3]:>10.1f}"
+            )
+        print()
+
+    return per_sample_roles, centers, scaler, cluster_id_to_name
+
+
+
     """각 cluster 가 몇 % sample 에 등장하는지 분석.
 
     Returns:
@@ -2218,6 +2316,7 @@ class JointDataset(Dataset):
         type_names=None,
         canonicalize=True,
         role_n_clusters=8,
+        use_json_names=True,
         snap_to_variants=True,
         snap_assign_max_dist=2.5,
     ):
@@ -2225,8 +2324,10 @@ class JointDataset(Dataset):
         self.max_len = max_len
         self.do_canonicalize = bool(canonicalize)
         self.role_n_clusters = int(role_n_clusters)
+        self.use_json_names = bool(use_json_names)
         self.snap_to_variants_enabled = bool(snap_to_variants)
         self.snap_assign_max_dist = float(snap_assign_max_dist)
+        self.cluster_id_to_name = {}
 
         self.json_files = []
         for f in self.npy_files:
@@ -2247,9 +2348,11 @@ class JointDataset(Dataset):
         if self.do_canonicalize:
             print(f"\n  Phase 1: extracting sketch features for {len(self.npy_files)} samples...")
             all_sample_features = []
+            all_sample_names = []
             for jf in self.json_files:
                 if jf is None or not os.path.exists(jf):
                     all_sample_features.append(None)
+                    all_sample_names.append(None)
                     continue
                 try:
                     import json as _json
@@ -2257,14 +2360,39 @@ class JointDataset(Dataset):
                         jd = _json.load(f)
                     feats = _extract_sketch_features_from_json(jd)
                     all_sample_features.append(feats)
+                    # ★ JSON metadata.solids[i].name 추출 (STEP exporter 가 박아둠)
+                    solids_meta = jd.get("metadata", {}).get("solids", [])
+                    names = [str(s.get("name", "")) for s in solids_meta]
+                    if not names or not any(names):
+                        names = None
+                    all_sample_names.append(names)
                 except Exception:
                     all_sample_features.append(None)
+                    all_sample_names.append(None)
 
-            per_sample_roles, cluster_centers, scaler = build_role_clusters(
-                all_sample_features,
-                n_clusters=self.role_n_clusters,
-                verbose=True,
+            n_with_names = sum(1 for n in all_sample_names if n is not None)
+            use_names = (
+                bool(self.use_json_names)
+                and n_with_names >= max(1, int(0.5 * len(self.npy_files)))
             )
+            if use_names:
+                print(f"  ★ Found JSON names in {n_with_names}/{len(self.npy_files)} samples "
+                      f"→ name-based role clustering (skipping k-means)")
+                per_sample_roles, cluster_centers, scaler, cluster_id_to_name = (
+                    build_name_based_role_clusters(
+                        all_sample_features, all_sample_names, verbose=True,
+                    )
+                )
+                self.cluster_id_to_name = cluster_id_to_name
+            else:
+                print(f"  ★ JSON names available in only {n_with_names}/{len(self.npy_files)} "
+                      f"samples → falling back to k-means (K={self.role_n_clusters})")
+                per_sample_roles, cluster_centers, scaler = build_role_clusters(
+                    all_sample_features,
+                    n_clusters=self.role_n_clusters,
+                    verbose=True,
+                )
+                self.cluster_id_to_name = {}
             self.role_cluster_centers = cluster_centers
             self.role_scaler = scaler
             self.per_sample_roles = per_sample_roles
@@ -2344,7 +2472,9 @@ class JointDataset(Dataset):
             print("  ★ Cluster presence (fraction of samples containing each cluster):")
             for c_id, ratio in sorted(presence.items()):
                 tag = "★ ESSENTIAL" if c_id in essential else ""
-                print(f"    cluster {c_id}: {ratio*100:5.1f}%  {tag}")
+                nm = self.cluster_id_to_name.get(c_id, "")
+                nm_tag = f"({nm!r})" if nm else ""
+                print(f"    cluster {c_id} {nm_tag}: {ratio*100:5.1f}%  {tag}")
             print(f"  Essential clusters: {essential}\n")
 
             # Templates 추출 — essential cluster 들 + 일부 nonessential 도 (도움 되는 경우)
@@ -3680,6 +3810,7 @@ def load_multitype_data(cfg, script_dir):
         type_names=type_names,
         canonicalize=getattr(cfg, "canonicalize_sketches", True),
         role_n_clusters=getattr(cfg, "role_n_clusters", 8),
+        use_json_names=getattr(cfg, "use_json_names", True),
         snap_to_variants=getattr(cfg, "snap_to_variants", True),
         snap_assign_max_dist=getattr(cfg, "snap_assign_max_dist", 2.5),
     )
@@ -3798,8 +3929,8 @@ def train_fixed_medium_var(
     print(f"  Aux numeric         : {cfg.aux_numeric}")
     print(f"  Role discovery      : "
           f"{getattr(cfg, 'canonicalize_sketches', True)} "
-          f"(k-means K={getattr(cfg, 'role_n_clusters', 8)}, "
-          f"reorder by role_id)")
+          f"(use_json_names={getattr(cfg, 'use_json_names', True)}, "
+          f"k-means fallback K={getattr(cfg, 'role_n_clusters', 8)})")
     print(f"  Latent noise std    : {getattr(cfg, 'latent_noise_std', 0.0)} "
           f"({'ON, decoder smoothing' if getattr(cfg, 'latent_noise_std', 0.0) > 0 else 'OFF'})")
     print(f"  Variant snap        : {getattr(cfg, 'snap_to_variants', True)} "
