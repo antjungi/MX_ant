@@ -3722,6 +3722,211 @@ def visualize_inverse_design_curve(result):
     print(f"  ✓ inverse design curve figure 생성")
 
 
+# ══════════════════════════════════════════════════════════════
+# ★ Decoded structure cleanup — degenerate/duplicate sketch filter
+# ══════════════════════════════════════════════════════════════
+def _compute_sketch_chunk_stats(chunk, sk_meta):
+    """SOL ... EXT 청크 한 개를 walk 해서 real-coord stats 계산.
+
+    Returns dict with:
+      perimeter (mm), n_edges, max_arc_sweep_deg, min_edge_mm, max_edge_mm,
+      center_2d_in_sketch (mid of all points)
+    """
+    cur_2d = (0.0, 0.0)
+    edge_lengths = []
+    arc_sweeps = []
+    pts = []
+
+    for row in chunk:
+        cmd = int(row[0])
+        p = row[1:]
+        if cmd == SOL:
+            cur_2d = (0.0, 0.0)
+        elif cmd == LINE:
+            if p[0] < 0 or p[1] < 0:
+                continue
+            ex = _dequant(p[0], sk_meta["xy_min"][0], sk_meta["xy_max"][0])
+            ey = _dequant(p[1], sk_meta["xy_min"][1], sk_meta["xy_max"][1])
+            sx, sy = cur_2d
+            length = math.sqrt((ex - sx) ** 2 + (ey - sy) ** 2)
+            edge_lengths.append(length)
+            pts.append((ex, ey))
+            cur_2d = (ex, ey)
+        elif cmd == ARC:
+            if any(p[i] < 0 for i in range(4)):
+                continue
+            mx = _dequant(p[0], sk_meta["xy_min"][0], sk_meta["xy_max"][0])
+            my = _dequant(p[1], sk_meta["xy_min"][1], sk_meta["xy_max"][1])
+            ex = _dequant(p[2], sk_meta["xy_min"][0], sk_meta["xy_max"][0])
+            ey = _dequant(p[3], sk_meta["xy_min"][1], sk_meta["xy_max"][1])
+            sx, sy = cur_2d
+            D = 2 * (sx * (my - ey) + mx * (ey - sy) + ex * (sy - my))
+            if abs(D) > 1e-9:
+                ux = ((sx ** 2 + sy ** 2) * (my - ey)
+                      + (mx ** 2 + my ** 2) * (ey - sy)
+                      + (ex ** 2 + ey ** 2) * (sy - my)) / D
+                uy = ((sx ** 2 + sy ** 2) * (ex - mx)
+                      + (mx ** 2 + my ** 2) * (sx - ex)
+                      + (ex ** 2 + ey ** 2) * (mx - sx)) / D
+                r = math.sqrt((sx - ux) ** 2 + (sy - uy) ** 2)
+                a1 = math.atan2(sy - uy, sx - ux)
+                a2 = math.atan2(ey - uy, ex - ux)
+                am = math.atan2(my - uy, mx - ux)
+
+                def _fix(a, ref):
+                    while a - ref > math.pi:
+                        a -= 2 * math.pi
+                    while a - ref < -math.pi:
+                        a += 2 * math.pi
+                    return a
+                am_f = _fix(am, a1)
+                a2_f = _fix(a2, a1)
+                if not (min(a1, a2_f) <= am_f <= max(a1, a2_f)):
+                    a2_f = a2_f - 2 * math.pi if a2_f > a1 else a2_f + 2 * math.pi
+                sweep = abs(a2_f - a1)
+                arc_sweeps.append(math.degrees(sweep))
+                edge_lengths.append(r * sweep)
+                pts.append((mx, my))
+                pts.append((ex, ey))
+                cur_2d = (ex, ey)
+        elif cmd == CIRCLE:
+            if any(p[i] < 0 for i in range(3)):
+                continue
+            cx = _dequant(p[0], sk_meta["xy_min"][0], sk_meta["xy_max"][0])
+            cy = _dequant(p[1], sk_meta["xy_min"][1], sk_meta["xy_max"][1])
+            r = (p[2] / QMAX) * sk_meta["sk_scale"]
+            edge_lengths.append(2 * math.pi * r)
+            pts.append((cx, cy))
+        elif cmd == EXT:
+            break
+
+    perimeter = sum(edge_lengths)
+    return {
+        "perimeter": perimeter,
+        "n_edges": len(edge_lengths),
+        "max_arc_sweep": max(arc_sweeps) if arc_sweeps else 0.0,
+        "min_edge": min(edge_lengths) if edge_lengths else 0.0,
+        "max_edge": max(edge_lengths) if edge_lengths else 0.0,
+        "n_pts": len(pts),
+    }
+
+
+def cleanup_decoded_structure(
+    tokens, dq_meta,
+    min_perimeter_mm=3.0,
+    max_arc_sweep_deg=200.0,
+    min_arc_sweep_deg=3.0,
+    dedup_pos_tol_mm=2.0,
+    min_edge_mm=0.2,
+    verbose=True,
+):
+    """디코딩된 토큰의 비정상 / 중복 sketch 를 필터링.
+
+    Filters:
+      (1) perimeter < min_perimeter_mm   → degenerate (사라진 sketch)
+      (2) arc sweep > max_arc_sweep_deg or < min_arc_sweep_deg → 비정상 arc
+      (3) 가장 작은 edge < min_edge_mm 인 sketch (decoder hallucination 작은 fragments)
+      (4) 같은 3D 위치 (≤ dedup_pos_tol_mm) → 중복
+
+    Returns: (cleaned_tokens, info_dict)
+    """
+    if dq_meta is None:
+        return tokens, {"filtered": 0, "kept": -1, "reasons": []}
+
+    chunks, tail = _split_sketch_chunks(tokens)
+    if not chunks:
+        return tokens, {"filtered": 0, "kept": 0, "reasons": []}
+
+    sk_metas = list(dq_meta["sketches"])
+    # sk_metas 부족하면 마지막 것 반복
+    while len(sk_metas) < len(chunks):
+        sk_metas.append(dict(sk_metas[-1]) if sk_metas else None)
+
+    valid_chunks = []
+    valid_centers = []
+    reasons = []
+
+    for i, chunk in enumerate(chunks):
+        sk_meta = sk_metas[i]
+        if sk_meta is None:
+            valid_chunks.append(chunk)
+            continue
+
+        stats = _compute_sketch_chunk_stats(chunk, sk_meta)
+
+        # Rule 1: degenerate perimeter
+        if stats["perimeter"] < min_perimeter_mm:
+            reasons.append(
+                (i, f"degenerate: perimeter={stats['perimeter']:.2f}mm "
+                    f"< {min_perimeter_mm}mm")
+            )
+            continue
+        # Rule 2: abnormal arc sweep
+        if stats["max_arc_sweep"] > max_arc_sweep_deg:
+            reasons.append(
+                (i, f"bad arc: max sweep={stats['max_arc_sweep']:.1f}° "
+                    f"> {max_arc_sweep_deg}°")
+            )
+            continue
+        # Rule 3: tiny edge (hallucination)
+        if 0 < stats["min_edge"] < min_edge_mm:
+            # 너무 작은 edge 가 있는 sketch (전체적으론 ok 인데 작은 fragments 끼어있음)
+            # 일단 통과시키지만 경고
+            # 만약 perimeter 가 작은 경우는 위 Rule 1 에서 걸림
+            pass
+
+        # Rule 4: deduplicate by 3D center
+        origin = np.asarray(sk_meta["origin"], dtype=float)
+        z_axis = np.asarray(sk_meta["z_axis"], dtype=float)
+        zn = z_axis / (np.linalg.norm(z_axis) + 1e-12)
+        ext_row = chunk[-1]
+        e1q = int(ext_row[1 + P_E1])
+        e1_val = _dequant(e1q, 0, dq_meta["max_ext"]) if e1q >= 0 else 0.0
+        # rough center: origin + (e1/2) * normal — 같은 sketch 면 거의 일치
+        center = origin + zn * (e1_val * 0.5)
+
+        is_dup = False
+        for j, c in enumerate(valid_centers):
+            if np.linalg.norm(center - c) < dedup_pos_tol_mm:
+                is_dup = True
+                reasons.append(
+                    (i, f"duplicate of kept-sketch (within {dedup_pos_tol_mm}mm)")
+                )
+                break
+        if is_dup:
+            continue
+
+        valid_chunks.append(chunk)
+        valid_centers.append(center)
+
+    n_filtered = len(chunks) - len(valid_chunks)
+    if verbose and n_filtered > 0:
+        print(f"  ★ cleanup: removed {n_filtered}/{len(chunks)} degenerate/duplicate sketches")
+        for idx, reason in reasons:
+            print(f"    sketch[{idx}] → REMOVED: {reason}")
+
+    if not valid_chunks:
+        # 전부 필터되면 원본 그대로 반환 (안전장치)
+        return tokens, {"filtered": 0, "kept": len(chunks), "reasons": reasons,
+                        "fallback_to_raw": True}
+
+    out_parts = valid_chunks + ([tail] if tail.size else [])
+    out = np.concatenate(out_parts, axis=0)
+    # 원본 길이로 패딩
+    L = len(tokens)
+    if out.shape[0] < L:
+        pad = np.full((L - out.shape[0], 17), PAD_V, dtype=tokens.dtype)
+        out = np.concatenate([out, pad], axis=0)
+    out = out[:L]
+
+    info = {
+        "filtered": n_filtered,
+        "kept": len(valid_chunks),
+        "reasons": reasons,
+    }
+    return out, info
+
+
 def extract_decoded_dimensions(tokens, dq_meta):
     """Decoded tokens → 실좌표(mm) 단위의 dimension list.
     - tokens_to_real_sketches() 와 달리 ARC/CIRCLE 을 polyline 화 하지 않고
@@ -4022,6 +4227,16 @@ def visualize_decoded_structure(
 
     if dq_meta is not None and n_ext > 0:
         dq_meta = _extend_dequant_meta(dq_meta, max(n_ext, len(dq_meta["sketches"])))
+        # ★ Post-decoding cleanup: degenerate/duplicate sketch 필터링
+        recon_trim, cleanup_info = cleanup_decoded_structure(
+            recon_trim, dq_meta,
+            min_perimeter_mm=3.0,
+            max_arc_sweep_deg=200.0,
+            dedup_pos_tol_mm=2.0,
+            verbose=True,
+        )
+        # cleanup 후 EXT 개수 재계산
+        n_ext = int((recon_trim[:, 0] == EXT).sum())
         sketches = tokens_to_real_sketches(recon_trim, dq_meta)
         use_real = True
         coord_label = "real coord (mm)"

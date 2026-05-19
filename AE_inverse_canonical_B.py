@@ -3958,6 +3958,129 @@ def visualize_inverse_design_curve(result):
     print(f"  ✓ inverse design curve figure 생성")
 
 
+# ══════════════════════════════════════════════════════════════
+# ★ Decoded structure cleanup
+# ══════════════════════════════════════════════════════════════
+def _compute_sketch_chunk_stats(chunk, sk_meta):
+    cur_2d = (0.0, 0.0)
+    edge_lengths = []
+    arc_sweeps = []
+    for row in chunk:
+        cmd = int(row[0])
+        p = row[1:]
+        if cmd == SOL:
+            cur_2d = (0.0, 0.0)
+        elif cmd == LINE:
+            if p[0] < 0 or p[1] < 0:
+                continue
+            ex = _dequant(p[0], sk_meta["xy_min"][0], sk_meta["xy_max"][0])
+            ey = _dequant(p[1], sk_meta["xy_min"][1], sk_meta["xy_max"][1])
+            sx, sy = cur_2d
+            edge_lengths.append(math.sqrt((ex - sx) ** 2 + (ey - sy) ** 2))
+            cur_2d = (ex, ey)
+        elif cmd == ARC:
+            if any(p[i] < 0 for i in range(4)):
+                continue
+            mx = _dequant(p[0], sk_meta["xy_min"][0], sk_meta["xy_max"][0])
+            my = _dequant(p[1], sk_meta["xy_min"][1], sk_meta["xy_max"][1])
+            ex = _dequant(p[2], sk_meta["xy_min"][0], sk_meta["xy_max"][0])
+            ey = _dequant(p[3], sk_meta["xy_min"][1], sk_meta["xy_max"][1])
+            sx, sy = cur_2d
+            D = 2 * (sx * (my - ey) + mx * (ey - sy) + ex * (sy - my))
+            if abs(D) > 1e-9:
+                ux = ((sx**2+sy**2)*(my-ey) + (mx**2+my**2)*(ey-sy) + (ex**2+ey**2)*(sy-my)) / D
+                uy = ((sx**2+sy**2)*(ex-mx) + (mx**2+my**2)*(sx-ex) + (ex**2+ey**2)*(mx-sx)) / D
+                r = math.sqrt((sx - ux)**2 + (sy - uy)**2)
+                a1 = math.atan2(sy - uy, sx - ux)
+                a2 = math.atan2(ey - uy, ex - ux)
+                am = math.atan2(my - uy, mx - ux)
+                def _fix(a, ref):
+                    while a - ref > math.pi: a -= 2 * math.pi
+                    while a - ref < -math.pi: a += 2 * math.pi
+                    return a
+                am_f = _fix(am, a1); a2_f = _fix(a2, a1)
+                if not (min(a1, a2_f) <= am_f <= max(a1, a2_f)):
+                    a2_f = a2_f - 2 * math.pi if a2_f > a1 else a2_f + 2 * math.pi
+                sweep = abs(a2_f - a1)
+                arc_sweeps.append(math.degrees(sweep))
+                edge_lengths.append(r * sweep)
+                cur_2d = (ex, ey)
+        elif cmd == CIRCLE:
+            if any(p[i] < 0 for i in range(3)):
+                continue
+            r = (p[2] / QMAX) * sk_meta["sk_scale"]
+            edge_lengths.append(2 * math.pi * r)
+        elif cmd == EXT:
+            break
+    return {
+        "perimeter": sum(edge_lengths),
+        "n_edges": len(edge_lengths),
+        "max_arc_sweep": max(arc_sweeps) if arc_sweeps else 0.0,
+        "min_edge": min(edge_lengths) if edge_lengths else 0.0,
+        "max_edge": max(edge_lengths) if edge_lengths else 0.0,
+    }
+
+
+def cleanup_decoded_structure(tokens, dq_meta,
+                              min_perimeter_mm=3.0,
+                              max_arc_sweep_deg=200.0,
+                              dedup_pos_tol_mm=2.0,
+                              verbose=True):
+    if dq_meta is None:
+        return tokens, {"filtered": 0, "kept": -1, "reasons": []}
+    chunks, tail = _split_sketch_chunks(tokens)
+    if not chunks:
+        return tokens, {"filtered": 0, "kept": 0, "reasons": []}
+    sk_metas = list(dq_meta["sketches"])
+    while len(sk_metas) < len(chunks):
+        sk_metas.append(dict(sk_metas[-1]) if sk_metas else None)
+    valid_chunks, valid_centers, reasons = [], [], []
+    for i, chunk in enumerate(chunks):
+        sk_meta = sk_metas[i]
+        if sk_meta is None:
+            valid_chunks.append(chunk)
+            continue
+        stats = _compute_sketch_chunk_stats(chunk, sk_meta)
+        if stats["perimeter"] < min_perimeter_mm:
+            reasons.append((i, f"degenerate: perimeter={stats['perimeter']:.2f}mm"))
+            continue
+        if stats["max_arc_sweep"] > max_arc_sweep_deg:
+            reasons.append((i, f"bad arc: sweep={stats['max_arc_sweep']:.1f}°"))
+            continue
+        origin = np.asarray(sk_meta["origin"], dtype=float)
+        z_axis = np.asarray(sk_meta["z_axis"], dtype=float)
+        zn = z_axis / (np.linalg.norm(z_axis) + 1e-12)
+        ext_row = chunk[-1]
+        e1q = int(ext_row[1 + P_E1])
+        e1_val = _dequant(e1q, 0, dq_meta["max_ext"]) if e1q >= 0 else 0.0
+        center = origin + zn * (e1_val * 0.5)
+        is_dup = False
+        for c in valid_centers:
+            if np.linalg.norm(center - c) < dedup_pos_tol_mm:
+                is_dup = True
+                reasons.append((i, f"duplicate (within {dedup_pos_tol_mm}mm)"))
+                break
+        if is_dup:
+            continue
+        valid_chunks.append(chunk)
+        valid_centers.append(center)
+    n_filtered = len(chunks) - len(valid_chunks)
+    if verbose and n_filtered > 0:
+        print(f"  ★ cleanup: removed {n_filtered}/{len(chunks)} sketches")
+        for idx, reason in reasons:
+            print(f"    sketch[{idx}] → REMOVED: {reason}")
+    if not valid_chunks:
+        return tokens, {"filtered": 0, "kept": len(chunks), "reasons": reasons,
+                        "fallback_to_raw": True}
+    out_parts = valid_chunks + ([tail] if tail.size else [])
+    out = np.concatenate(out_parts, axis=0)
+    L = len(tokens)
+    if out.shape[0] < L:
+        pad = np.full((L - out.shape[0], 17), PAD_V, dtype=tokens.dtype)
+        out = np.concatenate([out, pad], axis=0)
+    return out[:L], {"filtered": n_filtered, "kept": len(valid_chunks), "reasons": reasons}
+
+
 def extract_decoded_dimensions(tokens, dq_meta):
     """Decoded tokens → 실좌표(mm) 단위의 dimension list.
     - tokens_to_real_sketches() 와 달리 ARC/CIRCLE 을 polyline 화 하지 않고
@@ -4258,6 +4381,13 @@ def visualize_decoded_structure(
 
     if dq_meta is not None and n_ext > 0:
         dq_meta = _extend_dequant_meta(dq_meta, max(n_ext, len(dq_meta["sketches"])))
+        # ★ Post-decoding cleanup
+        recon_trim, _cleanup_info = cleanup_decoded_structure(
+            recon_trim, dq_meta,
+            min_perimeter_mm=3.0, max_arc_sweep_deg=200.0,
+            dedup_pos_tol_mm=2.0, verbose=True,
+        )
+        n_ext = int((recon_trim[:, 0] == EXT).sum())
         sketches = tokens_to_real_sketches(recon_trim, dq_meta)
         use_real = True
         coord_label = "real coord (mm)"
