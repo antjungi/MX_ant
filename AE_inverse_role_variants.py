@@ -6,19 +6,19 @@ DeepCAD AE + Return-3 Common-Curve Residual Surrogate  —  role + variant snap
 
 base = AE_inverse_role.py (role discovery + essential enforcement) 에서 파생.
 
-★ 새 컨셉: Variant snapping
+★ 새 컨셉: Variant snapping (full enforce)
   - 각 cluster (= role) 마다 학습 데이터에 등장한 "구조적 변형 (variant)" 들을
     discrete 하게 수집한다 (예: frame 은 3개 variant, GND 는 2개 variant).
-  - Variant signature = (n_lines, n_arcs, n_circles) — topology fingerprint.
+  - Variant signature = (n_lines, n_arcs, n_circles, n_loops) — topology fingerprint.
   - 디코딩 후 각 sketch chunk 에 대해:
-      1) cluster 할당
-      2) 그 cluster 의 variant 들 중 가장 가까운 것을 선택
-      3) topology 가 정확히 일치하면 → decoder 가 만든 chunk 를 그대로 사용
-         (수치 변형은 허용)
-      4) 일치하지 않으면 → 그 variant 의 학습 template chunk 로 snap
-         (구조적으로 학습된 형태에서만 파생)
-  - 결과: 새 조합은 가능 (예: type1 frame + type3 GND) 하지만, 완전히
-    novel 한 구조는 생성하지 않음 → 디코딩 안정성 ↑
+      1) cluster 할당 (decoder feature → cluster id)
+      2) 그 cluster 의 variant 중 signature L1-distance 가 최소인 variant 선택
+      3) 그 variant 의 templates 중 decoded chunk 의 feature 와 가장 가까운 것 선택
+      4) ★ 무조건 ★ 그 template 으로 교체 (decoder 가 만든 토큰은 폐기)
+  - 결과: 모든 chunk 는 실제 학습 시퀀스. 새 조합 (type1 frame + type3 GND 등) 은
+    가능하지만, 각 chunk 의 수치까지 모두 학습 데이터의 그대로 → 디코딩 안정성 최대.
+  - Decoder 의 역할은 (a) 어느 cluster 인지, (b) 어느 variant 와 가까운지,
+    (c) 그 variant 안에서 어느 특정 template 인지 만 결정 — "신호" 역할.
 
 요구사항:
   - scikit-learn (k-means 용): pip install scikit-learn
@@ -190,12 +190,11 @@ class CFG:
     essential_threshold: float = 0.95        # 이 fraction 이상 sample 에 등장 = essential
     essential_assign_max_dist: float = 2.5   # decoded sketch cluster 할당 거리 임계 (standardized)
 
-    # ★ Variant snapping (이 파일의 새 기능)
-    #   디코딩 후 각 chunk 를 그 cluster 의 학습 variant 로 snap.
-    #   topology 일치 시 decoder chunk 유지, 불일치 시 template 교체.
+    # ★ Variant snapping (이 파일의 새 기능, full enforce 모드)
+    #   디코딩 후 모든 chunk 를 학습 variant template 으로 교체.
+    #   decoder 는 cluster/variant/specific-template 선택에만 영향.
     snap_to_variants: bool = True
-    snap_keep_on_exact_match: bool = True    # signature 정확 일치 시 decoder 결과 유지
-    snap_assign_max_dist: float = 2.5        # cluster 할당 거리 임계 (snap 용)
+    snap_assign_max_dist: float = 2.5        # cluster 할당 거리 임계
 
     # ★ Latent noise injection (학습 중 decoder 부드럽게)
     #   0.0 = 사용 안 함. 권장: 0.05 ~ 0.15
@@ -775,45 +774,70 @@ def _chunk_topology_signature(chunk_tokens):
 
 
 def discover_variants_per_cluster(per_sample_roles, raw_tokens_list, cluster_ids,
-                                   verbose=True):
+                                   all_sample_features=None, verbose=True):
     """각 cluster 안에서 chunk 들을 topology signature 별로 묶어 variant 발견.
 
-    Returns: dict {
-        cluster_id: list of variant dicts, each {
-            "signature": (n_line, n_arc, n_circle, n_sol),
-            "count": int,                  # 학습 데이터 중 등장 횟수
-            "templates": [chunk_tokens, ...],  # 같은 variant 의 모든 chunk
+    Returns:
+        cluster_variants: dict {
+            cluster_id: list of variant dicts, each {
+                "signature": (n_line, n_arc, n_circle, n_sol),
+                "count": int,                  # 학습 데이터 중 등장 횟수
+                "templates": [chunk_tokens, ...],  # 같은 variant 의 모든 chunk
+            }
         }
-    }
+        template_feats: dict {
+            cluster_id: {
+                signature: np.ndarray (n_templates, 8) — 각 template 의 raw feature
+            }
+        }   (snap 단계에서 decoder feature 와 NN 매칭에 사용)
     """
-    raw_by_cluster = {c: [] for c in cluster_ids}
+    raw_by_cluster = {c: [] for c in cluster_ids}     # list of (chunk, feat_or_None)
     for s_idx, roles in enumerate(per_sample_roles):
         if roles is None:
             continue
         tokens = raw_tokens_list[s_idx]
         chunks, _tail = _split_sketch_chunks(tokens)
+        sample_feats = (
+            all_sample_features[s_idx]
+            if all_sample_features is not None and s_idx < len(all_sample_features)
+            else None
+        )
         for k, c_id in enumerate(roles):
             if c_id is None or c_id not in raw_by_cluster:
                 continue
             if k < len(chunks):
-                raw_by_cluster[c_id].append(chunks[k].copy())
+                feat = None
+                if sample_feats is not None and k < len(sample_feats):
+                    feat = sample_feats[k]
+                raw_by_cluster[c_id].append((chunks[k].copy(), feat))
 
     cluster_variants = {}
-    for c_id, chunk_list in raw_by_cluster.items():
-        sig_groups = {}
-        for ch in chunk_list:
+    template_feats = {}
+    for c_id, items in raw_by_cluster.items():
+        sig_groups = {}     # sig -> list of (chunk, feat)
+        for ch, ft in items:
             sig = _chunk_topology_signature(ch)
-            sig_groups.setdefault(sig, []).append(ch)
+            sig_groups.setdefault(sig, []).append((ch, ft))
         variants = []
+        feats_by_sig = {}
         for sig, group in sorted(
             sig_groups.items(), key=lambda kv: -len(kv[1])
         ):
+            tpl_chunks = [g[0] for g in group]
+            tpl_fts = [g[1] for g in group]
             variants.append({
                 "signature": sig,
                 "count": len(group),
-                "templates": group,
+                "templates": tpl_chunks,
             })
+            # feature 가 None 인 것은 zero-vector 로 채움 (raw_scaler 가 처리)
+            feat_arr = np.stack([
+                ft if ft is not None else np.zeros(8, dtype=np.float32)
+                for ft in tpl_fts
+            ], axis=0).astype(np.float32)
+            feats_by_sig[sig] = feat_arr
         cluster_variants[c_id] = variants
+        template_feats[c_id] = feats_by_sig
 
     if verbose:
         print("  ★ Variant discovery per cluster:")
@@ -828,43 +852,44 @@ def discover_variants_per_cluster(per_sample_roles, raw_tokens_list, cluster_ids
                     f"  count={v['count']}"
                 )
         print()
-    return cluster_variants
+    return cluster_variants, template_feats
 
 
 def snap_decoded_to_variants(
     decoded_tokens, dq_meta,
-    cluster_variants,
+    cluster_variants, cluster_variant_template_feats,
     role_scaler, role_cluster_centers,
     max_assign_dist=2.5,
-    keep_decoder_on_exact_match=True,
     verbose=True,
 ):
-    """디코딩된 각 sketch chunk 를 그 cluster 의 가장 가까운 variant 로 snap.
+    """디코딩된 각 sketch chunk 를 그 cluster 의 학습 variant template 으로 강제 교체.
+
+    "어중띠게 keep" 안 함 — 모든 chunk 는 실제 학습 시퀀스 chunk 로 교체된다.
+    Decoder 의 역할: (1) 어느 cluster 인지, (2) 어느 variant signature 와 가까운지,
+    (3) 그 variant 안에서 어느 특정 template (위치/크기) 와 가까운지 만 결정.
 
     동작:
-      1) chunk 마다 feature 로 cluster 할당 (너무 멀면 unassigned → 그대로 둠)
-      2) 그 cluster 의 variant 들 중:
-         - decoded signature 가 어떤 variant 와 정확 일치 →
-           keep_decoder_on_exact_match=True 면 decoder chunk 유지 (수치 변형 허용)
-         - 불일치 → 가장 가까운 variant 의 template 으로 교체
+      1) chunk feature 로 cluster 할당 (너무 멀면 unassigned → 그대로 둠)
+      2) 그 cluster 의 variant 들 중 signature L1-distance 가 최소인 variant 선택
+         (동률이면 count 가 더 많은 = 더 흔한 variant 우선)
+      3) 그 variant 의 templates 중 decoded chunk 의 feature 와 가장 가까운 것 선택
+      4) 무조건 그 template 으로 교체 (decoder chunk 폐기)
 
     Returns: (snapped_tokens, info_dict)
     """
     if (dq_meta is None or role_scaler is None or role_cluster_centers is None
             or not cluster_variants):
-        return decoded_tokens, {"snapped": 0, "kept": 0, "unassigned": 0, "details": []}
+        return decoded_tokens, {"snapped": 0, "unassigned": 0, "details": []}
 
     chunks, tail = _split_sketch_chunks(decoded_tokens)
     decoded_feats = _extract_features_from_decoded(decoded_tokens, dq_meta)
     if decoded_feats is None:
-        return decoded_tokens, {"snapped": 0, "kept": 0, "unassigned": 0, "details": []}
+        return decoded_tokens, {"snapped": 0, "unassigned": 0, "details": []}
 
     centers = np.asarray(role_cluster_centers)
-    rng = np.random.default_rng(0)
 
     out_chunks = []
     n_snap = 0
-    n_keep = 0
     n_unassigned = 0
     details = []
 
@@ -895,32 +920,42 @@ def snap_decoded_to_variants(
             details.append(f"sk{i}: cluster {nn_c} no variants → kept as-is")
             continue
 
+        # (2) signature L1 distance 가 최소인 variant; 동률은 count desc
         dec_sig = _chunk_topology_signature(ch)
-        exact = next((v for v in variants if v["signature"] == dec_sig), None)
+        dec_sig_arr = np.asarray(dec_sig, dtype=np.int64)
+        best_v = None
+        best_key = None
+        for v in variants:
+            sig_arr = np.asarray(v["signature"], dtype=np.int64)
+            sig_dist = int(np.abs(sig_arr - dec_sig_arr).sum())
+            key = (sig_dist, -int(v["count"]))
+            if best_key is None or key < best_key:
+                best_key = key
+                best_v = v
 
-        if exact is not None and keep_decoder_on_exact_match:
-            out_chunks.append(ch)
-            n_keep += 1
-            details.append(
-                f"sk{i}: cluster {nn_c} exact-match {dec_sig} "
-                f"(count={exact['count']}) → kept decoder chunk"
-            )
-        else:
-            # snap: 가장 등장 많은 variant (= variants[0]) 의 template
-            best_v = variants[0]
-            tpl_list = best_v["templates"]
-            pick = rng.integers(0, len(tpl_list))
-            template_chunk = tpl_list[pick].copy()
-            out_chunks.append(template_chunk)
-            n_snap += 1
-            details.append(
-                f"sk{i}: cluster {nn_c} dec_sig={dec_sig} → snap to "
-                f"variant {best_v['signature']} (count={best_v['count']})"
-            )
+        # (3) variant 안에서 decoded feature 와 가장 가까운 template 선택
+        tpl_feats = cluster_variant_template_feats.get(nn_c, {}).get(
+            best_v["signature"], None
+        )
+        templates = best_v["templates"]
+        pick = 0
+        if tpl_feats is not None and len(tpl_feats) == len(templates):
+            tpl_feats_scaled = role_scaler.transform(np.asarray(tpl_feats))
+            tpl_d = np.linalg.norm(tpl_feats_scaled - feat_scaled, axis=1)
+            pick = int(np.argmin(tpl_d))
+        template_chunk = templates[pick].copy()
+        out_chunks.append(template_chunk)
+        n_snap += 1
+        sig_dist_val = best_key[0]
+        details.append(
+            f"sk{i}: cluster {nn_c} dec_sig={dec_sig} → "
+            f"variant {best_v['signature']} (sig_dist={sig_dist_val}, "
+            f"count={best_v['count']}, tpl_pick={pick}/{len(templates)}) → replaced"
+        )
 
     if verbose:
         print(
-            f"  ★ variant-snap: kept={n_keep}, snapped={n_snap}, "
+            f"  ★ variant-snap (full enforce): snapped={n_snap}, "
             f"unassigned={n_unassigned} (of {len(chunks)} chunks)"
         )
         for d in details:
@@ -928,7 +963,7 @@ def snap_decoded_to_variants(
 
     if not out_chunks:
         return decoded_tokens, {
-            "snapped": 0, "kept": 0, "unassigned": 0, "details": details,
+            "snapped": 0, "unassigned": 0, "details": details,
         }
 
     out_parts = out_chunks + ([tail] if tail.size else [])
@@ -938,8 +973,7 @@ def snap_decoded_to_variants(
         pad = np.full((L - out.shape[0], 17), PAD_V, dtype=decoded_tokens.dtype)
         out = np.concatenate([out, pad], axis=0)
     return out[:L], {
-        "snapped": n_snap, "kept": n_keep, "unassigned": n_unassigned,
-        "details": details,
+        "snapped": n_snap, "unassigned": n_unassigned, "details": details,
     }
 
 
@@ -2185,7 +2219,6 @@ class JointDataset(Dataset):
         canonicalize=True,
         role_n_clusters=8,
         snap_to_variants=True,
-        snap_keep_on_exact_match=True,
         snap_assign_max_dist=2.5,
     ):
         self.npy_files = list(npy_files)
@@ -2193,7 +2226,6 @@ class JointDataset(Dataset):
         self.do_canonicalize = bool(canonicalize)
         self.role_n_clusters = int(role_n_clusters)
         self.snap_to_variants_enabled = bool(snap_to_variants)
-        self.snap_keep_on_exact_match = bool(snap_keep_on_exact_match)
         self.snap_assign_max_dist = float(snap_assign_max_dist)
 
         self.json_files = []
@@ -2301,6 +2333,7 @@ class JointDataset(Dataset):
         self.essential_cluster_ids = []
         self.cluster_templates = {}
         self.cluster_variants = {}
+        self.cluster_variant_template_feats = {}
         if self.do_canonicalize and self.role_cluster_centers is not None:
             essential, presence = analyze_cluster_essentiality(
                 self.per_sample_roles,
@@ -2321,10 +2354,14 @@ class JointDataset(Dataset):
             )
 
             # ★ Variant discovery — 각 cluster 안에서 topology signature 별로 묶음
-            self.cluster_variants = discover_variants_per_cluster(
-                self.per_sample_roles, self.raw,
-                cluster_ids=set(presence.keys()),
-                verbose=True,
+            #   template_feats: variant 안에서 decoder feature 와 NN 매칭용
+            self.cluster_variants, self.cluster_variant_template_feats = (
+                discover_variants_per_cluster(
+                    self.per_sample_roles, self.raw,
+                    cluster_ids=set(presence.keys()),
+                    all_sample_features=all_sample_features,
+                    verbose=True,
+                )
             )
 
         self.sparam_db = sparam_db.astype(np.float32)
@@ -3644,7 +3681,6 @@ def load_multitype_data(cfg, script_dir):
         canonicalize=getattr(cfg, "canonicalize_sketches", True),
         role_n_clusters=getattr(cfg, "role_n_clusters", 8),
         snap_to_variants=getattr(cfg, "snap_to_variants", True),
-        snap_keep_on_exact_match=getattr(cfg, "snap_keep_on_exact_match", True),
         snap_assign_max_dist=getattr(cfg, "snap_assign_max_dist", 2.5),
     )
 
@@ -3767,8 +3803,7 @@ def train_fixed_medium_var(
     print(f"  Latent noise std    : {getattr(cfg, 'latent_noise_std', 0.0)} "
           f"({'ON, decoder smoothing' if getattr(cfg, 'latent_noise_std', 0.0) > 0 else 'OFF'})")
     print(f"  Variant snap        : {getattr(cfg, 'snap_to_variants', True)} "
-          f"(keep_on_exact_match={getattr(cfg, 'snap_keep_on_exact_match', True)}, "
-          f"max_dist={getattr(cfg, 'snap_assign_max_dist', 2.5)})")
+          f"(full enforce, max_dist={getattr(cfg, 'snap_assign_max_dist', 2.5)})")
     print(f"  selected output dim : {cfg.n_freq * 3}")
     print(f"  full target dim     : {cfg.raw_n_freq * 3}")
 
@@ -5007,19 +5042,19 @@ def visualize_decoded_structure(
             if n_ext_after > len(dq_meta["sketches"]):
                 dq_meta = _extend_dequant_meta(dq_meta, n_ext_after)
 
-        # ★ Variant snapping: 각 chunk 를 그 cluster 의 학습 variant 로 snap
+        # ★ Variant snapping (full enforce): 모든 chunk 를 학습 variant template 으로 교체
         if (getattr(dataset, "snap_to_variants_enabled", True)
                 and getattr(dataset, "cluster_variants", None)
                 and getattr(dataset, "role_scaler", None) is not None):
             recon_trim, _snap_info = snap_decoded_to_variants(
                 recon_trim, dq_meta,
                 cluster_variants=dataset.cluster_variants,
+                cluster_variant_template_feats=getattr(
+                    dataset, "cluster_variant_template_feats", {}
+                ),
                 role_scaler=dataset.role_scaler,
                 role_cluster_centers=dataset.role_cluster_centers,
                 max_assign_dist=getattr(dataset, "snap_assign_max_dist", 2.5),
-                keep_decoder_on_exact_match=getattr(
-                    dataset, "snap_keep_on_exact_match", True
-                ),
                 verbose=True,
             )
             n_ext_after = int((recon_trim[:, 0] == EXT).sum())
