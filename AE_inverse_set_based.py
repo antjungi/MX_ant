@@ -2727,7 +2727,12 @@ def vicreg_z_loss(z, var_target=1.0, eps=1e-4):
 # ══════════════════════════════════════════════════════════════
 # Epoch
 # ══════════════════════════════════════════════════════════════
-def run_epoch(ae, mlp, loader, optimizer, device, cfg, interp_w, train_mode=True):
+def run_epoch(ae, mlp, loader, optimizer, device, cfg, interp_w,
+              train_mode=True, epoch=0, slot_init_cluster_ids=None):
+    """Set-based 학습 epoch.
+    - 8-tuple batch (encoder input + sk_tokens + sk_summary + sk_count + sk_cluster_ids)
+    - set_based_ae_loss with curriculum (epoch 기반 token weight ramp)
+    """
     if train_mode:
         ae.train(); mlp.train()
     else:
@@ -2737,6 +2742,7 @@ def run_epoch(ae, mlp, loader, optimizer, device, cfg, interp_w, train_mode=True
         "total": 0.0, "ae": 0.0, "sp": 0.0,
         "rmse_db_full": 0.0, "rmse_db_sel": 0.0,
         "cmd": 0.0, "prm": 0.0, "aux": 0.0,
+        "active": 0.0, "summary": 0.0, "token_w": 0.0,
         "var": 0.0, "cov": 0.0,
         "z_std": 0.0, "z_norm": 0.0,
         "res_abs": 0.0, "grad_norm": 0.0,
@@ -2744,23 +2750,38 @@ def run_epoch(ae, mlp, loader, optimizer, device, cfg, interp_w, train_mode=True
     n = 0
 
     for batch in loader:
-        batch_tok, batch_sel_db, batch_full_db, _tid = batch
+        # 8-tuple: (tok, sel, full, type, sk_tokens, sk_summary, sk_count, sk_cluster_ids)
+        (batch_tok, batch_sel_db, batch_full_db, _tid,
+         batch_sk_tokens, batch_sk_summary, batch_n_sk, batch_sk_cids) = batch
         batch_tok = batch_tok.to(device)
         batch_sel_db = batch_sel_db.to(device)
         batch_full_db = batch_full_db.to(device)
+        batch_sk_tokens = batch_sk_tokens.to(device)
+        batch_sk_summary = batch_sk_summary.to(device)
+        batch_n_sk = batch_n_sk.to(device)
+        batch_sk_cids = batch_sk_cids.to(device)
 
         if train_mode:
             optimizer.zero_grad(set_to_none=True)
 
         with torch.set_grad_enabled(train_mode):
-            cmd_logits, prm_logits, aux, z = ae(batch_tok)
+            sk_latents, is_active_logits, pred_summaries, z = ae(batch_tok)
 
-            ae_loss, ae_comp = ae_loss_fn(
-                cmd_logits, prm_logits, aux, batch_tok, cfg,
+            ae_loss, ae_comp = set_based_ae_loss(
+                ae=ae,
+                sk_latents=sk_latents,
+                is_active_logits=is_active_logits,
+                pred_summaries=pred_summaries,
+                target_sk_tokens=batch_sk_tokens,
+                target_summaries=batch_sk_summary,
+                target_cluster_ids=batch_sk_cids,
+                n_sketches=batch_n_sk,
+                cfg=cfg,
+                epoch=epoch,
+                slot_init_cluster_ids=slot_init_cluster_ids,
             )
 
             pred_sel_db, residual = mlp(z, return_parts=True)
-
             sp_loss, sp_comp, _pred_full_db = sparam_full_interp_loss(
                 pred_sel_db=pred_sel_db,
                 true_sel_db=batch_sel_db,
@@ -2794,7 +2815,10 @@ def run_epoch(ae, mlp, loader, optimizer, device, cfg, interp_w, train_mode=True
             acc["rmse_db_sel"] += sp_comp["rmse_db_sel"]
             acc["cmd"] += ae_comp["cmd"]
             acc["prm"] += ae_comp["prm"]
-            acc["aux"] += ae_comp["aux"]
+            acc["aux"] += ae_comp.get("aux", 0.0)
+            acc["active"] += ae_comp.get("active", 0.0)
+            acc["summary"] += ae_comp.get("summary", 0.0)
+            acc["token_w"] += ae_comp.get("token_w", 0.0)
             acc["var"] += float(var_loss.item())
             acc["cov"] += float(cov_loss.item())
             acc["z_std"] += float(z.std(dim=0).mean().item()) if z.size(0) > 1 else 0.0
@@ -2928,7 +2952,8 @@ def evaluate_sparam_predictions(ae, mlp, dataset, val_idx_per_type, type_names, 
         all_residual = []
 
         for idx in idxs:
-            tok, true_sel_db, true_full_db, _tid = dataset[idx]
+            (tok, true_sel_db, true_full_db, _tid,
+             _skt, _sks, _skn, _skc) = dataset[idx]
             tok = tok.unsqueeze(0).to(device)
 
             z = ae.encode(tok)
@@ -3535,6 +3560,34 @@ def train_fixed_medium_var(
         val_set, batch_size=cfg.batch_size, shuffle=False, num_workers=0,
     )
 
+    # ★ Set-based: slot_init from Phase 1 cluster centers
+    slot_init = None
+    slot_init_cluster_ids = None
+    n_slots = getattr(cfg, "n_slots", N_SKETCH_SLOTS)
+    if (getattr(cfg, "use_role_init", True)
+            and hasattr(dataset, "role_cluster_centers")
+            and dataset.role_cluster_centers is not None):
+        centers_f = np.asarray(dataset.role_cluster_centers, dtype=np.float32)
+        K_clu = centers_f.shape[0]
+        F = centers_f.shape[1]
+        # K_clu 와 n_slots 맞춤
+        if K_clu < n_slots:
+            extra = np.random.randn(n_slots - K_clu, F).astype(np.float32) * 0.5
+            centers_f = np.vstack([centers_f, extra])
+        elif K_clu > n_slots:
+            centers_f = centers_f[:n_slots]
+        # Linear projection F → d_model (fixed seed for reproducibility)
+        rng = np.random.default_rng(0)
+        proj_W = rng.standard_normal((F, cfg.d_model)).astype(np.float32) * 0.1
+        slot_init = centers_f @ proj_W   # (K, d_model)
+        # 스케일 정규화 (random init 과 비슷한 magnitude)
+        s = slot_init.std()
+        if s > 1e-6:
+            slot_init = slot_init / s * 0.02
+        slot_init_cluster_ids = np.arange(n_slots, dtype=np.int64)
+        slot_init_cluster_ids[K_clu:] = -1
+        print(f"  ★ slot_init: K={n_slots}, projected from {K_clu} clusters (F={F} → d_model={cfg.d_model})")
+
     ae = DeepCADBaselineAE(
         max_len=dataset.max_len,
         d_model=cfg.d_model,
@@ -3550,7 +3603,10 @@ def train_fixed_medium_var(
         n_freq_bands=cfg.n_freq_bands,
         aux_numeric=cfg.aux_numeric,
         aux_hidden_mult=cfg.aux_hidden_mult,
-        latent_noise_std=getattr(cfg, "latent_noise_std", 0.0),
+        n_slots=n_slots,
+        max_tokens_per_sketch=getattr(cfg, "max_tokens_per_sketch", MAX_TOKENS_PER_SKETCH),
+        set_dec_n_layers=getattr(cfg, "set_dec_n_layers", 3),
+        slot_init=slot_init,
     ).to(device)
 
     mlp = SparamCommonResidualMLP(
@@ -3637,10 +3693,12 @@ def train_fixed_medium_var(
         tr = run_epoch(
             ae, mlp, train_loader, optimizer, device, cfg,
             interp_w=interp_w, train_mode=True,
+            epoch=ep, slot_init_cluster_ids=slot_init_cluster_ids,
         )
         va = run_epoch(
             ae, mlp, val_loader, optimizer, device, cfg,
             interp_w=interp_w, train_mode=False,
+            epoch=ep, slot_init_cluster_ids=slot_init_cluster_ids,
         )
 
         scheduler.step()
