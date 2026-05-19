@@ -74,9 +74,13 @@ def inspect_type(type_name, type_dir, max_files=None, summary_only=False):
     if max_files is not None:
         step_files = step_files[:max_files]
 
-    all_solid_lists = []        # list of name-tuple per file
-    name_counter = Counter()    # name -> n_files containing it
-    files_with_n_solids = Counter()  # n_solids -> n_files
+    # ──── 모든 파일 파싱하지만 동일 name-tuple 은 group 으로 묶어 1번만 표시 ────
+    # signature = ordered name tuple (같은 구성이면 같은 signature)
+    groups = {}             # signature -> list of file paths
+    name_counter = Counter()  # name -> n_files containing it
+    files_with_n_solids = Counter()
+    n_parsed = 0
+    n_failed = 0
 
     for f in step_files:
         try:
@@ -84,33 +88,45 @@ def inspect_type(type_name, type_dir, max_files=None, summary_only=False):
             names = find_solid_names(ents)
         except Exception as e:
             print(f"    [err] {os.path.basename(f)}: {e}")
+            n_failed += 1
             continue
-
-        all_solid_lists.append(tuple(names))
+        n_parsed += 1
+        sig = tuple(names)
+        groups.setdefault(sig, []).append(f)
         files_with_n_solids[len(names)] += 1
         for nm in set(names):
             name_counter[nm] += 1
 
-        if not summary_only:
-            print(f"\n  [{os.path.relpath(f, type_dir)}]   {len(names)} solid(s)")
-            for i, nm in enumerate(names):
-                print(f"      sk{i:>2}: {nm!r}")
+    print(f"  parsed {n_parsed} file(s)  →  {len(groups)} unique name-pattern(s)\n")
+
+    if not summary_only:
+        # 가장 흔한 group 부터 표시
+        sorted_groups = sorted(groups.items(), key=lambda kv: -len(kv[1]))
+        for var_idx, (sig, members) in enumerate(sorted_groups, start=1):
+            rep = members[0]
+            print(f"  ─── Pattern {var_idx}/{len(groups)}   "
+                  f"{len(members)} file(s)   "
+                  f"({len(sig)} solid(s)) ───")
+            print(f"      rep: {os.path.relpath(rep, type_dir)}")
+            for i, nm in enumerate(sig):
+                print(f"        sk{i:>2}: {nm!r}")
+            if len(members) > 1:
+                shown = min(3, len(members) - 1)
+                other_names = [os.path.basename(m) for m in members[1:1 + shown]]
+                more = f" ...+{len(members) - 1 - shown}" if len(members) - 1 > shown else ""
+                print(f"      also: {', '.join(other_names)}{more}")
+            print()
 
     # ───── summary ─────
-    print(f"\n  ─ summary for {type_name} ─")
-    print(f"    n_solid distribution: {dict(files_with_n_solids)}")
-
-    print(f"    unique name set (count = files containing it):")
+    print(f"  ─ summary for {type_name} ─")
+    print(f"    parsed/failed         : {n_parsed} / {n_failed}")
+    print(f"    n_solid distribution  : {dict(files_with_n_solids)}")
+    print(f"    distinct name patterns: {len(groups)}")
+    print(f"    unique name set (presence ratio):")
     for nm, cnt in sorted(name_counter.items(), key=lambda kv: (-kv[1], kv[0])):
-        ratio = cnt / max(len(step_files), 1)
+        ratio = cnt / max(n_parsed, 1)
         tag = "★" if ratio >= 0.95 else ""
-        print(f"      {ratio*100:5.1f}% ({cnt:>3}/{len(step_files)})  {nm!r}  {tag}")
-
-    # 같은 순서 (tuple) 인 파일 그룹
-    order_groups = Counter(all_solid_lists)
-    print(f"    distinct order patterns: {len(order_groups)}")
-    for pat, cnt in order_groups.most_common(5):
-        print(f"      {cnt:>3} file(s):  {list(pat)}")
+        print(f"      {ratio*100:5.1f}% ({cnt:>3}/{n_parsed})  {nm!r}  {tag}")
 
 
 def main():
