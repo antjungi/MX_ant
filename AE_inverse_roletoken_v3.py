@@ -205,6 +205,11 @@ class CFG:
         "camera",                            # 없을 수도 있는 component → 마지막
     )
 
+    # ★ Checkpoint save/load (학습 후 가중치 저장, 나중에 인버스만 돌릴 때 로드)
+    ckpt_save_path: str = "ckpt/v3_last.pt"  # 빈 문자열 = 저장 안 함
+    ckpt_load_path: str = ""                 # 비어 있으면 학습; 경로 주면 로드 후 학습 skip
+    save_ckpt_after_train: bool = True
+
     # loss weights
     w_cmd: float = 1.0
     w_prm: float = 1.0
@@ -3333,6 +3338,28 @@ def train_fixed_medium_var(
         zero_init_residual=cfg.zero_init_residual,
     ).to(device)
 
+    # ★ Checkpoint load (optional) — 학습 건너뛰고 인버스만 돌릴 때 사용
+    loaded_from_ckpt = False
+    ckpt_load_path = getattr(cfg, "ckpt_load_path", "")
+    if ckpt_load_path and os.path.exists(ckpt_load_path):
+        try:
+            ckpt = torch.load(ckpt_load_path, map_location=device, weights_only=False)
+            ae.load_state_dict(ckpt["ae_state_dict"])
+            mlp.load_state_dict(ckpt["mlp_state_dict"])
+            saved_map = ckpt.get("role_name_to_id", {})
+            cur_map = getattr(dataset, "role_name_to_id", {})
+            if saved_map and cur_map and saved_map != cur_map:
+                print(f"  ⚠ role_name_to_id mismatch — saved vs current")
+                print(f"      saved : {saved_map}")
+                print(f"      current: {cur_map}")
+            loaded_from_ckpt = True
+            print(f"\n  ✓ loaded ckpt ← {ckpt_load_path}")
+            print(f"    → training will be skipped (0 epochs)\n")
+        except Exception as e:
+            print(f"  ⚠ failed to load ckpt {ckpt_load_path}: {e} — training from scratch")
+    elif ckpt_load_path:
+        print(f"  ⚠ ckpt_load_path={ckpt_load_path} not found — training from scratch")
+
     ae_params = sum(p.numel() for p in ae.parameters())
     mlp_params = sum(p.numel() for p in mlp.parameters())
 
@@ -3397,7 +3424,8 @@ def train_fixed_medium_var(
     )
     print("  " + "-" * 154)
 
-    for ep in range(1, cfg.epochs + 1):
+    n_epochs_eff = 0 if loaded_from_ckpt else cfg.epochs
+    for ep in range(1, n_epochs_eff + 1):
         tr = run_epoch(
             ae, mlp, train_loader, optimizer, device, cfg,
             interp_w=interp_w, train_mode=True,
@@ -3446,6 +3474,28 @@ def train_fixed_medium_var(
         ae.load_state_dict({k: v.to(device) for k, v in best_ae_state.items()})
     if best_mlp_state is not None:
         mlp.load_state_dict({k: v.to(device) for k, v in best_mlp_state.items()})
+
+    # ★ Checkpoint save — 학습 끝나면 (로드한 경우엔 다시 저장 안 함)
+    ckpt_save_path = getattr(cfg, "ckpt_save_path", "")
+    if (ckpt_save_path and getattr(cfg, "save_ckpt_after_train", True)
+            and not loaded_from_ckpt):
+        try:
+            _dir = os.path.dirname(ckpt_save_path)
+            if _dir:
+                os.makedirs(_dir, exist_ok=True)
+            torch.save({
+                "ae_state_dict": ae.state_dict(),
+                "mlp_state_dict": mlp.state_dict(),
+                "role_name_to_id": getattr(dataset, "role_name_to_id", {}),
+                "role_id_to_name": getattr(dataset, "role_id_to_name", {}),
+                "canonical_role_order": getattr(dataset, "canonical_role_order", ()),
+                "max_len": dataset.max_len,
+                "cfg_repr": repr(cfg),
+                "best_val_metric": float(best_metric),
+            }, ckpt_save_path)
+            print(f"\n  ✓ saved ckpt → {ckpt_save_path}  (best val RMSE dB={best_metric:.4f})\n")
+        except Exception as e:
+            print(f"  ⚠ failed to save ckpt {ckpt_save_path}: {e}")
 
     section("EVALUATION")
 
