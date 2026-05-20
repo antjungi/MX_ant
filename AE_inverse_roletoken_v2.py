@@ -3386,6 +3386,12 @@ def train_fixed_medium_var(
                 _src_name = os.path.basename(_src_path)
             except Exception:
                 pass
+            # ★ cfg 도 dict 로 직렬화 → 추론 시 같은 architecture 재현 가능
+            try:
+                import dataclasses as _dc
+                _cfg_dict = _dc.asdict(cfg)
+            except Exception:
+                _cfg_dict = None
             torch.save({
                 "ae_state_dict": ae.state_dict(),
                 "mlp_state_dict": mlp.state_dict(),
@@ -3393,6 +3399,7 @@ def train_fixed_medium_var(
                 "role_id_to_name": getattr(dataset, "role_id_to_name", {}),
                 "max_len": dataset.max_len,
                 "cfg_repr": repr(cfg),
+                "cfg_dict": _cfg_dict,
                 "best_val_metric": float(best_metric),
                 "source_code": _src,
                 "source_filename": _src_name,

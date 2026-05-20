@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Inverse design from saved v3 (또는 v2) checkpoint
-=================================================
+Inverse design from saved AE checkpoint (version-agnostic)
+==========================================================
 
-학습된 AE ckpt 를 불러와서 사용자 지정 target frequency 로 인버스 설계만
-빠르게 돌리는 standalone 스크립트.
+학습 시 저장된 ckpt 하나만 있으면 인버스 설계만 따로 돌릴 수 있는 standalone 스크립트.
 
-- 같은 폴더에 AE_inverse_roletoken_v3.py 가 있으면 그걸 사용
-- 없으면 ckpt 안에 embed 된 source_code 를 자동 추출해서 import
-  → ckpt 하나만으로 실행 가능 (학습 시 v3 가 자기 소스를 ckpt 에 박아둠)
+- v2 / v3 / 그 외 변종이 만든 ckpt 모두 지원 (cfg/architecture 정보를 ckpt 안에서 복원)
+- AE 학습 .py 가 같이 없어도 됨 — ckpt 안에 embed 된 source_code 자동 추출/import
+- 데이터 폴더 위치도 경로로 override 가능
 
 모든 설정은 아래 ★ CONFIG ★ 블록에서 수정. CLI 인자 없음.
 """
@@ -18,23 +17,29 @@ import os
 import sys
 import tempfile
 import importlib
+import importlib.util
 
 
 # ═══════════════════════════════════════════════════════════════
 #  ★ CONFIG  ★    (수정은 여기에서만)
 # ═══════════════════════════════════════════════════════════════
 
-# ── Source .py 위치 ─────────────────────────────────────────────
-# 학습할 때 쓴 AE 모듈 파일 경로 (이름은 자유 — 예: stp2seq.py).
-# 비워두면 → 같은 폴더에서 AE_inverse_roletoken_v3.py / _v2.py 자동 검색,
-# 그것도 없으면 → ckpt 안에 embed 된 source_code 사용.
-LOCAL_V3_PATH     = r"G:\jg\MX_AI_Code\stp2seq.py"
-
-# ── Checkpoint ──────────────────────────────────────────────────
-# "auto" 또는 ""  → tkinter 파일 선택 다이얼로그 띄움
-# 또는 정확한 경로 직접 지정. 예: "ckpt/v3_last.pt"
+# ── 필요한 파일/폴더 경로 ─────────────────────────────────────
+# Ckpt 파일: 학습 후 저장된 .pt / .pth
+#   "auto" 또는 ""  → tkinter 파일 다이얼로그 띄움
+#   특정 경로       → 그 파일 사용. 예: r"G:\jg\MX_AI_Code\ckpt\v3_last.pt"
 CKPT_PATH         = "auto"
 CKPT_INITIAL_DIR  = "ckpt"             # 다이얼로그가 처음 열 디렉토리
+
+# AE 학습 .py 파일 (이름 자유 — 예: stp2seq.py 든 AE_inverse_roletoken_v3.py 든):
+#   ""  → ckpt 안의 embed 된 source_code 사용 (학습 시 새로 저장된 ckpt 필요)
+#   특정 경로 → 그 파일 직접 load. 예: r"G:\jg\MX_AI_Code\stp2seq.py"
+LOCAL_PY_PATH     = ""
+
+# 데이터 폴더 root (hfss_results/ 의 상위):
+#   ""  → 이 스크립트가 있는 폴더 기준
+#   특정 경로 → 그 폴더 기준으로 cfg.npy_dirs / sparam_globs 해석
+DATA_ROOT         = ""
 
 # ── Target frequencies per channel (GHz) ─────────────────────────
 # None = 그 채널 loss 무시 (optimizer 가 그 채널 신경 안 씀)
@@ -42,7 +47,7 @@ TARGET_S11        = 2.4
 TARGET_S22        = 3.5
 TARGET_S33        = 5.8
 
-BANDWIDTH_GHZ     = 0.1
+BANDWIDTH_GHZ     = 0.1                # ± bw/2 안에서 deep_db 도달이 목표
 DEEP_DB           = -15.0
 
 # ── Optimization knobs ──────────────────────────────────────────
@@ -63,27 +68,31 @@ RESTART_NOISE     = 0.3
 MAX_RESTARTS      = 10
 
 # ── Display / save ──────────────────────────────────────────────
-SEPARATE_WINDOWS  = False
+SEPARATE_WINDOWS  = False              # decoded 4-view 를 각각 별도 창에
 SAVE_DIR          = "inversed"
 SAVE_OUTPUTS      = True
 
-# ── Preset (학습 때와 동일해야 함) ─────────────────────────────
-PRESET            = None
+# ── Preset fallback (ckpt 에 cfg_dict 없을 때만 사용) ───────────
+FALLBACK_PRESET   = None               # None = CFG default
 
 # ═══════════════════════════════════════════════════════════════
 #  (아래는 일반적으로 수정 불필요)
 # ═══════════════════════════════════════════════════════════════
 
 
+# ── ckpt 선택 ───────────────────────────────────────────────────
 def _pick_ckpt_gui(initial_dir):
-    """tkinter 파일 다이얼로그로 .pt 선택. 실패 시 None 반환."""
     try:
         import tkinter as tk
         from tkinter import filedialog
     except Exception as e:
         print(f"  ⚠ tkinter not available ({e})")
         return None
-    init_abs = os.path.abspath(initial_dir) if initial_dir and os.path.isdir(initial_dir) else os.getcwd()
+    init_abs = (
+        os.path.abspath(initial_dir)
+        if initial_dir and os.path.isdir(initial_dir)
+        else os.getcwd()
+    )
     try:
         root = tk.Tk()
         root.withdraw()
@@ -120,11 +129,10 @@ def select_ckpt(ckpt_path_cfg, initial_dir):
     return path
 
 
+# ── 모듈 로드 (3 단계 fallback) ────────────────────────────────
 def _load_module_from_file(path, mod_name=None):
-    """임의 경로의 .py 를 직접 import. 성공 시 (모듈, 이름), 실패 시 (None, None)."""
     if not path or not os.path.exists(path):
         return None, None
-    import importlib.util
     if mod_name is None:
         mod_name = os.path.splitext(os.path.basename(path))[0]
     try:
@@ -133,47 +141,42 @@ def _load_module_from_file(path, mod_name=None):
             return None, None
         mod = importlib.util.module_from_spec(spec)
         sys.modules[mod_name] = mod
-        # .py 가 속한 폴더도 sys.path 에 (해당 파일 안에서 다른 로컬 모듈 import 가능)
         d = os.path.dirname(os.path.abspath(path))
         if d not in sys.path:
             sys.path.insert(0, d)
         spec.loader.exec_module(mod)
-        print(f"  ✓ loaded module '{mod_name}' from {path}")
+        print(f"  ✓ module '{mod_name}' loaded from {path}")
         return mod, mod_name
     except Exception as e:
         print(f"  ✗ failed to load module from {path}: {e}")
         return None, None
 
 
-def _try_local_import(module_names=("AE_inverse_roletoken_v3",
-                                     "AE_inverse_roletoken_v2")):
-    """로컬 fs 에 있는 v3 (또는 v2) 를 import 시도. 성공 시 (모듈, 이름) 반환."""
+def _try_local_import():
     here = os.path.dirname(os.path.abspath(__file__))
     for p in (here, os.getcwd()):
         if p not in sys.path:
             sys.path.insert(0, p)
-    for name in module_names:
+    for name in ("AE_inverse_roletoken_v3", "AE_inverse_roletoken_v2",
+                 "AE_inverse_roletoken", "AE_inverse"):
         try:
-            mod = importlib.import_module(name)
-            return mod, name
+            return importlib.import_module(name), name
         except ModuleNotFoundError:
             continue
     return None, None
 
 
 def _import_from_ckpt_embedded(ckpt_path):
-    """ckpt 의 source_code 를 꺼내 임시 폴더에 풀고 import."""
     import torch as _torch
-    print(f"  → reading source_code from ckpt: {ckpt_path}")
     try:
         raw = _torch.load(ckpt_path, map_location="cpu", weights_only=False)
     except Exception as e:
-        print(f"  ✗ failed to load ckpt for source extraction: {e}")
+        print(f"  ✗ failed to read ckpt: {e}")
         return None, None
     src = raw.get("source_code")
     src_name = raw.get("source_filename")
     if not src or not src_name:
-        print("  ✗ no source_code embedded in this ckpt")
+        print("  ✗ no source_code embedded in this ckpt (older ckpt without embed)")
         return None, None
     tmp_dir = tempfile.mkdtemp(prefix="ae_src_")
     tmp_file = os.path.join(tmp_dir, src_name)
@@ -187,21 +190,59 @@ def _import_from_ckpt_embedded(ckpt_path):
     mod_name = os.path.splitext(src_name)[0]
     try:
         mod = importlib.import_module(mod_name)
-        print(f"  ✓ imported '{mod_name}' from ckpt-embedded source ({tmp_dir})")
+        print(f"  ✓ module '{mod_name}' loaded from ckpt-embedded source ({tmp_dir})")
         return mod, mod_name
     except Exception as e:
         print(f"  ✗ failed to import embedded source: {e}")
         return None, None
 
 
-def _print_config_summary(ckpt_path, channel_active, channel_target_freqs, v3_name):
-    v3 = sys.modules.get(v3_name)
-    v3.section("INVERSE-ONLY — load ckpt + custom targets")
-    print(f"  module        : {v3_name}")
+def _resolve_module(ckpt_path):
+    """우선순위 (a) LOCAL_PY_PATH → (b) 로컬 자동검색 → (c) ckpt embedded."""
+    if LOCAL_PY_PATH:
+        m, n = _load_module_from_file(LOCAL_PY_PATH)
+        if m is not None:
+            return m, n
+        print(f"  ⚠ LOCAL_PY_PATH failed: {LOCAL_PY_PATH}")
+    m, n = _try_local_import()
+    if m is not None:
+        return m, n
+    print("  ⚠ no local AE module — trying ckpt-embedded source")
+    return _import_from_ckpt_embedded(ckpt_path)
+
+
+# ── CFG 복원 ────────────────────────────────────────────────────
+def _restore_cfg(ae_mod, ckpt_dict, fallback_preset):
+    """ckpt 안의 cfg_dict 로 동일 architecture CFG 재현. 없으면 fresh + preset."""
+    saved = ckpt_dict.get("cfg_dict")
+    cfg_cls = ae_mod.CFG
+    if saved:
+        import dataclasses as _dc
+        valid_keys = {f.name for f in _dc.fields(cfg_cls)}
+        filtered = {k: v for k, v in saved.items() if k in valid_keys}
+        cfg = cfg_cls(**filtered)
+        print(f"  ✓ cfg restored from ckpt "
+              f"(preset={getattr(cfg, 'preset', '?')}, "
+              f"d_model={getattr(cfg, 'd_model', '?')}, "
+              f"latent={getattr(cfg, 'latent', '?')})")
+        return cfg
+    cfg = cfg_cls()
+    if fallback_preset:
+        cfg.preset = fallback_preset
+    if hasattr(ae_mod, "apply_preset"):
+        ae_mod.apply_preset(cfg)
+    print(f"  ⚠ no cfg_dict in ckpt — using fresh CFG (preset={cfg.preset})")
+    return cfg
+
+
+def _print_config_summary(ckpt_path, mod_name, channel_active,
+                          channel_target_freqs, ae_mod):
+    ae_mod.section("INVERSE-ONLY — load ckpt + custom targets")
+    print(f"  module        : {mod_name}")
     print(f"  ckpt          : {ckpt_path}")
-    print(f"  preset        : {PRESET}")
+    print(f"  data root     : {DATA_ROOT or '(script dir default)'}")
     print(f"  target spec   : bw=±{BANDWIDTH_GHZ / 2 * 1000:.0f} MHz, deep_db={DEEP_DB}")
-    for c, lbl in enumerate(v3.RETURN_LABELS):
+    for c, lbl in enumerate(ae_mod.RETURN_LABELS):
         if channel_active[c]:
             print(f"    {lbl}: {channel_target_freqs[c]:.3f} GHz   ★ ACTIVE")
         else:
@@ -213,6 +254,7 @@ def _print_config_summary(ckpt_path, channel_active, channel_target_freqs, v3_na
 
 
 def main():
+    # ── 1) 채널 활성화 결정 ──
     user_targets = [TARGET_S11, TARGET_S22, TARGET_S33]
     channel_active = [t is not None for t in user_targets]
     if not any(channel_active):
@@ -224,58 +266,48 @@ def main():
         for t, df in zip(user_targets, default_freqs)
     )
 
-    # ── 1) Ckpt 선택 (v3 import 보다 먼저) ──
+    # ── 2) Ckpt 선택 ──
     ckpt_path = select_ckpt(CKPT_PATH, CKPT_INITIAL_DIR)
 
-    # ── 2) v3 module 확보 — 우선순위:
-    #       (a) LOCAL_V3_PATH 지정돼 있으면 그 경로의 .py 직접 로드
-    #       (b) 같은 폴더 / cwd 의 AE_inverse_roletoken_v3.py / _v2.py
-    #       (c) ckpt 안의 embedded source
-    v3, v3_name = (None, None)
-    if LOCAL_V3_PATH:
-        v3, v3_name = _load_module_from_file(LOCAL_V3_PATH)
-        if v3 is None:
-            print(f"  ⚠ LOCAL_V3_PATH set but not loadable: {LOCAL_V3_PATH}")
-    if v3 is None:
-        v3, v3_name = _try_local_import()
-    if v3 is None:
-        print("  ⚠ no local AE_inverse_roletoken_v* .py found")
-        v3, v3_name = _import_from_ckpt_embedded(ckpt_path)
-    if v3 is None:
-        print("  ✗ unable to obtain AE_inverse_roletoken module — abort")
+    # ── 3) AE 모듈 확보 ──
+    ae_mod, mod_name = _resolve_module(ckpt_path)
+    if ae_mod is None:
+        print("  ✗ unable to obtain AE module — abort")
         sys.exit(1)
 
     import torch
-    import numpy as np   # noqa
+    import numpy as np   # noqa: F401
 
-    _print_config_summary(ckpt_path, channel_active, channel_target_freqs, v3_name)
+    _print_config_summary(ckpt_path, mod_name, channel_active,
+                          channel_target_freqs, ae_mod)
 
-    # ── 3) CFG / preset ──
-    cfg = v3.CFG()
-    if PRESET:
-        cfg.preset = PRESET
-    v3.apply_preset(cfg)
-    v3.set_seed(cfg.seed)
+    # ── 4) Ckpt dict 로드 + CFG 복원 ──
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    cfg = _restore_cfg(ae_mod, ckpt, FALLBACK_PRESET)
+    ae_mod.set_seed(cfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ── 4) Load data ──
-    v3.section("LOAD DATA")
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    dataset, npy_files, type_ids, type_names, sparam_db, max_len = (
-        v3.load_multitype_data(cfg, script_dir)
+    # ── 5) Data root + dataset ──
+    ae_mod.section("LOAD DATA")
+    script_dir = (
+        os.path.abspath(DATA_ROOT) if DATA_ROOT
+        else os.path.dirname(os.path.abspath(__file__))
     )
-
-    train_idx, val_idx, val_idx_per_type = v3.make_stratified_split(
+    print(f"  data script_dir = {script_dir}")
+    dataset, npy_files, type_ids, type_names, sparam_db, max_len = (
+        ae_mod.load_multitype_data(cfg, script_dir)
+    )
+    train_idx, val_idx, val_idx_per_type = ae_mod.make_stratified_split(
         cfg, dataset, type_ids, type_names,
     )
-    common_curve = v3.build_common_curve_and_print_baseline(
+    common_curve = ae_mod.build_common_curve_and_print_baseline(
         dataset=dataset, train_idx=train_idx,
         val_idx_per_type=val_idx_per_type, type_names=type_names,
     )
 
-    # ── 5) Build models + load ckpt ──
-    v3.section("BUILD MODELS + LOAD CKPT")
-    ae = v3.DeepCADBaselineAE(
+    # ── 6) 모델 build + ckpt weights 로드 ──
+    ae_mod.section("BUILD MODELS + LOAD WEIGHTS")
+    ae = ae_mod.DeepCADBaselineAE(
         max_len=dataset.max_len,
         d_model=cfg.d_model, d_param=cfg.d_param,
         nhead=cfg.nhead, n_enc=cfg.n_enc, n_dec=cfg.n_dec,
@@ -284,17 +316,17 @@ def main():
         n_freq_bands=cfg.n_freq_bands,
         aux_numeric=cfg.aux_numeric, aux_hidden_mult=cfg.aux_hidden_mult,
     ).to(device)
-    mlp = v3.SparamCommonResidualMLP(
+    mlp = ae_mod.SparamCommonResidualMLP(
         latent_dim=cfg.latent, n_freq=cfg.n_freq,
         common_curve=common_curve,
         hidden_mult=cfg.mlp_hidden_mult, dropout=cfg.mlp_dropout,
         residual_scale=cfg.residual_scale,
         zero_init_residual=cfg.zero_init_residual,
     ).to(device)
-
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     ae.load_state_dict(ckpt["ae_state_dict"])
     mlp.load_state_dict(ckpt["mlp_state_dict"])
+    ae.to(device); mlp.to(device)
+
     saved_max_len = ckpt.get("max_len")
     saved_role_map = ckpt.get("role_name_to_id", {})
     cur_role_map = getattr(dataset, "role_name_to_id", {})
@@ -304,13 +336,13 @@ def main():
         print(f"  ⚠ role_name_to_id mismatch:")
         print(f"      saved  : {saved_role_map}")
         print(f"      current: {cur_role_map}")
-    print(f"  ✓ loaded ckpt ← {ckpt_path}")
+    print(f"  ✓ loaded weights ← {ckpt_path}")
     bvm = ckpt.get("best_val_metric")
     if bvm is not None:
         print(f"    best val RMSE dB at save: {bvm:.4f}")
 
-    # ── 6) Monkey-patch make_target_db_curve 로 비활성 채널 mask 제거 ──
-    _orig_make_target = v3.make_target_db_curve
+    # ── 7) 비활성 채널 mask 제거 (per-channel target 선택) ──
+    _orig_make_target = ae_mod.make_target_db_curve
 
     def _masked_make_target(freqs_full, ctfs, bw, deep_db=-20.0, flat_db=0.0):
         target, masks = _orig_make_target(freqs_full, ctfs, bw, deep_db, flat_db)
@@ -320,11 +352,11 @@ def main():
                 target[:, c] = flat_db
         return target, masks
 
-    v3.make_target_db_curve = _masked_make_target
+    ae_mod.make_target_db_curve = _masked_make_target
 
-    # ── 7) Run inverse optimization ──
-    v3.section("INVERSE DESIGN — latent search")
-    result = v3.inverse_design_optimize(
+    # ── 8) Inverse optimization ──
+    ae_mod.section("INVERSE DESIGN — latent search")
+    result = ae_mod.inverse_design_optimize(
         ae=ae, mlp=mlp, dataset=dataset,
         channel_target_freqs=channel_target_freqs,
         bandwidth_ghz=BANDWIDTH_GHZ,
@@ -344,23 +376,23 @@ def main():
     )
     print(f"\n  best match loss : {result['best_loss']:.4f}")
     print(f"  in-band MSE:")
-    for c, lbl in enumerate(v3.RETURN_LABELS):
+    for c, lbl in enumerate(ae_mod.RETURN_LABELS):
         tag = "★" if channel_active[c] else "(ignored)"
         print(f"    {lbl}: {result['best_in_band_mse'][c]:.3f}  {tag}")
 
-    # ── 8) Figures ──
-    v3.subsection("S-param curve figure")
+    # ── 9) Figures ──
+    ae_mod.subsection("S-param curve figure")
     try:
-        v3.visualize_inverse_design_curve(result)
+        ae_mod.visualize_inverse_design_curve(result)
     except Exception as e:
         import traceback as _tb
         print(f"  ⚠ visualize_inverse_design_curve failed: {type(e).__name__}: {e}")
         _tb.print_exc()
 
-    v3.subsection("Decoded structure figure")
+    ae_mod.subsection("Decoded structure figure")
     recon_trim = None
     try:
-        recon_trim, _sketches, _ = v3.visualize_decoded_structure(
+        recon_trim, _sketches, _ = ae_mod.visualize_decoded_structure(
             ae, result["best_z"], dataset, device,
             title="Inverse-designed structure (from loaded ckpt)",
             separate_windows=SEPARATE_WINDOWS,
@@ -371,12 +403,12 @@ def main():
         print(f"  ⚠ visualize_decoded_structure failed: {type(e).__name__}: {e}")
         _tb.print_exc()
 
-    v3.subsection("z trajectory on training PCA")
+    ae_mod.subsection("z trajectory on training PCA")
     try:
-        z_train_all, tids_train_all = v3.collect_latents(
+        z_train_all, tids_train_all = ae_mod.collect_latents(
             ae, dataset, list(range(len(dataset))), device,
         )
-        v3.visualize_inverse_z_on_pca(
+        ae_mod.visualize_inverse_z_on_pca(
             z_train=z_train_all,
             type_ids_train=tids_train_all,
             type_names=list(dataset.type_names),
@@ -389,18 +421,18 @@ def main():
         print(f"  ⚠ visualize_inverse_z_on_pca failed: {type(e).__name__}: {e}")
         _tb.print_exc()
 
-    # ── 9) Save ──
+    # ── 10) Save ──
     if SAVE_OUTPUTS and recon_trim is not None:
-        v3.subsection(f"Saving outputs → {SAVE_DIR}/")
+        ae_mod.subsection(f"Saving outputs → {SAVE_DIR}/")
         try:
             tag_parts = []
             for lbl, ct, ac in zip(
-                v3.RETURN_LABELS, channel_target_freqs, channel_active,
+                ae_mod.RETURN_LABELS, channel_target_freqs, channel_active,
             ):
                 if ac:
                     tag_parts.append(f"{lbl}_{ct:.2f}GHz")
             run_tag = "infer_" + "_".join(tag_parts)
-            v3.save_inverse_design_outputs(
+            ae_mod.save_inverse_design_outputs(
                 result, SAVE_DIR, run_tag,
                 channel_target_freqs=channel_target_freqs,
                 bandwidth_ghz=BANDWIDTH_GHZ,
@@ -411,7 +443,7 @@ def main():
             print(f"  ⚠ save failed: {type(e).__name__}: {e}")
             _tb.print_exc()
 
-    v3.section("DONE")
+    ae_mod.section("DONE")
     import matplotlib.pyplot as plt
     plt.show()
 
