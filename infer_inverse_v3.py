@@ -24,6 +24,12 @@ import importlib
 #  ★ CONFIG  ★    (수정은 여기에서만)
 # ═══════════════════════════════════════════════════════════════
 
+# ── Source .py 위치 ─────────────────────────────────────────────
+# 학습할 때 쓴 AE 모듈 파일 경로 (이름은 자유 — 예: stp2seq.py).
+# 비워두면 → 같은 폴더에서 AE_inverse_roletoken_v3.py / _v2.py 자동 검색,
+# 그것도 없으면 → ckpt 안에 embed 된 source_code 사용.
+LOCAL_V3_PATH     = r"G:\jg\MX_AI_Code\stp2seq.py"
+
 # ── Checkpoint ──────────────────────────────────────────────────
 # "auto" 또는 ""  → tkinter 파일 선택 다이얼로그 띄움
 # 또는 정확한 경로 직접 지정. 예: "ckpt/v3_last.pt"
@@ -114,6 +120,31 @@ def select_ckpt(ckpt_path_cfg, initial_dir):
     return path
 
 
+def _load_module_from_file(path, mod_name=None):
+    """임의 경로의 .py 를 직접 import. 성공 시 (모듈, 이름), 실패 시 (None, None)."""
+    if not path or not os.path.exists(path):
+        return None, None
+    import importlib.util
+    if mod_name is None:
+        mod_name = os.path.splitext(os.path.basename(path))[0]
+    try:
+        spec = importlib.util.spec_from_file_location(mod_name, path)
+        if spec is None or spec.loader is None:
+            return None, None
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[mod_name] = mod
+        # .py 가 속한 폴더도 sys.path 에 (해당 파일 안에서 다른 로컬 모듈 import 가능)
+        d = os.path.dirname(os.path.abspath(path))
+        if d not in sys.path:
+            sys.path.insert(0, d)
+        spec.loader.exec_module(mod)
+        print(f"  ✓ loaded module '{mod_name}' from {path}")
+        return mod, mod_name
+    except Exception as e:
+        print(f"  ✗ failed to load module from {path}: {e}")
+        return None, None
+
+
 def _try_local_import(module_names=("AE_inverse_roletoken_v3",
                                      "AE_inverse_roletoken_v2")):
     """로컬 fs 에 있는 v3 (또는 v2) 를 import 시도. 성공 시 (모듈, 이름) 반환."""
@@ -196,8 +227,17 @@ def main():
     # ── 1) Ckpt 선택 (v3 import 보다 먼저) ──
     ckpt_path = select_ckpt(CKPT_PATH, CKPT_INITIAL_DIR)
 
-    # ── 2) v3 module 확보: 로컬 → ckpt-embedded fallback ──
-    v3, v3_name = _try_local_import()
+    # ── 2) v3 module 확보 — 우선순위:
+    #       (a) LOCAL_V3_PATH 지정돼 있으면 그 경로의 .py 직접 로드
+    #       (b) 같은 폴더 / cwd 의 AE_inverse_roletoken_v3.py / _v2.py
+    #       (c) ckpt 안의 embedded source
+    v3, v3_name = (None, None)
+    if LOCAL_V3_PATH:
+        v3, v3_name = _load_module_from_file(LOCAL_V3_PATH)
+        if v3 is None:
+            print(f"  ⚠ LOCAL_V3_PATH set but not loadable: {LOCAL_V3_PATH}")
+    if v3 is None:
+        v3, v3_name = _try_local_import()
     if v3 is None:
         print("  ⚠ no local AE_inverse_roletoken_v* .py found")
         v3, v3_name = _import_from_ckpt_embedded(ckpt_path)
