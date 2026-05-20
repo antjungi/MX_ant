@@ -3376,6 +3376,16 @@ def train_fixed_medium_var(
             _dir = os.path.dirname(ckpt_save_path)
             if _dir:
                 os.makedirs(_dir, exist_ok=True)
+            # ★ 자기 자신의 소스 코드 embed (인버스 단계에서 .py 따로 안 들고 다녀도 되도록)
+            _src = None
+            _src_name = None
+            try:
+                _src_path = os.path.abspath(__file__)
+                with open(_src_path, "r", encoding="utf-8") as _f:
+                    _src = _f.read()
+                _src_name = os.path.basename(_src_path)
+            except Exception:
+                pass
             torch.save({
                 "ae_state_dict": ae.state_dict(),
                 "mlp_state_dict": mlp.state_dict(),
@@ -3384,8 +3394,11 @@ def train_fixed_medium_var(
                 "max_len": dataset.max_len,
                 "cfg_repr": repr(cfg),
                 "best_val_metric": float(best_metric),
+                "source_code": _src,
+                "source_filename": _src_name,
             }, ckpt_save_path)
-            print(f"\n  ✓ saved ckpt → {ckpt_save_path}  (best val RMSE dB={best_metric:.4f})\n")
+            extra = f"  (+source: {_src_name})" if _src else "  (source not embedded)"
+            print(f"\n  ✓ saved ckpt → {ckpt_save_path}  (best val RMSE dB={best_metric:.4f}){extra}\n")
         except Exception as e:
             print(f"  ⚠ failed to save ckpt {ckpt_save_path}: {e}")
 
