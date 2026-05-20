@@ -65,22 +65,36 @@ PRESET            = None         # None = CFG default, 또는 "small"/"medium"/"
 #  (아래는 일반적으로 수정 불필요)
 # ═══════════════════════════════════════════════════════════════
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+sys.path.insert(0, os.getcwd())
 
-import AE_inverse_roletoken_v3 as v3
-from AE_inverse_roletoken_v3 import (
-    CFG, apply_preset, set_seed,
-    load_multitype_data, make_stratified_split,
-    build_common_curve_and_print_baseline,
-    DeepCADBaselineAE, SparamCommonResidualMLP,
-    inverse_design_optimize,
-    visualize_inverse_design_curve, visualize_decoded_structure,
-    visualize_inverse_z_on_pca,
-    save_inverse_design_outputs,
-    collect_latents,
-    section, subsection,
-    RETURN_LABELS,
-)
+try:
+    import AE_inverse_roletoken_v3 as v3
+    from AE_inverse_roletoken_v3 import (
+        CFG, apply_preset, set_seed,
+        load_multitype_data, make_stratified_split,
+        build_common_curve_and_print_baseline,
+        DeepCADBaselineAE, SparamCommonResidualMLP,
+        inverse_design_optimize,
+        visualize_inverse_design_curve, visualize_decoded_structure,
+        visualize_inverse_z_on_pca,
+        save_inverse_design_outputs,
+        collect_latents,
+        section, subsection,
+        RETURN_LABELS,
+    )
+except ModuleNotFoundError as _e:
+    print("=" * 60)
+    print(" ERROR: 'AE_inverse_roletoken_v3.py' not found")
+    print("=" * 60)
+    print(f"  This script needs 'AE_inverse_roletoken_v3.py' in:")
+    print(f"    {_HERE}")
+    print(f"  or in current working directory:")
+    print(f"    {os.getcwd()}")
+    print(f"  → copy/move that file alongside this script and re-run.")
+    print(f"  (original ModuleNotFoundError: {_e})")
+    sys.exit(1)
 
 
 def _pick_ckpt_gui(initial_dir):
