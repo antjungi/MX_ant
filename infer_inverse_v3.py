@@ -12,7 +12,6 @@ Inverse design from saved v3 checkpoint
 
 import os
 import sys
-import time
 import torch
 import numpy as np
 
@@ -22,10 +21,10 @@ import numpy as np
 # ═══════════════════════════════════════════════════════════════
 
 # ── Checkpoint ──────────────────────────────────────────────────
-# "auto" 또는 ""  → 아래 CKPT_SEARCH_DIRS 안의 .pt 파일을 나열하고 골라달라고 prompt
+# "auto" 또는 ""  → tkinter 파일 선택 다이얼로그 띄움
 # 또는 정확한 경로 직접 지정. 예: "ckpt/v3_last.pt"
 CKPT_PATH         = "auto"
-CKPT_SEARCH_DIRS  = ["ckpt", "."]      # auto 모드에서 검색할 디렉토리들
+CKPT_INITIAL_DIR  = "ckpt"             # 다이얼로그가 처음 열 디렉토리
 
 # ── Target frequencies per channel (GHz) ─────────────────────────
 # None = 그 채널 loss 무시 (optimizer 가 그 채널 신경 안 씀)
@@ -84,62 +83,54 @@ from AE_inverse_roletoken_v3 import (
 )
 
 
-def _list_ckpts(search_dirs):
-    """search_dirs 안의 *.pt / *.pth 파일을 찾아 정보와 함께 리스트."""
-    found = []
-    for d in search_dirs:
-        if not os.path.isdir(d):
-            continue
-        for f in sorted(os.listdir(d)):
-            if f.lower().endswith((".pt", ".pth")):
-                p = os.path.join(d, f)
-                try:
-                    st = os.stat(p)
-                    size_mb = st.st_size / (1024 * 1024)
-                    mtime = time.strftime(
-                        "%Y-%m-%d %H:%M", time.localtime(st.st_mtime),
-                    )
-                except OSError:
-                    size_mb = 0
-                    mtime = "?"
-                found.append({"path": p, "size_mb": size_mb, "mtime": mtime})
-    return found
+def _pick_ckpt_gui(initial_dir):
+    """tkinter 파일 다이얼로그로 .pt 선택. 실패 시 None 반환."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception as e:
+        print(f"  ⚠ tkinter not available ({e})")
+        return None
+
+    init_abs = os.path.abspath(initial_dir) if initial_dir and os.path.isdir(initial_dir) else os.getcwd()
+
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except Exception:
+            pass
+        path = filedialog.askopenfilename(
+            title="Select trained ckpt (.pt / .pth)",
+            initialdir=init_abs,
+            filetypes=[("PyTorch ckpt", "*.pt *.pth"), ("All files", "*.*")],
+        )
+        root.destroy()
+    except Exception as e:
+        print(f"  ⚠ Tk filedialog failed: {e}")
+        return None
+
+    return path if path else None
 
 
-def select_ckpt(ckpt_path_cfg, search_dirs):
-    """CKPT_PATH 가 auto/"" 면 interactive 선택, 아니면 그 경로 그대로 사용."""
+def select_ckpt(ckpt_path_cfg, initial_dir):
+    """CKPT_PATH 가 auto/"" 면 파일 다이얼로그, 아니면 그 경로 그대로 사용."""
     if ckpt_path_cfg and ckpt_path_cfg.lower() != "auto":
         if not os.path.exists(ckpt_path_cfg):
             print(f"  ✗ ckpt not found: {ckpt_path_cfg}")
             sys.exit(1)
         return ckpt_path_cfg
 
-    candidates = _list_ckpts(search_dirs)
-    if not candidates:
-        print(f"  ✗ no *.pt / *.pth in: {search_dirs}")
+    print(f"  → opening file picker (initial dir: {initial_dir})")
+    path = _pick_ckpt_gui(initial_dir)
+    if not path:
+        print("  ✗ no ckpt selected (or picker unavailable)")
         sys.exit(1)
-
-    print(f"\n  Available checkpoints in {search_dirs}:")
-    for i, c in enumerate(candidates):
-        print(f"    [{i}] {c['path']:<40s}  {c['size_mb']:>6.1f} MB   {c['mtime']}")
-
-    while True:
-        try:
-            ans = input(f"\n  Select index [0..{len(candidates) - 1}] (Enter=0): ").strip()
-        except EOFError:
-            ans = ""
-        if ans == "":
-            idx = 0
-            break
-        try:
-            idx = int(ans)
-            if 0 <= idx < len(candidates):
-                break
-        except ValueError:
-            pass
-        print(f"    invalid, try 0..{len(candidates) - 1}")
-
-    return candidates[idx]["path"]
+    if not os.path.exists(path):
+        print(f"  ✗ selected file does not exist: {path}")
+        sys.exit(1)
+    return path
 
 
 def _print_config_summary(ckpt_path, channel_active, channel_target_freqs):
@@ -174,7 +165,7 @@ def main():
     )
 
     # ── Ckpt 선택 ──
-    ckpt_path = select_ckpt(CKPT_PATH, CKPT_SEARCH_DIRS)
+    ckpt_path = select_ckpt(CKPT_PATH, CKPT_INITIAL_DIR)
 
     _print_config_summary(ckpt_path, channel_active, channel_target_freqs)
 
