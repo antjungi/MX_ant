@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Inverse design from saved AE checkpoint (version-agnostic)
-==========================================================
+Inverse design from saved AE_main checkpoint
+============================================
 
-학습 시 저장된 ckpt 하나만 있으면 인버스 설계만 따로 돌릴 수 있는 standalone 스크립트.
+학습된 AE_main ckpt 하나만 있으면 인버스 설계만 따로 돌릴 수 있는 standalone 스크립트.
 
-- v2 / v3 / 그 외 변종이 만든 ckpt 모두 지원 (cfg/architecture 정보를 ckpt 안에서 복원)
-- AE 학습 .py 가 같이 없어도 됨 — ckpt 안에 embed 된 source_code 자동 추출/import
-- 데이터 폴더 위치도 경로로 override 가능
+지원 동작:
+  - tkinter 파일 다이얼로그로 ckpt 선택
+  - cfg / architecture 정보를 ckpt 안에서 자동 복원 (preset mismatch 0)
+  - AE_main.py 가 같이 없어도 됨 → ckpt 안의 embed 된 source_code 자동 추출/import
+  - 데이터 폴더 위치도 경로로 override 가능
+  - 채널별 (S11/S22/S33) 타겟 주파수를 켜고/끌 수 있음
 
 모든 설정은 아래 ★ CONFIG ★ 블록에서 수정. CLI 인자 없음.
 """
@@ -27,13 +30,13 @@ import importlib.util
 # ── 필요한 파일/폴더 경로 ─────────────────────────────────────
 # Ckpt 파일: 학습 후 저장된 .pt / .pth
 #   "auto" 또는 ""  → tkinter 파일 다이얼로그 띄움
-#   특정 경로       → 그 파일 사용. 예: r"G:\jg\MX_AI_Code\ckpt\v3_last.pt"
+#   특정 경로       → 그 파일 사용. 예: r"G:\jg\MX_AI_Code\ckpt\AE_main_last.pt"
 CKPT_PATH         = "auto"
-CKPT_INITIAL_DIR  = "ckpt"             # 다이얼로그가 처음 열 디렉토리
+CKPT_INITIAL_DIR  = "ckpt"                # 다이얼로그가 처음 열 디렉토리
 
-# AE 학습 .py 파일 (이름 자유 — 예: stp2seq.py 든 AE_inverse_roletoken_v3.py 든):
-#   ""  → ckpt 안의 embed 된 source_code 사용 (학습 시 새로 저장된 ckpt 필요)
-#   특정 경로 → 그 파일 직접 load. 예: r"G:\jg\MX_AI_Code\stp2seq.py"
+# AE_main.py 파일 (이름 자유 — 예: AE_main.py / 다른 이름):
+#   ""  → ckpt 안의 embed 된 source_code 자동 사용
+#   특정 경로 → 그 파일 직접 load
 LOCAL_PY_PATH     = ""
 
 # 데이터 폴더 root (hfss_results/ 의 상위):
@@ -47,7 +50,7 @@ TARGET_S11        = 2.4
 TARGET_S22        = 3.5
 TARGET_S33        = 5.8
 
-BANDWIDTH_GHZ     = 0.1                # ± bw/2 안에서 deep_db 도달이 목표
+BANDWIDTH_GHZ     = 0.1                   # ± bw/2 안에서 deep_db 도달이 목표
 DEEP_DB           = -15.0
 
 # ── Optimization knobs ──────────────────────────────────────────
@@ -68,12 +71,12 @@ RESTART_NOISE     = 0.3
 MAX_RESTARTS      = 10
 
 # ── Display / save ──────────────────────────────────────────────
-SEPARATE_WINDOWS  = False              # decoded 4-view 를 각각 별도 창에
+SEPARATE_WINDOWS  = False                 # decoded 4-view 를 각각 별도 창에
 SAVE_DIR          = "inversed"
 SAVE_OUTPUTS      = True
 
 # ── Preset fallback (ckpt 에 cfg_dict 없을 때만 사용) ───────────
-FALLBACK_PRESET   = None               # None = CFG default
+FALLBACK_PRESET   = None
 
 # ═══════════════════════════════════════════════════════════════
 #  (아래는 일반적으로 수정 불필요)
@@ -157,8 +160,7 @@ def _try_local_import():
     for p in (here, os.getcwd()):
         if p not in sys.path:
             sys.path.insert(0, p)
-    for name in ("AE_inverse_roletoken_v3", "AE_inverse_roletoken_v2",
-                 "AE_inverse_roletoken", "AE_inverse"):
+    for name in ("AE_main", "AE_inverse"):
         try:
             return importlib.import_module(name), name
         except ModuleNotFoundError:
@@ -213,7 +215,6 @@ def _resolve_module(ckpt_path):
 
 # ── CFG 복원 ────────────────────────────────────────────────────
 def _restore_cfg(ae_mod, ckpt_dict, fallback_preset):
-    """ckpt 안의 cfg_dict 로 동일 architecture CFG 재현. 없으면 fresh + preset."""
     saved = ckpt_dict.get("cfg_dict")
     cfg_cls = ae_mod.CFG
     if saved:
@@ -328,14 +329,8 @@ def main():
     ae.to(device); mlp.to(device)
 
     saved_max_len = ckpt.get("max_len")
-    saved_role_map = ckpt.get("role_name_to_id", {})
-    cur_role_map = getattr(dataset, "role_name_to_id", {})
     if saved_max_len is not None and saved_max_len != dataset.max_len:
         print(f"  ⚠ max_len mismatch: ckpt={saved_max_len} dataset={dataset.max_len}")
-    if saved_role_map and saved_role_map != cur_role_map:
-        print(f"  ⚠ role_name_to_id mismatch:")
-        print(f"      saved  : {saved_role_map}")
-        print(f"      current: {cur_role_map}")
     print(f"  ✓ loaded weights ← {ckpt_path}")
     bvm = ckpt.get("best_val_metric")
     if bvm is not None:
@@ -392,34 +387,37 @@ def main():
     ae_mod.subsection("Decoded structure figure")
     recon_trim = None
     try:
-        recon_trim, _sketches, _ = ae_mod.visualize_decoded_structure(
+        ret = ae_mod.visualize_decoded_structure(
             ae, result["best_z"], dataset, device,
             title="Inverse-designed structure (from loaded ckpt)",
             separate_windows=SEPARATE_WINDOWS,
         )
+        if isinstance(ret, tuple) and len(ret) >= 1:
+            recon_trim = ret[0]
         result["decoded_tokens"] = recon_trim
     except Exception as e:
         import traceback as _tb
         print(f"  ⚠ visualize_decoded_structure failed: {type(e).__name__}: {e}")
         _tb.print_exc()
 
-    ae_mod.subsection("z trajectory on training PCA")
-    try:
-        z_train_all, tids_train_all = ae_mod.collect_latents(
-            ae, dataset, list(range(len(dataset))), device,
-        )
-        ae_mod.visualize_inverse_z_on_pca(
-            z_train=z_train_all,
-            type_ids_train=tids_train_all,
-            type_names=list(dataset.type_names),
-            z_trajectory=result.get("z_trajectory", []),
-            track_iters=result.get("track_iters", []),
-            best_start_idx=int(result.get("best_start_idx", 0)),
-        )
-    except Exception as e:
-        import traceback as _tb
-        print(f"  ⚠ visualize_inverse_z_on_pca failed: {type(e).__name__}: {e}")
-        _tb.print_exc()
+    if hasattr(ae_mod, "visualize_inverse_z_on_pca"):
+        ae_mod.subsection("z trajectory on training PCA")
+        try:
+            z_train_all, tids_train_all = ae_mod.collect_latents(
+                ae, dataset, list(range(len(dataset))), device,
+            )
+            ae_mod.visualize_inverse_z_on_pca(
+                z_train=z_train_all,
+                type_ids_train=tids_train_all,
+                type_names=list(dataset.type_names),
+                z_trajectory=result.get("z_trajectory", []),
+                track_iters=result.get("track_iters", []),
+                best_start_idx=int(result.get("best_start_idx", 0)),
+            )
+        except Exception as e:
+            import traceback as _tb
+            print(f"  ⚠ visualize_inverse_z_on_pca failed: {type(e).__name__}: {e}")
+            _tb.print_exc()
 
     # ── 10) Save ──
     if SAVE_OUTPUTS and recon_trim is not None:
