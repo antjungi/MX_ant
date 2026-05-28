@@ -32,6 +32,7 @@ STEEL = np.array([0.66, 0.70, 0.78])
 TABC  = np.array([0.55, 0.78, 0.55])
 LIGHT = np.array([0.4, 0.5, 0.78]); LIGHT = LIGHT / np.linalg.norm(LIGHT)
 AMB, DIF = 0.42, 0.58
+MTN, VAL = "#d62728", "#1f77b4"   # mountain / valley fold colours (2D crease)
 
 
 def q(v):
@@ -123,6 +124,38 @@ def _newell(v):
     nn = np.linalg.norm(n); return n/nn if nn > 1e-12 else n
 
 
+def plus_perim(a, hw, L):
+    """outline of a Greek-cross net: square half-size a, arm half-width hw, arm length L."""
+    return [(-hw,-a-L),(hw,-a-L),(hw,-a),(a,-a),(a,-hw),(a+L,-hw),(a+L,hw),(a,hw),(a,a),
+            (hw,a),(hw,a+L),(-hw,a+L),(-hw,a),(-a,a),(-a,hw),(-a-L,hw),(-a-L,-hw),(-a,-hw),(-a,-a),(-hw,-a)]
+
+
+def draw_crease(ax, design, sym_axes=True, pad=4.0):
+    """Draw the 2D flat pattern (crease pattern) for a design with .meta."""
+    from matplotlib.patches import Rectangle, Polygon
+    m = design.meta
+    for f in design.faces:                       # face fills (full rect, ignore holes)
+        x0, x1, y0, y1 = f['rect']
+        green = np.allclose(f.get('col', STEEL), TABC)
+        ax.add_patch(Rectangle((x0,y0), x1-x0, y1-y0,
+                     fc=("#d7efd7" if green else "#dfe6f2"), ec='none', zorder=1))
+    xs = [p[0] for p in m['perim']]; ys = [p[1] for p in m['perim']]
+    if sym_axes:
+        mx = max(max(map(abs,xs)), max(map(abs,ys))) * 1.12
+        for seg in ([[-mx,mx],[0,0]], [[0,0],[-mx,mx]]):
+            ax.plot(seg[0], seg[1], color="#9a9a9a", lw=0.9, ls=(0,(5,3,1,3)), zorder=0)
+    ax.add_patch(Polygon(m['perim'], closed=True, fill=False, ec='k', lw=2.4, zorder=4))
+    for (x0,x1,y0,y1) in m.get('cuts', []):      # kerf strips / slots (removed)
+        ax.add_patch(Rectangle((x0,y0), x1-x0, y1-y0, fc='white', ec='k', lw=1.0, zorder=5))
+    for (Ax,Ay,Bx,By), mv in m['folds2d']:        # fold lines
+        col = MTN if mv == 'M' else VAL
+        ls = (0,(6,4)) if mv == 'M' else (0,(6,2,1,2))
+        ax.plot([Ax,Bx], [Ay,By], color=col, lw=1.8, ls=ls, zorder=6)
+    ax.set_xlim(min(xs)-pad, max(xs)+pad); ax.set_ylim(min(ys)-pad, max(ys)+pad)
+    ax.set_aspect('equal'); ax.set_xticks([]); ax.set_yticks([])
+    for s in ax.spines.values(): s.set_visible(False)
+
+
 def render(ax, design, view=(26, -52), thick=THICK):
     quads = design.quads(thick); polys, cols, pts = [], [], []
     for verts, rgb in quads:
@@ -169,14 +202,20 @@ def closed_box(a=20.0, h=20.0):
          dict(rect=(-a,a,a,a+h)), dict(rect=(-a,a,-a-h,-a))]
     fo = [(0,1,(a,-a,a,a),-90), (0,2,(-a,-a,-a,a),+90),
           (0,3,(-a,a,a,a),+90), (0,4,(-a,-a,a,-a),-90)]
-    return Design(F, fo)
+    d = Design(F, fo)
+    d.meta = dict(perim=plus_perim(a,a,h), cuts=[],
+                  folds2d=[(f[2],'M') for f in fo])
+    return d
 
 def cross_fins(a=20.0, hw=5.0, h=25.0):
     F = [dict(rect=(-a,a,-a,a)), dict(rect=(a,a+h,-hw,hw)), dict(rect=(-a-h,-a,-hw,hw)),
          dict(rect=(-hw,hw,a,a+h)), dict(rect=(-hw,hw,-a-h,-a))]
     fo = [(0,1,(a,-hw,a,hw),-90), (0,2,(-a,-hw,-a,hw),+90),
           (0,3,(-hw,a,hw,a),+90), (0,4,(-hw,-a,hw,-a),-90)]
-    return Design(F, fo)
+    d = Design(F, fo)
+    d.meta = dict(perim=plus_perim(a,hw,h), cuts=[],
+                  folds2d=[(f[2],'M') for f in fo])
+    return d
 
 def crown(a=20.0, wall=15.0, tip=8.0):
     L = wall + tip
@@ -188,41 +227,55 @@ def crown(a=20.0, wall=15.0, tip=8.0):
     fo = [(0,1,(a,-a,a,a),-90), (0,2,(-a,-a,-a,a),+90), (0,3,(-a,a,a,a),+90), (0,4,(-a,-a,a,-a),-90),
           (1,5,(a+wall,-a,a+wall,a),+90), (2,6,(-a-wall,-a,-a-wall,a),-90),
           (3,7,(-a,a+wall,a,a+wall),-90), (4,8,(-a,-a-wall,a,-a-wall),+90)]
-    return Design(F, fo)
+    d = Design(F, fo)
+    d.meta = dict(perim=plus_perim(a,a,L), cuts=[],
+                  folds2d=[(f[2],'M' if i < 4 else 'V') for i,f in enumerate(fo)])
+    return d
 
 def lanced_tabs(plate=PLATE, inner=10.0, length=15.0, width=10.0):
     P = plate / 2.0
-    holes, tabfaces, folds = [], [], []
-    for k, d in enumerate(['+x','-x','+y','-y']):
-        tab, hole, line, th = lance(d, inner, length, width)
+    holes, tabfaces, folds, cuts, folds2d = [], [], [], [], []
+    for k, ddirec in enumerate(['+x','-x','+y','-y']):
+        tab, hole, line, th = lance(ddirec, inner, length, width)
         holes.append(hole)
         tabfaces.append(dict(rect=tab, col=TABC))
         folds.append((0, 1+k, line, th))
+        cuts += rect_minus(hole, tab)      # the 3 kerf strips of the U-lance
+        folds2d.append((line, 'M'))
     faces = [dict(rect=(-P,P,-P,P), holes=holes)] + tabfaces
-    return Design(faces, folds)
+    d = Design(faces, folds)
+    d.meta = dict(perim=[(-P,-P),(P,-P),(P,P),(-P,P)], cuts=cuts, folds2d=folds2d)
+    return d
 
 
 if __name__ == "__main__":
     import matplotlib; matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    from matplotlib.lines import Line2D
     cases = [
         ("Closed box\ncenter 40x40, wall 20mm", closed_box(), (26,-52)),
         ("Cross fins\ncenter 40x40, fin 10x25mm", cross_fins(), (24,-52)),
         ("Crown / top-loaded\nwall 15, tip 8mm", crown(), (24,-52)),
         ("Lanced 4-tab on 100x100\ntab 10x15mm, kerf 0.5", lanced_tabs(), (34,-54)),
     ]
-    fig = plt.figure(figsize=(16, 4.8))
+    fig = plt.figure(figsize=(16, 8.6))
     for j, (name, d, vw) in enumerate(cases):
-        ax = fig.add_subplot(1, 4, j+1, projection="3d")
-        render(ax, d, view=vw)
-        ax.set_title(name, fontsize=10.5, fontweight="bold")
+        axc = fig.add_subplot(2, 4, j+1)                       # row 1: crease (전개도)
+        draw_crease(axc, d)
+        axc.set_title(name, fontsize=10.5, fontweight="bold")
+        ax3 = fig.add_subplot(2, 4, j+5, projection="3d")      # row 2: folded 3D
+        render(ax3, d, view=vw)
         x0,x1,y0,y1 = d.bbox_xy()
         fits = "fits" if (x1-x0<=PLATE and y1-y0<=PLATE) else "TOO BIG"
         print(f"{name.splitlines()[0]:18s} flat bbox = {x1-x0:.1f} x {y1-y0:.1f} mm  [{fits}]")
-    fig.suptitle("press_fold.py  —  examples folded under locked spec "
+    leg = [Line2D([0],[0],color='k',lw=2.4,label="CUT / blank outline"),
+           Line2D([0],[0],color=MTN,lw=1.8,ls=(0,(6,4)),label="MOUNTAIN +90"),
+           Line2D([0],[0],color=VAL,lw=1.8,ls=(0,(6,2,1,2)),label="VALLEY +90")]
+    fig.legend(handles=leg, loc="lower center", ncol=3, fontsize=10, frameon=True, bbox_to_anchor=(0.5,0.005))
+    fig.suptitle("press_fold.py  —  flat pattern (crease) + folded 3D  "
                  "(100x100mm, t=1mm, 0.5mm grid, kerf 0.5mm)",
-                 fontsize=13, fontweight="bold", y=1.02)
-    fig.tight_layout()
+                 fontsize=13, fontweight="bold", y=0.99)
+    fig.tight_layout(rect=[0,0.04,1,0.97])
     fig.savefig("/tmp/press_fold_demo.png", dpi=130, bbox_inches="tight")
     print("saved /tmp/press_fold_demo.png")
