@@ -109,13 +109,12 @@ class Design:
 
     def quads(self, thick=THICK):
         """
-        Return rendered quads.
+        Return rendered quads as (verts, rgb, alpha) triples.
 
         `holes` controls which regions are removed from the face.
         `hole_walls` optionally controls which holes get vertical wall faces.
-
-        For bend-fillet examples, `holes` may include auxiliary bend openings.
-        If every auxiliary opening draws a wall, the fillet and hole wall overlap.
+        `alpha` (per face) lets a face be rendered semi-transparent so you can
+        see the structure underneath.
         """
         out = []
         for i, f in enumerate(self.faces):
@@ -123,6 +122,7 @@ class Design:
             holes = f.get('holes', [])
             hole_walls = f.get('hole_walls', holes)
             rgb = f.get('col', STEEL)
+            alpha = f.get('alpha', 1.0)
             n = self._normal(i)
             off = 0.5 * thick * n
 
@@ -142,21 +142,18 @@ class Design:
             for (x0, x1, y0, y1) in tiles:
                 if x1 - x0 <= 1e-9 or y1 - y0 <= 1e-9:
                     continue
-                out.append(([top(x0, y0), top(x1, y0), top(x1, y1), top(x0, y1)], rgb))
-                out.append(([bot(x0, y0), bot(x1, y0), bot(x1, y1), bot(x0, y1)], rgb))
+                out.append(([top(x0, y0), top(x1, y0), top(x1, y1), top(x0, y1)], rgb, alpha))
+                out.append(([bot(x0, y0), bot(x1, y0), bot(x1, y1), bot(x0, y1)], rgb, alpha))
 
             def walls(x0, x1, y0, y1):
                 for (p, qq) in [((x0, y0), (x1, y0)),
                                 ((x1, y0), (x1, y1)),
                                 ((x1, y1), (x0, y1)),
                                 ((x0, y1), (x0, y0))]:
-                    out.append(([top(*p), top(*qq), bot(*qq), bot(*p)], rgb))
+                    out.append(([top(*p), top(*qq), bot(*qq), bot(*p)], rgb, alpha))
 
             walls(*rect)
 
-            # 수정 포인트:
-            # 원래는 모든 holes에 대해 walls를 그림.
-            # 이제는 face가 hole_walls를 따로 갖고 있으면 그것만 벽으로 그림.
             for h in hole_walls:
                 walls(*h)
 
@@ -231,8 +228,8 @@ def draw_crease(ax, design, sym_axes=True, pad=4.0):
         s.set_visible(False)
 
 
-def _box_quads(b, rgb):
-    """Six face quads of an axis-aligned box."""
+def _box_quads(b, rgb, alpha=1.0):
+    """Six face quads of an axis-aligned box, each as (verts, rgb, alpha)."""
     x0, x1, y0, y1, z0, z1 = b
     F = [[(x0,y0,z0),(x1,y0,z0),(x1,y1,z0),(x0,y1,z0)],
          [(x0,y0,z1),(x1,y0,z1),(x1,y1,z1),(x0,y1,z1)],
@@ -240,7 +237,7 @@ def _box_quads(b, rgb):
          [(x0,y1,z0),(x1,y1,z0),(x1,y1,z1),(x0,y1,z1)],
          [(x0,y0,z0),(x0,y1,z0),(x0,y1,z1),(x0,y0,z1)],
          [(x1,y0,z0),(x1,y1,z0),(x1,y1,z1),(x1,y0,z1)]]
-    return [(f, rgb) for f in F]
+    return [(f, rgb, alpha) for f in F]
 
 
 def pcb_box(plate_size=PLATE, top_z=0.0, thick=1.6, color=FR4):
@@ -250,11 +247,17 @@ def pcb_box(plate_size=PLATE, top_z=0.0, thick=1.6, color=FR4):
 
 
 def _shade_quads(quads):
+    """Accept (verts, rgb) or (verts, rgb, alpha). Output RGBA face colours."""
     polys, cols, pts = [], [], []
-    for verts, rgb in quads:
+    for q in quads:
+        if len(q) == 2:
+            verts, rgb = q; alpha = 1.0
+        else:
+            verts, rgb, alpha = q
         f = AMB + DIF * abs(float(np.dot(_newell(verts), LIGHT)))
+        s = np.clip(np.asarray(rgb, float) * f, 0, 1)
+        cols.append((float(s[0]), float(s[1]), float(s[2]), float(alpha)))
         polys.append(verts)
-        cols.append(tuple(np.clip(np.asarray(rgb) * f, 0, 1)))
         pts += [np.asarray(p, float) for p in verts]
     return polys, cols, pts
 
@@ -550,10 +553,11 @@ def bend_fillet_extras(design, r=None, t=None, N=10):
         ro = r + t / 2.0
         ri = max(r - t / 2.0, 0.01)
 
-        # bend region: tint with the child (tab) colour so the curved bend reads
-        # clearly. Now that fillets ride in the main collection (correct depth
-        # sort) the "green halo" that used to spill over the radiator top is gone.
+        # bend region: tint with the child (tab) colour so the curve reads
+        # clearly; inherit the PARENT's alpha so a transparent radiator carries
+        # its transparency through into the fillet.
         col = design.faces[child].get('col', design.faces[parent].get('col', STEEL))
+        alpha = design.faces[parent].get('alpha', 1.0)
 
         for i in range(N):
             a0 = ath * i / N
@@ -562,33 +566,14 @@ def bend_fillet_extras(design, r=None, t=None, N=10):
             o0 = -n_bend_3d * np.cos(a0) - v_par_3d * np.sin(a0)
             o1 = -n_bend_3d * np.cos(a1) - v_par_3d * np.sin(a1)
 
-            # outer convex strip
-            extras.append((
-                [tuple(bA + ro*o0), tuple(bB + ro*o0),
-                 tuple(bB + ro*o1), tuple(bA + ro*o1)],
-                col
-            ))
-
-            # inner concave strip
-            extras.append((
-                [tuple(bA + ri*o0), tuple(bB + ri*o0),
-                 tuple(bB + ri*o1), tuple(bA + ri*o1)],
-                col
-            ))
-
-            # end cap A
-            extras.append((
-                [tuple(bA + ri*o0), tuple(bA + ro*o0),
-                 tuple(bA + ro*o1), tuple(bA + ri*o1)],
-                col
-            ))
-
-            # end cap B
-            extras.append((
-                [tuple(bB + ri*o0), tuple(bB + ro*o0),
-                 tuple(bB + ro*o1), tuple(bB + ri*o1)],
-                col
-            ))
+            extras.append(([tuple(bA + ro*o0), tuple(bB + ro*o0),
+                            tuple(bB + ro*o1), tuple(bA + ro*o1)], col, alpha))
+            extras.append(([tuple(bA + ri*o0), tuple(bB + ri*o0),
+                            tuple(bB + ri*o1), tuple(bA + ri*o1)], col, alpha))
+            extras.append(([tuple(bA + ri*o0), tuple(bA + ro*o0),
+                            tuple(bA + ro*o1), tuple(bA + ri*o1)], col, alpha))
+            extras.append(([tuple(bB + ri*o0), tuple(bB + ro*o0),
+                            tuple(bB + ro*o1), tuple(bB + ri*o1)], col, alpha))
 
     return extras
 
@@ -684,6 +669,8 @@ if __name__ == "__main__":
         leg_len=8.0,
         leg_w=5.0,
     )
+    d.faces[0]['alpha'] = 0.45            # make the radiator semi-transparent
+                                          # (fillets inherit this alpha automatically)
 
     fig2 = plt.figure(figsize=(15.5, 6.4))
 
