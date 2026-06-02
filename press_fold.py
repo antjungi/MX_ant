@@ -329,7 +329,8 @@ def bend_fillet_extras(design, r=None, t=None, N=10):
         ath = np.radians(abs(theta))
         ro = r + t/2.0
         ri = max(r - t/2.0, 0.01)
-        col = design.faces[child].get('col', design.faces[parent].get('col', STEEL))
+        # bend region is continuous radiator metal -> match PARENT colour (not child tab tint)
+        col = design.faces[parent].get('col', STEEL)
         for i in range(N):
             a0 = ath * i / N
             a1 = ath * (i+1) / N
