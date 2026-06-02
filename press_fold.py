@@ -30,6 +30,7 @@ KERF  = 0.5
 
 STEEL = np.array([0.66, 0.70, 0.78])
 TABC  = np.array([0.55, 0.78, 0.55])
+FR4   = np.array([0.14, 0.45, 0.22])   # PCB substrate (green)
 LIGHT = np.array([0.4, 0.5, 0.78]); LIGHT = LIGHT / np.linalg.norm(LIGHT)
 AMB, DIF = 0.42, 0.58
 MTN, VAL = "#d62728", "#1f77b4"   # mountain / valley fold colours (2D crease)
@@ -156,6 +157,38 @@ def draw_crease(ax, design, sym_axes=True, pad=4.0):
     for s in ax.spines.values(): s.set_visible(False)
 
 
+def _box_quads(b, rgb):
+    """Six face quads of an axis-aligned box (unshaded; shading happens later)."""
+    x0, x1, y0, y1, z0, z1 = b
+    F = [[(x0,y0,z0),(x1,y0,z0),(x1,y1,z0),(x0,y1,z0)],
+         [(x0,y0,z1),(x1,y0,z1),(x1,y1,z1),(x0,y1,z1)],
+         [(x0,y0,z0),(x1,y0,z0),(x1,y0,z1),(x0,y0,z1)],
+         [(x0,y1,z0),(x1,y1,z0),(x1,y1,z1),(x0,y1,z1)],
+         [(x0,y0,z0),(x0,y1,z0),(x0,y1,z1),(x0,y0,z1)],
+         [(x1,y0,z0),(x1,y1,z0),(x1,y1,z1),(x1,y0,z1)]]
+    return [(f, rgb) for f in F]
+
+
+def pcb_box(plate_size=PLATE, top_z=0.0, thick=1.6, color=FR4):
+    """Return quad list for a PCB substrate box sitting under top_z."""
+    P = plate_size / 2.0
+    return _box_quads((-P, P, -P, P, top_z-thick, top_z), color)
+
+
+def render_assembly(ax, design, extras=(), view=(26, -52), thick=THICK):
+    """Render a Design plus extra unshaded quads (e.g. a PCB) into one collection."""
+    quads = list(design.quads(thick)) + list(extras)
+    polys, cols, pts = [], [], []
+    for verts, rgb in quads:
+        f = AMB + DIF * abs(float(np.dot(_newell(verts), LIGHT)))
+        polys.append(verts); cols.append(tuple(np.clip(rgb*f, 0, 1))); pts += verts
+    pc = Poly3DCollection(polys, facecolors=cols, edgecolor='none'); pc.set_zsort('average')
+    ax.add_collection3d(pc)
+    P = np.array(pts); lo = P.min(0); hi = P.max(0); c = (lo+hi)/2; r = (hi-lo).max()/2*1.08
+    ax.set_xlim(c[0]-r, c[0]+r); ax.set_ylim(c[1]-r, c[1]+r); ax.set_zlim(c[2]-r, c[2]+r)
+    ax.set_box_aspect((1, 1, 1)); ax.view_init(elev=view[0], azim=view[1]); ax.set_axis_off()
+
+
 def render(ax, design, view=(26, -52), thick=THICK):
     quads = design.quads(thick); polys, cols, pts = [], [], []
     for verts, rgb in quads:
@@ -232,6 +265,25 @@ def crown(a=20.0, wall=15.0, tip=8.0):
                   folds2d=[(f[2],'M' if i < 4 else 'V') for i,f in enumerate(fo)])
     return d
 
+def planar_on_pcb(plate=PLATE, leg_inner=35.0, leg_len=8.0, leg_w=6.0):
+    """Planar radiator with 4 lanced U-tabs folded DOWN to land on a PCB below.
+       leg_inner = fold position from centre,  leg_len = drop height to PCB."""
+    P = plate / 2.0
+    holes, legfaces, folds, cuts, folds2d = [], [], [], [], []
+    for k, dirn in enumerate(['+x', '-x', '+y', '-y']):
+        tab, hole, line, th_up = lance(dirn, leg_inner, leg_len, leg_w)
+        holes.append(hole)
+        legfaces.append(dict(rect=tab, col=TABC))
+        folds.append((0, 1+k, line, -th_up))       # NEGATE -> fold DOWN
+        cuts += rect_minus(hole, tab)
+        folds2d.append((line, 'V'))                 # valley = down (toward PCB)
+    faces = [dict(rect=(-P,P,-P,P), holes=holes)] + legfaces
+    d = Design(faces, folds)
+    d.meta = dict(perim=[(-P,-P),(P,-P),(P,P),(-P,P)], cuts=cuts, folds2d=folds2d,
+                  leg_drop=leg_len)
+    return d
+
+
 def lanced_tabs(plate=PLATE, inner=10.0, length=15.0, width=10.0):
     P = plate / 2.0
     holes, tabfaces, folds, cuts, folds2d = [], [], [], [], []
@@ -279,3 +331,23 @@ if __name__ == "__main__":
     fig.tight_layout(rect=[0,0.04,1,0.97])
     fig.savefig("/tmp/press_fold_demo.png", dpi=130, bbox_inches="tight")
     print("saved /tmp/press_fold_demo.png")
+
+    # ------- planar antenna on PCB (radiator + 4 U-legs folded DOWN) -------
+    d = planar_on_pcb()
+    fig2 = plt.figure(figsize=(14.5, 6.6))
+    axc = fig2.add_subplot(1, 2, 1); draw_crease(axc, d)
+    axc.set_title("Flat pattern (crease)  —  radiator 100x100 mm,  4 U-lances",
+                  fontsize=11, fontweight="bold")
+    ax3 = fig2.add_subplot(1, 2, 2, projection="3d")
+    pcb = pcb_box(PLATE, top_z=-d.meta['leg_drop'])
+    render_assembly(ax3, d, extras=pcb, view=(18, -55))
+    ax3.set_title(f"Folded  —  radiator floats {d.meta['leg_drop']:.0f} mm above PCB (FR4 1.6 mm)",
+                  fontsize=11, fontweight="bold")
+    leg2 = [Line2D([0],[0],color='k',lw=2.4,label="CUT / blank outline"),
+            Line2D([0],[0],color=VAL,lw=1.8,ls=(0,(6,2,1,2)),label="VALLEY -90 (legs fold DOWN)")]
+    fig2.legend(handles=leg2, loc="lower center", ncol=2, fontsize=10, frameon=True, bbox_to_anchor=(0.5,0.005))
+    fig2.suptitle("Planar antenna on PCB  —  radiator with 4 lanced legs bent DOWN to PCB",
+                  fontsize=13, fontweight="bold", y=0.99)
+    fig2.tight_layout(rect=[0,0.05,1,0.96])
+    fig2.savefig("/tmp/press_fold_planar.png", dpi=130, bbox_inches="tight")
+    print("saved /tmp/press_fold_planar.png")
