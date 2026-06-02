@@ -151,8 +151,9 @@ def draw_crease(ax, design, sym_axes=True, pad=4.0):
         ax.add_patch(Rectangle((x0,y0), x1-x0, y1-y0, fc='white', ec='k', lw=1.0, zorder=5))
     for (Ax,Ay,Bx,By), mv in m['folds2d']:        # fold lines
         col = MTN if mv == 'M' else VAL
-        ls = (0,(6,4)) if mv == 'M' else (0,(6,2,1,2))
-        ax.plot([Ax,Bx], [Ay,By], color=col, lw=1.8, ls=ls, zorder=6)
+        ls = (0,(6,4)) if mv == 'M' else (0,(1,2.5))   # mountain dashed, valley DOTTED
+        lw = 1.8 if mv == 'M' else 2.4
+        ax.plot([Ax,Bx], [Ay,By], color=col, lw=lw, ls=ls, zorder=6)
     ax.set_xlim(min(xs)-pad, max(xs)+pad); ax.set_ylim(min(ys)-pad, max(ys)+pad)
     ax.set_aspect('equal'); ax.set_xticks([]); ax.set_yticks([])
     for s in ax.spines.values(): s.set_visible(False)
@@ -298,7 +299,7 @@ def planar_on_pcb(plate=PLATE, leg_inner=35.0, leg_len=8.0, leg_w=6.0, bend_r=BE
     faces = [dict(rect=(-P,P,-P,P), holes=holes)] + legfaces
     d = Design(faces, folds)
     d.meta = dict(perim=[(-P,-P),(P,-P),(P,P),(-P,P)], cuts=cuts, folds2d=folds2d,
-                  leg_drop=leg_len, bend_r=bend_r)
+                  leg_drop=leg_len, bend_r=bend_r, plate=plate)
     return d
 
 
@@ -396,23 +397,29 @@ if __name__ == "__main__":
     fig.savefig("/tmp/press_fold_demo.png", dpi=130, bbox_inches="tight")
     print("saved /tmp/press_fold_demo.png")
 
-    # ------- planar antenna on PCB (radiator + 4 U-legs folded DOWN) -------
-    d = planar_on_pcb()
-    fig2 = plt.figure(figsize=(14.5, 6.6))
-    axc = fig2.add_subplot(1, 2, 1); draw_crease(axc, d)
-    axc.set_title("Flat pattern (crease)  —  radiator 100x100 mm,  4 U-lances",
+    # ------- planar antenna on PCB (50 x 50 mm radiator + 4 U-legs folded DOWN) -------
+    d = planar_on_pcb(plate=50.0, leg_inner=14.0, leg_len=8.0, leg_w=5.0)
+    fig2 = plt.figure(figsize=(15.5, 6.4))
+    axc = fig2.add_subplot(1, 3, 1); draw_crease(axc, d)
+    axc.set_title(f"Flat pattern (crease)\nradiator {d.meta['plate']:.0f}x{d.meta['plate']:.0f} mm,  4 U-lances",
                   fontsize=11, fontweight="bold")
-    ax3 = fig2.add_subplot(1, 2, 2, projection="3d")
-    pcb = pcb_box(PLATE, top_z=-d.meta['leg_drop'])
+    pcb     = pcb_box(plate_size=d.meta['plate'], top_z=-d.meta['leg_drop'])
     fillets = bend_fillet_extras(d)
-    render_assembly(ax3, d, extras=list(pcb) + list(fillets), view=(14, -52))
-    ax3.set_title(f"Folded  —  radiator floats {d.meta['leg_drop']:.0f} mm above PCB (FR4 1.6 mm)",
-                  fontsize=11, fontweight="bold")
+    # isometric view
+    ax_iso = fig2.add_subplot(1, 3, 2, projection="3d")
+    render_assembly(ax_iso, d, extras=list(pcb) + list(fillets), view=(22, -48))
+    ax_iso.set_title(f"Folded — isometric\nradiator floats {d.meta['leg_drop']:.0f} mm above PCB (FR4 1.6 mm)",
+                     fontsize=11, fontweight="bold")
+    # near-side view (shows 1 mm thickness, kerf gap, fillet curvature)
+    ax_side = fig2.add_subplot(1, 3, 3, projection="3d")
+    render_assembly(ax_side, d, extras=list(pcb) + list(fillets), view=(4, -90))
+    ax_side.set_title("Folded — side view\n(thickness, kerf, fillet visible)",
+                      fontsize=11, fontweight="bold")
     leg2 = [Line2D([0],[0],color='k',lw=2.4,label="CUT / blank outline"),
-            Line2D([0],[0],color=VAL,lw=1.8,ls=(0,(6,2,1,2)),label="VALLEY -90 (legs fold DOWN)")]
+            Line2D([0],[0],color=VAL,lw=2.4,ls=(0,(1,2.5)),label="VALLEY -90 (legs fold DOWN)")]
     fig2.legend(handles=leg2, loc="lower center", ncol=2, fontsize=10, frameon=True, bbox_to_anchor=(0.5,0.005))
-    fig2.suptitle("Planar antenna on PCB  —  radiator with 4 lanced legs bent DOWN to PCB",
+    fig2.suptitle("Planar antenna on PCB  —  50 x 50 mm radiator with 4 lanced legs bent DOWN",
                   fontsize=13, fontweight="bold", y=0.99)
-    fig2.tight_layout(rect=[0,0.05,1,0.96])
+    fig2.tight_layout(rect=[0,0.05,1,0.94])
     fig2.savefig("/tmp/press_fold_planar.png", dpi=130, bbox_inches="tight")
     print("saved /tmp/press_fold_planar.png")
