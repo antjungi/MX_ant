@@ -27,6 +27,7 @@ PLATE = 100.0
 GRID  = 0.5
 THICK = 1.0
 KERF  = 0.5
+BEND_R = 1.0     # min bend radius (mm) ~ 1 x sheet thickness for a 90 deg press
 
 STEEL = np.array([0.66, 0.70, 0.78])
 TABC  = np.array([0.55, 0.78, 0.55])
@@ -265,23 +266,86 @@ def crown(a=20.0, wall=15.0, tip=8.0):
                   folds2d=[(f[2],'M' if i < 4 else 'V') for i,f in enumerate(fo)])
     return d
 
-def planar_on_pcb(plate=PLATE, leg_inner=35.0, leg_len=8.0, leg_w=6.0):
+def planar_on_pcb(plate=PLATE, leg_inner=35.0, leg_len=8.0, leg_w=6.0, bend_r=BEND_R):
     """Planar radiator with 4 lanced U-tabs folded DOWN to land on a PCB below.
-       leg_inner = fold position from centre,  leg_len = drop height to PCB."""
+       Each leg is truncated by bend_r on the hinge side and the radiator hole is
+       extended by bend_r so the bend region has room for a fillet."""
     P = plate / 2.0
+    hw = leg_w / 2.0
     holes, legfaces, folds, cuts, folds2d = [], [], [], [], []
     for k, dirn in enumerate(['+x', '-x', '+y', '-y']):
         tab, hole, line, th_up = lance(dirn, leg_inner, leg_len, leg_w)
-        holes.append(hole)
-        legfaces.append(dict(rect=tab, col=TABC))
-        folds.append((0, 1+k, line, -th_up))       # NEGATE -> fold DOWN
+        # kerf strips (real cuts in flat pattern)
         cuts += rect_minus(hole, tab)
-        folds2d.append((line, 'V'))                 # valley = down (toward PCB)
+        # truncate the leg face by bend_r on hinge side; record the bend extension
+        if dirn == '+x':
+            tab2 = (tab[0]+bend_r, tab[1], tab[2], tab[3])
+            bend_ext = (leg_inner-bend_r, leg_inner, -hw, hw)
+        elif dirn == '-x':
+            tab2 = (tab[0], tab[1]-bend_r, tab[2], tab[3])
+            bend_ext = (-leg_inner, -leg_inner+bend_r, -hw, hw)
+        elif dirn == '+y':
+            tab2 = (tab[0], tab[1], tab[2]+bend_r, tab[3])
+            bend_ext = (-hw, hw, leg_inner-bend_r, leg_inner)
+        else:   # '-y'
+            tab2 = (tab[0], tab[1], tab[2], tab[3]-bend_r)
+            bend_ext = (-hw, hw, -leg_inner, -leg_inner+bend_r)
+        holes.append(hole)
+        holes.append(bend_ext)              # extra opening in radiator for the fillet
+        legfaces.append(dict(rect=tab2, col=TABC))
+        folds.append((0, 1+k, line, -th_up))   # NEGATE -> fold DOWN
+        folds2d.append((line, 'V'))             # valley = down (toward PCB)
     faces = [dict(rect=(-P,P,-P,P), holes=holes)] + legfaces
     d = Design(faces, folds)
     d.meta = dict(perim=[(-P,-P),(P,-P),(P,P),(-P,P)], cuts=cuts, folds2d=folds2d,
-                  leg_drop=leg_len)
+                  leg_drop=leg_len, bend_r=bend_r)
     return d
+
+
+def bend_fillet_extras(design, r=None, t=None, N=10):
+    """Generate quarter-cylindrical fillet patches (outer + inner surface + side caps)
+    for every fold in a design. Returns a list of (verts, rgb) quads to drop into
+    render_assembly's extras."""
+    if r is None: r = BEND_R
+    if t is None: t = THICK
+    extras = []
+    for parent, child, line, theta in design.folds:
+        Ax, Ay, Bx, By = line
+        Mp, tp = design.tf[parent]
+        A3 = Mp @ np.array([Ax, Ay, 0.0]) + tp
+        B3 = Mp @ np.array([Bx, By, 0.0]) + tp
+        u_axis = B3 - A3
+        hd = np.array([Bx-Ax, By-Ay, 0.0]); hd /= np.linalg.norm(hd)
+        perp = np.array([-hd[1], hd[0], 0.0])
+        pr = design.faces[parent]['rect']
+        cf = np.array([(pr[0]+pr[1])/2-(Ax+Bx)/2, (pr[2]+pr[3])/2-(Ay+By)/2, 0.0])
+        v_par_flat = perp * (1.0 if np.dot(cf, perp) > 0 else -1.0)
+        v_par_3d = Mp @ v_par_flat
+        R = rot_axis(u_axis, theta)
+        n_bend_3d = R @ (Mp @ (-v_par_flat))
+        bA = A3 + r*v_par_3d + r*n_bend_3d
+        bB = B3 + r*v_par_3d + r*n_bend_3d
+        ath = np.radians(abs(theta))
+        ro = r + t/2.0
+        ri = max(r - t/2.0, 0.01)
+        col = design.faces[child].get('col', design.faces[parent].get('col', STEEL))
+        for i in range(N):
+            a0 = ath * i / N
+            a1 = ath * (i+1) / N
+            o0 = -n_bend_3d*np.cos(a0) - v_par_3d*np.sin(a0)
+            o1 = -n_bend_3d*np.cos(a1) - v_par_3d*np.sin(a1)
+            # outer (convex) strip
+            extras.append(([tuple(bA + ro*o0), tuple(bB + ro*o0),
+                            tuple(bB + ro*o1), tuple(bA + ro*o1)], col))
+            # inner (concave) strip
+            extras.append(([tuple(bA + ri*o0), tuple(bB + ri*o0),
+                            tuple(bB + ri*o1), tuple(bA + ri*o1)], col))
+            # end caps (annular wedges) at each hinge endpoint
+            extras.append(([tuple(bA + ri*o0), tuple(bA + ro*o0),
+                            tuple(bA + ro*o1), tuple(bA + ri*o1)], col))
+            extras.append(([tuple(bB + ri*o0), tuple(bB + ro*o0),
+                            tuple(bB + ro*o1), tuple(bB + ri*o1)], col))
+    return extras
 
 
 def lanced_tabs(plate=PLATE, inner=10.0, length=15.0, width=10.0):
@@ -340,7 +404,8 @@ if __name__ == "__main__":
                   fontsize=11, fontweight="bold")
     ax3 = fig2.add_subplot(1, 2, 2, projection="3d")
     pcb = pcb_box(PLATE, top_z=-d.meta['leg_drop'])
-    render_assembly(ax3, d, extras=pcb, view=(18, -55))
+    fillets = bend_fillet_extras(d)
+    render_assembly(ax3, d, extras=list(pcb) + list(fillets), view=(14, -52))
     ax3.set_title(f"Folded  —  radiator floats {d.meta['leg_drop']:.0f} mm above PCB (FR4 1.6 mm)",
                   fontsize=11, fontweight="bold")
     leg2 = [Line2D([0],[0],color='k',lw=2.4,label="CUT / blank outline"),
