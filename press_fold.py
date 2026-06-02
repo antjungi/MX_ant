@@ -274,15 +274,17 @@ def _set_axes_equal_from_pts(ax, pts, view):
     ax.set_axis_off()
 
 
-def render_assembly(ax, design, extras=(), view=(26, -52), thick=THICK):
+def render_assembly(ax, design, extras=(), fillets=(), view=(26, -52), thick=THICK):
     """
-    Render a Design plus extra quads.
+    Render a Design plus extras and bend fillets.
 
-    수정 포인트:
-      - PCB/extras와 folded metal을 별도 collection으로 그림.
-      - 큰 PCB 면과 작은 leg/fillet 면의 depth sort 깨짐을 조금 줄임.
+    extras  : background quads drawn BEHIND the design (e.g. PCB)
+    fillets : quads merged WITH the design's main collection so they depth-sort
+              correctly against the radiator / legs.  This is important — if
+              fillets are dropped into `extras` they get painted over by the
+              radiator and the bend curve disappears.
     """
-    main_quads = list(design.quads(thick))
+    main_quads  = list(design.quads(thick)) + list(fillets)
     extra_quads = list(extras)
 
     all_pts = []
@@ -548,8 +550,10 @@ def bend_fillet_extras(design, r=None, t=None, N=10):
         ro = r + t / 2.0
         ri = max(r - t / 2.0, 0.01)
 
-        # bend region is continuous radiator metal -> match parent colour
-        col = design.faces[parent].get('col', STEEL)
+        # bend region: tint with the child (tab) colour so the curved bend reads
+        # clearly. Now that fillets ride in the main collection (correct depth
+        # sort) the "green halo" that used to spill over the radiator top is gone.
+        col = design.faces[child].get('col', design.faces[parent].get('col', STEEL))
 
         for i in range(N):
             a0 = ath * i / N
@@ -708,7 +712,8 @@ if __name__ == "__main__":
     render_assembly(
         ax_iso,
         d,
-        extras=list(pcb) + list(fillets),
+        extras=list(pcb),
+        fillets=list(fillets),
         view=(22, -48),
     )
 
@@ -724,7 +729,8 @@ if __name__ == "__main__":
     render_assembly(
         ax_side,
         d,
-        extras=list(pcb) + list(fillets),
+        extras=list(pcb),
+        fillets=list(fillets),
         view=(4, -90),
     )
 
