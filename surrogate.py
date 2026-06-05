@@ -1,26 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Surrogate-only training: data → encoder → latent → S-param MLP
-==============================================================
-
-AE_main 의 전체 AE (encoder + decoder + 보조 head) 중에서
-★ encoder + surrogate MLP 만 ★ 떼내서 학습하는 standalone 스크립트.
-
-목적:
-  - "안테나 구조 (토큰 시퀀스) → S-param 예측" 만 하는 성능 추론기
-  - decoder / cmd-prm reconstruction loss / aux loss / inverse 다 없음
-  - 학습 loss = S-param dB RMSE (+ optional VICReg)
-
-장점:
-  - 더 작고 빠름 (decoder 관련 ~10M 파라미터 제거)
-  - 학습 신호 단일화 (S-param 만)
-  - 인코더가 "S-param 예측" 에만 특화 → recon 보단 성능 예측 정확도가 더 중요할 때
-
-CFG 기본은 AE_main 의 small preset 과 동일. 학습 후 `ckpt/surrogate_last.pt` 저장.
-
-데이터 로딩 / S-param 파싱 / VICReg / interp matrix 같은 인프라는 AE_main 에서 import.
-"""
+"""Surrogate-only training: encoder + S-param MLP (decoder 없음)."""
 
 import os
 import sys
