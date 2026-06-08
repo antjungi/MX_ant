@@ -1425,6 +1425,7 @@ def build_common_curve_and_print_baseline(dataset, train_idx, val_idx_per_type, 
 
 
 
+@torch.no_grad()
 def evaluate_sparam_predictions(ae, mlp, dataset, val_idx_per_type, type_names, cfg, device):
     ae.eval(); mlp.eval()
 
@@ -1509,6 +1510,7 @@ def evaluate_sparam_predictions(ae, mlp, dataset, val_idx_per_type, type_names, 
 
 
 
+@torch.no_grad()
 def diagnose_latent_simple(ae, dataset, indices, device):
     ae.eval()
     z_list = []
@@ -1568,6 +1570,7 @@ def plot_training_curves(hist):
 
 
 
+@torch.no_grad()
 def collect_latents(ae, dataset, indices, device, batch_size=32):
     ae.eval()
     z_list = []
@@ -1690,6 +1693,7 @@ def analyze_latent_space(z_all, type_ids=None, type_names=None):
 
 
 
+@torch.no_grad()
 def visualize_sparam_predictions(
     ae, mlp, dataset, val_indices, device,
     n_samples=3, seed=0,
