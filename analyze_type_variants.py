@@ -53,6 +53,19 @@ USE_JSON_NAMES  = True
 # token signature 에 param 의 통계도 포함할지 (True 면 같은 토폴로지여도 param 분포 다르면 분리됨 — 보통 False)
 INCLUDE_PARAM_HISTOGRAM = False
 
+# ── ★ Variant 제외 ★ ──
+# 분석 결과의 rank 가 여기 들어있는 variant 들의 sample 파일을 옮기거나 지움.
+# 빈 list [] → 아무 것도 안 함 (기본).
+# 예시:  EXCLUDE_VARIANTS = [3]      → variant 3 sample 들 제외
+#        EXCLUDE_VARIANTS = [3, 5]   → variant 3 과 5 제외
+EXCLUDE_VARIANTS = []
+
+# 어떻게 제외할지:  "move" (안전, 되돌릴 수 있음)  /  "delete" (영구)
+#   "move" → {TYPE_DIR}_excluded/ 폴더로 이동.
+#            나중에 다시 쓰려면 그 폴더에서 원래 자리로 복사하면 됨.
+EXCLUDE_MODE = "move"
+EXCLUDE_FOLDER_SUFFIX = "_excluded"   # 이동될 폴더 이름의 suffix
+
 
 # ═══════════════════════════════════════════════════════════════
 
@@ -311,6 +324,81 @@ def _set_axes_struct(ax, pts):
         pass
 
 
+# ══════════════════════════════════════════════════════════════
+# Variant 제외 (선택된 variant 의 sample 파일들을 옮기거나 삭제)
+# ══════════════════════════════════════════════════════════════
+def do_exclude_variants(groups_sorted, type_dir_abs,
+                        ranks_to_exclude, mode="move",
+                        folder_suffix="_excluded"):
+    """ranks_to_exclude 의 variant 들에 속한 모든 sample 파일을 처리.
+
+    한 sample 당 같이 옮길/지울 파일:
+      - {basename}_tokens.npy
+      - {basename}_deepcad.json
+      - {basename}_tokens_float.npy   (있을 때만)
+
+    mode="move":   {type_dir_abs}{folder_suffix}/ 폴더로 이동.
+                   학습 코드 (surrogate.py) 가 더 이상 이 폴더 안 보니까
+                   자동으로 학습 대상에서 제외됨.
+    mode="delete": 영구 삭제. 되돌릴 수 없음.
+    """
+    import shutil
+
+    rank_set = set(int(r) for r in ranks_to_exclude)
+    target_groups = []
+    for r0, (sig, group) in enumerate(groups_sorted):
+        rank = r0 + 1
+        if rank in rank_set:
+            target_groups.append((rank, sig, group))
+
+    if not target_groups:
+        print(f"\n  ⚠ EXCLUDE_VARIANTS={ranks_to_exclude} 중 매칭되는 그룹 없음 (전체 {len(groups_sorted)} 개)")
+        return
+
+    n_samples = sum(len(g) for _, _, g in target_groups)
+    print(f"\n  ★ EXCLUDE {len(target_groups)} variant(s) → {n_samples} sample(s) "
+          f"  mode={mode}")
+    for rank, sig, group in target_groups:
+        print(f"    - Variant {rank}: {len(group)} samples  ({sig_to_str(sig)[:60]})")
+
+    if mode == "move":
+        excluded_dir = type_dir_abs.rstrip(os.sep) + folder_suffix
+        os.makedirs(excluded_dir, exist_ok=True)
+        print(f"    → moving to: {excluded_dir}/")
+
+    n_moved = 0
+    n_failed = 0
+    for rank, sig, group in target_groups:
+        for s in group:
+            npy_path = s["npy"]
+            json_path = npy_path.replace("_tokens.npy", "_deepcad.json")
+            float_path = npy_path.replace("_tokens.npy", "_tokens_float.npy")
+
+            files_to_handle = [npy_path]
+            if os.path.exists(json_path):
+                files_to_handle.append(json_path)
+            if os.path.exists(float_path):
+                files_to_handle.append(float_path)
+
+            for fp in files_to_handle:
+                try:
+                    if mode == "delete":
+                        os.remove(fp)
+                    elif mode == "move":
+                        dst = os.path.join(excluded_dir, os.path.basename(fp))
+                        shutil.move(fp, dst)
+                    else:
+                        raise ValueError(f"Unknown EXCLUDE_MODE: {mode}")
+                    n_moved += 1
+                except Exception as e:
+                    print(f"    ✗ failed {os.path.basename(fp)}: {e}")
+                    n_failed += 1
+
+    print(f"  ✓ {mode}d {n_moved} file(s)" + (f", {n_failed} failed" if n_failed else ""))
+    if mode == "move":
+        print(f"    되돌리려면: {excluded_dir} 의 파일들을 다시 {type_dir_abs} 로 복사.")
+
+
 def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     type_dir_abs = TYPE_DIR if os.path.isabs(TYPE_DIR) else os.path.join(script_dir, TYPE_DIR)
@@ -389,6 +477,15 @@ def main():
         print(f"\n  ✓ report saved → {report_path}")
     except Exception as e:
         print(f"  ⚠ failed to save report: {e}")
+
+    # ── 4.5) EXCLUDE_VARIANTS 처리: 선택한 variant 들의 sample 옮기기/삭제 ──
+    if EXCLUDE_VARIANTS:
+        do_exclude_variants(
+            groups_sorted, type_dir_abs,
+            ranks_to_exclude=EXCLUDE_VARIANTS,
+            mode=EXCLUDE_MODE,
+            folder_suffix=EXCLUDE_FOLDER_SUFFIX,
+        )
 
     # ── 5) 시각화: 상위 N 그룹의 대표 sample 3D ──
     if SHOW_FIGURES:
