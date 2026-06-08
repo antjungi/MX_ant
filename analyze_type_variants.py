@@ -92,6 +92,12 @@ CANONICALIZE_PREVIEW = True
 APPLY_CANONICALIZE = False
 CANONICALIZE_BACKUP_SUFFIX = "_canon_backup"
 
+# True 면 COUNT_TOLERANCE / SOL 조건 무시하고 "타입 안 모든 sample" 을 한 그룹으로
+# 취급해서 dominant exact-skeleton 으로 통일.  결과: 타입별 정확히 1개 골격.
+# 주의: 너무 다른 topology (예: 1 loop vs 2 loop) 까지 강제로 합치면 일부 sample 은
+# canonicalize 가 깨끗하게 안 될 수 있음. preview 보고 OK 일 때만 사용.
+FORCE_SINGLE_SKELETON_PER_TYPE = False
+
 # ── ★ Variant 제외 ★ ──
 # type 별로 따로 지정.  키 = TYPE_DIRS 의 label, 값 = 제외할 rank 리스트.
 # 빈 dict {} 또는 키가 없는 type 은 아무 것도 안 함 (기본).
@@ -897,9 +903,18 @@ def analyze_one_type(type_label, type_dir_abs):
 
     # ── 4.7) Canonicalize APPLY: 실제 _tokens.npy 변환 + 원본 백업 ──
     if APPLY_CANONICALIZE and len(exact_groups) >= 2:
+        if FORCE_SINGLE_SKELETON_PER_TYPE:
+            # 모든 exact group 의 sample 을 한 그룹으로 묶고 dominant exact 를 template 로
+            all_samples = [s for _, group in exact_groups for s in group]
+            dominant_sig = exact_groups[0][0]   # exact_groups 는 큰 거 먼저 정렬돼 있음
+            apply_target = [(dominant_sig, all_samples)]
+            print(f"  [{type_label}] FORCE_SINGLE_SKELETON_PER_TYPE=True → "
+                  f"merging {len(exact_groups)} exact variants into 1")
+        else:
+            apply_target = groups_sorted
         try:
             apply_canonicalize_to_disk(
-                exact_groups, groups_sorted, type_dir_abs,
+                exact_groups, apply_target, type_dir_abs,
                 type_label=type_label,
                 backup_suffix=CANONICALIZE_BACKUP_SUFFIX,
             )
