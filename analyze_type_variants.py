@@ -62,6 +62,16 @@ USE_JSON_NAMES  = True
 
 # 주의: 파라미터 (좌표값) 는 grouping 에서 항상 무시됨. cmd 종류와 개수, 그리고 chunk 순서만 비교.
 
+# ── ★ Variant 후처리 머지 ★ ──
+# exact 그룹화 후, "사실상 같은 골격" 인 variant 들을 합쳐줌.
+# 두 variant 가 머지되는 조건:
+#   1) chunk 개수와 순서가 같고, 각 chunk 의 role 이름이 같음
+#   2) 각 chunk 의 SOL(loop) 개수가 정확히 같음 — loop 수 다르면 진짜 다른 골격
+#   3) 각 chunk 의 LINE/ARC/CIRCLE 개수가 ±COUNT_TOLERANCE 안
+# 예: tolerance=2 면 L30A5C0S1 와 L32A5C0S1 가 합쳐짐 (양자화/edge 병합 노이즈).
+#     0 으로 두면 exact 동작 (머지 안 함).
+COUNT_TOLERANCE = 2
+
 # ── ★ Variant 제외 ★ ──
 # type 별로 따로 지정.  키 = TYPE_DIRS 의 label, 값 = 제외할 rank 리스트.
 # 빈 dict {} 또는 키가 없는 type 은 아무 것도 안 함 (기본).
@@ -157,6 +167,73 @@ def sig_to_str(sig):
         rname = role if role else "?"
         parts.append(f"{rname}(L{l}A{a}C{c}S{sol})")
     return " | ".join(parts)
+
+
+def _can_merge_sigs(sig_a, sig_b, tol):
+    """두 sample signature 가 머지 가능한 지 검사."""
+    if len(sig_a) != len(sig_b):
+        return False
+    for (role_a, ca), (role_b, cb) in zip(sig_a, sig_b):
+        if role_a != role_b:
+            return False
+        la, aa, ca_c, sa = ca
+        lb, ab, cb_c, sb = cb
+        if sa != sb:                                # loop 수는 정확히 같아야 함
+            return False
+        if abs(la - lb) > tol or abs(aa - ab) > tol or abs(ca_c - cb_c) > tol:
+            return False
+    return True
+
+
+def merge_close_groups(groups_sorted, tolerance):
+    """exact 그룹 → tolerance 내 인접한 그룹들을 합쳐서 새 groups 반환.
+
+    Returns:
+        merged_groups : [(rep_sig, samples_list)]   가장 큰 그룹 순서
+        merge_info    : [(rep_sig, [original_ranks_merged])]   리포트용
+    """
+    if tolerance <= 0 or len(groups_sorted) <= 1:
+        info = [(sig, [i + 1]) for i, (sig, _) in enumerate(groups_sorted)]
+        return list(groups_sorted), info
+
+    n = len(groups_sorted)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _can_merge_sigs(groups_sorted[i][0], groups_sorted[j][0], tolerance):
+                union(i, j)
+
+    clusters = {}
+    for idx in range(n):
+        clusters.setdefault(find(idx), []).append(idx)
+
+    merged = []
+    info = []
+    for _, idxs in clusters.items():
+        idxs.sort(key=lambda i: -len(groups_sorted[i][1]))   # 큰 거 먼저
+        rep_sig = groups_sorted[idxs[0]][0]
+        all_samples = []
+        for i in idxs:
+            all_samples.extend(groups_sorted[i][1])
+        merged.append((rep_sig, all_samples))
+        info.append((rep_sig, [i + 1 for i in idxs]))
+
+    pack = sorted(zip(merged, info), key=lambda p: -len(p[0][1]))
+    merged_sorted = [m for m, _ in pack]
+    info_sorted = [inf for _, inf in pack]
+    return merged_sorted, info_sorted
 
 
 # ══════════════════════════════════════════════════════════════
@@ -451,19 +528,33 @@ def analyze_one_type(type_label, type_dir_abs):
         sig = sample_signature(tokens, names)
         samples.append({"npy": npy, "tokens": tokens, "names": names, "sig": sig})
 
-    # ── 2) signature 별 그룹화 ──
+    # ── 2) signature 별 그룹화 (exact) ──
     sig_groups = {}
     for s in samples:
         sig_groups.setdefault(s["sig"], []).append(s)
 
-    groups_sorted = sorted(sig_groups.items(), key=lambda kv: -len(kv[1]))
+    exact_groups = sorted(sig_groups.items(), key=lambda kv: -len(kv[1]))
+
+    # ── 2.5) tolerance 머지 ──
+    groups_sorted, merge_info = merge_close_groups(exact_groups, COUNT_TOLERANCE)
+    n_exact = len(exact_groups)
+    n_merged = len(groups_sorted)
 
     # ── 3) 콘솔 출력 ──
-    print(f"  {len(groups_sorted)} unique structural variants found:\n")
+    if COUNT_TOLERANCE > 0 and n_exact != n_merged:
+        print(f"  {n_exact} exact variants → {n_merged} after tolerance "
+              f"merge (±{COUNT_TOLERANCE}):\n")
+    else:
+        print(f"  {n_merged} structural variants:\n")
     print(f"  {'rank':>4s} | {'count':>5s} | structure signature")
     print("  -----+-------+" + "-" * 60)
     for r, (sig, group) in enumerate(groups_sorted):
-        print(f"  {r + 1:>4d} | {len(group):>5d} | {sig_to_str(sig)}")
+        line = f"  {r + 1:>4d} | {len(group):>5d} | {sig_to_str(sig)}"
+        if COUNT_TOLERANCE > 0:
+            orig_ranks = merge_info[r][1]
+            if len(orig_ranks) > 1:
+                line += f"   ← merged from exact ranks {orig_ranks}"
+        print(line)
 
     # ── 4) 리포트 txt 저장 ──
     os.makedirs(SAVE_DIR, exist_ok=True)
