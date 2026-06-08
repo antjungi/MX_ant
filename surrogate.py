@@ -1674,18 +1674,24 @@ def train_surrogate(cfg, dataset, train_idx, val_idx, common_curve, device):
     section("SURROGATE TRAINING")
     print(f"  {'ep':>4s} | {'tr_total':>9s} {'tr_sp':>8s} {'tr_full':>8s} {'tr_sel':>8s} "
           f"{'var':>7s} {'cov':>7s} | "
-          f"{'va_total':>9s} {'va_full':>8s} {'va_sel':>8s} | {'lr':>8s}")
-    print("  " + "-" * 120)
+          f"{'va_total':>9s} {'va_full':>8s} {'va_sel':>8s} | {'lr':>8s} | "
+          f"{'ep_t':>5s} {'eta':>6s}")
+    print("  " + "-" * 138)
 
     best_metric = float("inf")
     best_state = None
     log_every = max(1, cfg.epochs // 30)
+    t_loop_start = time.time()
 
     for ep in range(1, cfg.epochs + 1):
+        t_ep = time.time()
         tr = run_epoch_surrogate(model, train_loader, optimizer, scheduler, device, cfg,
                                   interp_w, train_mode=True)
         va = run_epoch_surrogate(model, val_loader, None, None, device, cfg,
                                   interp_w, train_mode=False)
+        ep_time = time.time() - t_ep
+        elapsed = time.time() - t_loop_start
+        eta = elapsed / ep * (cfg.epochs - ep)
 
         val_metric = va["rmse_db_full"]
         if val_metric < best_metric:
@@ -1701,10 +1707,13 @@ def train_surrogate(cfg, dataset, train_idx, val_idx, common_curve, device):
                 f"{tr['total']:9.4f} {tr['sparam']:8.4f} {tr['rmse_db_full']:8.3f} {tr['rmse_db_sel']:8.3f} "
                 f"{tr['var']:7.4f} {tr['cov']:7.4f} | "
                 f"{va['total']:9.4f} {va['rmse_db_full']:8.3f} {va['rmse_db_sel']:8.3f} | "
-                f"{optimizer.param_groups[0]['lr']:8.2e}"
+                f"{optimizer.param_groups[0]['lr']:8.2e} | "
+                f"{ep_time:5.1f} {eta:6.0f}s"
             )
 
-    print(f"\n  Best full-grid val RMSE dB: {best_metric:.4f}")
+    t_loop_total = time.time() - t_loop_start
+    print(f"\n  Training loop elapsed: {t_loop_total:.1f} s  ({t_loop_total/60:.1f} min)")
+    print(f"  Best full-grid val RMSE dB: {best_metric:.4f}")
 
     if best_state is not None:
         model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
@@ -1756,17 +1765,45 @@ def train_surrogate(cfg, dataset, train_idx, val_idx, common_curve, device):
 
 
 # ═══════════════════════════════════════════════════════════════
+#  ★ RUN CONFIG ★    (수정은 여기에서만)
+# ═══════════════════════════════════════════════════════════════
+
+# ── Preset (모델 크기 / 학습량) ─────────────────────────────────
+#   "tiny"  : d_model=128, latent=128, n_enc=2, epochs= 80, n_samples=300/type
+#   "small" : d_model=256, latent=256, n_enc=3, epochs=160, n_samples=800/type
+#   "full"  : d_model=384, latent=384, n_enc=4, epochs=250, n_samples=전체
+PRESET            = "small"
+
+# ── Ckpt 저장 ──────────────────────────────────────────────────
+CKPT_SAVE_PATH    = "ckpt/surrogate_last.pt"   # 빈 문자열 = 저장 안 함
+SAVE_CKPT_AFTER   = True
+
+# ── Loss weight ────────────────────────────────────────────────
+W_SPARAM          = 1.0
+USE_VICREG        = True
+
+# ── 기타 ───────────────────────────────────────────────────────
+SEED              = 7
+
+# ═══════════════════════════════════════════════════════════════
 #  Main
 # ═══════════════════════════════════════════════════════════════
 def main():
+    import time
+    t_overall_start = time.time()
+
     cfg = CFG()
     cfg.run_name = "surrogate_only"
+    cfg.preset = PRESET                # ★ 위 RUN CONFIG 에서 결정
     apply_preset(cfg)
-    cfg.ckpt_save_path = "ckpt/surrogate_last.pt"
-    cfg.w_sparam = 1.0
+    cfg.ckpt_save_path = CKPT_SAVE_PATH
+    cfg.save_ckpt_after_train = SAVE_CKPT_AFTER
+    cfg.w_sparam = W_SPARAM
     cfg.w_cmd = 0.0
     cfg.w_prm = 0.0
     cfg.w_aux = 0.0
+    cfg.use_vicreg = USE_VICREG
+    cfg.seed = SEED
 
     set_seed(cfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1774,13 +1811,19 @@ def main():
     section("SURROGATE-ONLY TRAINING (standalone)")
     print(f"  Device : {device}" + (f" ({torch.cuda.get_device_name(0)})"
                                      if device.type == "cuda" else ""))
-    print(f"  Preset : {cfg.preset}")
+    print(f"  Preset : {cfg.preset}  "
+          f"(d_model={cfg.d_model}, latent={cfg.latent}, n_enc={cfg.n_enc}, "
+          f"epochs={cfg.epochs})")
+    print(f"  Seed   : {cfg.seed}")
+    print(f"  Ckpt   : {cfg.ckpt_save_path}")
 
     section("LOAD DATA")
+    t_data = time.time()
     script_dir = os.path.dirname(os.path.abspath(__file__))
     dataset, _npy, type_ids, type_names, _sp, _ml = load_multitype_data(
         cfg, script_dir,
     )
+    print(f"  data load time   : {time.time() - t_data:.1f} s")
 
     section("SPLIT")
     train_idx, val_idx, val_idx_per_type = make_stratified_split(
@@ -1792,10 +1835,16 @@ def main():
         val_idx_per_type=val_idx_per_type, type_names=type_names,
     )
 
+    t_train = time.time()
     model, best = train_surrogate(cfg, dataset, train_idx, val_idx,
                                    common_curve, device)
+    t_train_elapsed = time.time() - t_train
+    t_total_elapsed = time.time() - t_overall_start
 
     section("DONE")
+    print(f"  training time    : {t_train_elapsed:>8.1f} s  ({t_train_elapsed/60:.1f} min)")
+    print(f"  total elapsed    : {t_total_elapsed:>8.1f} s  ({t_total_elapsed/60:.1f} min)")
+    print(f"  best val RMSE dB : {best:.4f}")
 
 
 if __name__ == "__main__":
