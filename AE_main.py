@@ -1,13 +1,44 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DeepCAD AE + Return-3 Common-Curve Residual Surrogate
-=====================================================
+AE_main: DeepCAD AE + Return-3 surrogate training
+=================================================
 
-목적:
-  - 한 번 실행하면 학습 + 평가 + 진단 로그 출력
-  - 학습 후 reconstruction (encoder 입력 vs decoder 복원) 비교 figure
-  - RUN_INVERSE_DESIGN=True 일 때 latent 최적화 → 디코딩 → spec 매칭 figure
+기본 AE 구조
+------------
+- 입력은 LINE/ARC/CIRCLE/SOL/EXT/EOS 토큰과 ROLE 헤더 토큰으로 구성된다.
+- ROLE 토큰은 param[0]에 sketch 역할 id를 저장하고, 형상 파라미터는
+  기존처럼 10-bit quantization 값을 사용한다.
+- Encoder는 CAD token sequence를 latent z로 압축한다.
+- Decoder는 latent z에서 CAD token sequence를 autoregressive 방식으로 복원한다.
+- S-parameter surrogate는 z를 입력으로 받아 common curve + residual MLP 구조로
+  Return-3 dB 곡선을 예측한다.
+
+Inverse 구조
+-------------
+- inverse design은 AE_main.py 실행 흐름에서 돌리지 않는다.
+- AE_main_test.py가 저장된 checkpoint를 로드해 latent z 최적화와 decode 검증을 수행한다.
+- inverse helper 함수들은 테스트 스크립트에서 import해 재사용한다.
+
+현재 decode 안정화
+------------------
+- 같은 role/coplanar/same-extrude chunk는 multi-loop sketch로 병합할 수 있다.
+- autoregressive decode에는 일반 CAD command grammar를 적용한다.
+- 로딩된 dataset에서 ROLE별 정상 command pattern을 자동 추출하고,
+  frame loop split 같은 비정상 topology가 나오지 않도록 decode 시 제한한다.
+- 전체 구조 template 하나를 고정하지 않고, 학습 데이터의 ROLE 순서, ROLE별 command
+  pattern, 전체 topology signature prefix codebook을 함께 사용해 정상 조합 안에서만 decode한다.
+
+최근 수정
+---------
+- AE_main.py 메인 실행에서는 학습/평가/checkpoint 저장만 수행하고,
+  inverse batch test는 AE_main_test.py로 분리한다.
+- topology signature prefix codebook을 추가해, ROLE별로는 정상인 pattern들이
+  학습에 없던 전체 조합으로 섞이는 경우를 decode 단계에서 막는다.
+- 터미널 출력 기본값을 compact mode로 줄였고, PyTorch mask/nested-tensor warning은
+  bool causal mask와 enable_nested_tensor=False 설정으로 원인 수정했다.
+- 이 상단 설명은 전체 수정 이력이 아니라, 현재 구조와 가장 최근 의미 있는 수정만
+  짧게 유지한다.
 """
 
 import matplotlib
@@ -29,6 +60,12 @@ import random
 import copy
 import sys as _sys
 from dataclasses import dataclass
+
+for _stream in (_sys.stdout, _sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 import numpy as np
 
@@ -56,12 +93,13 @@ CIRCLE = 2
 SOL = 3
 EXT = 4
 EOS = 5
+ROLE = 6           # ★ NEW: chunk 시작을 알리는 role 헤더 토큰. param[0] = role_id
 
 N_BIT = 10
 N_QUANT = 2 ** N_BIT
 QMAX = N_QUANT - 1
 
-N_CMD = 6
+N_CMD = 7          # ★ LINE/ARC/CIRCLE/SOL/EXT/EOS/ROLE
 N_ARGS = 16
 
 PAD_V = -1
@@ -75,6 +113,7 @@ VALID_PAR = {
     SOL: 0,
     EXT: 8,
     EOS: 0,
+    ROLE: 1,        # ★ NEW: role_id 한 슬롯만 사용
 }
 
 CMD_NAME = {
@@ -84,6 +123,7 @@ CMD_NAME = {
     SOL: "SOL",
     EXT: "EXT",
     EOS: "EOS",
+    ROLE: "ROLE",   # ★ NEW
 }
 
 RETURN_PORT_PAIRS = ((1, 1), (2, 2), (3, 3))
@@ -120,7 +160,7 @@ PAL = PAL_PAPER
 class CFG:
     preset: str = "small"
     seed: int = 7
-    run_name: str = "medium_var_fixed"
+    run_name: str = "compact_vicreg"
 
     # data
     npy_dirs: tuple = ("hfss_results/step_test",)
@@ -163,6 +203,8 @@ class CFG:
     dropout: float = 0.1
     max_len_cap: int = 256
 
+
+
     n_pool: int = 12
     n_freq_bands: int = 6
 
@@ -170,9 +212,14 @@ class CFG:
     aux_numeric: bool = True
     aux_hidden_mult: float = 2.0
 
-    # ★ Checkpoint save/load (학습 후 가중치 + cfg + source 저장 → 나중에 인버스만 가능)
-    ckpt_save_path: str = "ckpt/AE_main_last.pt"   # 빈 문자열 = 저장 안 함
-    ckpt_load_path: str = ""                       # 비어 있으면 학습; 경로 주면 로드 후 학습 skip
+    # ★ ROLE 토큰화 + 같은 role coplanar chunk 자동 병합
+    use_json_names: bool = True              # JSON metadata names → ROLE 토큰 삽입
+    merge_same_role_chunks: bool = True      # 같은 role + 같은 plane + 같은 extrude → 1 chunk(multi-loop)
+    validate_json_alignment: bool = True     # token 파일명과 JSON metadata.source_file 일치 여부 점검
+
+    # ★ Checkpoint save/load (학습 후 가중치 저장, 나중에 인버스만 돌릴 때 로드)
+    ckpt_save_path: str = "ckpt/AE_main_last.pt"  # 빈 문자열 = 저장 안 함
+    ckpt_load_path: str = ""                 # 비어 있으면 학습; 경로 주면 로드 후 학습 skip
     save_ckpt_after_train: bool = True
 
     # loss weights
@@ -184,11 +231,11 @@ class CFG:
     # dB loss scale
     db_loss_scale: float = 20.0
 
-    # fixed medium_var VICReg
+    # compact VICReg for latent stability
     use_vicreg: bool = True
-    w_var: float = 0.5
-    w_cov: float = 0.05
-    vicreg_var_target: float = 1.0
+    w_var: float = 0.2
+    w_cov: float = 0.02
+    vicreg_var_target: float = 0.7
 
     # residual MLP
     mlp_hidden_mult: float = 2.0
@@ -297,9 +344,18 @@ def natural_key(path):
     return [int(x) if x.isdigit() else x.lower() for x in re.split(r"(\d+)", name)]
 
 
+def sample_id_from_path(path):
+    stem = os.path.splitext(os.path.basename(str(path)))[0]
+    stem = re.sub(r"(_tokens(?:_float)?|_deepcad)$", "", stem)
+    m = re.search(r"(\d+)$", stem)
+    if m:
+        return int(m.group(1))
+    return None
+
+
 def causal_mask(sz, device):
     return torch.triu(
-        torch.full((sz, sz), float("-inf"), device=device),
+        torch.ones((sz, sz), dtype=torch.bool, device=device),
         diagonal=1,
     )
 
@@ -338,6 +394,140 @@ def ensure_eos_when_truncated(t, max_len):
     out[-1] = eos_row
 
     return out
+
+
+_CMD_PATTERN_CHARS = {
+    LINE: "L",
+    ARC: "A",
+    CIRCLE: "C",
+    SOL: "S",
+    EXT: "E",
+}
+
+
+
+def cmd_pattern_to_string(pattern):
+    return "".join(_CMD_PATTERN_CHARS.get(int(c), "?") for c in pattern)
+
+
+def extract_role_cmd_patterns(token_sequences):
+    """Collect valid command topologies per ROLE from finalized train tokens."""
+    role_patterns = {}
+
+    for tokens in token_sequences:
+        arr = trim_after_eos(np.asarray(tokens))
+        cur_role = None
+        cur_cmds = []
+
+        for row in arr:
+            c = int(row[0])
+
+            if c < 0 or c == EOS:
+                break
+
+            if c == ROLE:
+                rid = int(row[1]) if row.shape[0] > 1 and int(row[1]) >= 0 else None
+                cur_role = rid
+                cur_cmds = []
+                continue
+
+            if c == EXT:
+                if cur_role is not None and cur_cmds:
+                    cur_cmds.append(c)
+                    role_patterns.setdefault(cur_role, set()).add(tuple(cur_cmds))
+                cur_role = None
+                cur_cmds = []
+                continue
+
+            if cur_role is not None and c in (SOL, LINE, ARC, CIRCLE):
+                cur_cmds.append(c)
+
+    return {
+        int(rid): tuple(sorted(patterns, key=lambda p: (len(p), p)))
+        for rid, patterns in sorted(role_patterns.items())
+        if patterns
+    }
+
+
+def extract_role_sequence(tokens):
+    """Return ROLE ids in sequence order from a token array."""
+    seq = []
+    arr = trim_after_eos(np.asarray(tokens))
+    for row in arr:
+        c = int(row[0])
+        if c < 0 or c == EOS:
+            break
+        if c == ROLE and row.shape[0] > 1 and int(row[1]) >= 0:
+            seq.append(int(row[1]))
+    return tuple(seq)
+
+
+def extract_role_sequence_codebook(token_sequences):
+    """Collect valid ROLE order sequences from finalized train tokens."""
+    seqs = set()
+    for tokens in token_sequences:
+        seq = extract_role_sequence(tokens)
+        if seq:
+            seqs.add(tuple(int(x) for x in seq))
+    return tuple(sorted(seqs, key=lambda s: (len(s), s)))
+
+
+def extract_topology_signature(tokens):
+    """Return ROLE + command-pattern chunks in sequence order."""
+    signature = []
+    arr = trim_after_eos(np.asarray(tokens))
+    cur_role = None
+    cur_cmds = []
+
+    for row in arr:
+        c = int(row[0])
+        if c < 0 or c == EOS:
+            break
+
+        if c == ROLE:
+            cur_role = int(row[1]) if row.shape[0] > 1 and int(row[1]) >= 0 else None
+            cur_cmds = []
+            continue
+
+        if c == EXT:
+            if cur_role is not None and cur_cmds:
+                cur_cmds.append(c)
+                signature.append((int(cur_role), tuple(int(x) for x in cur_cmds)))
+            cur_role = None
+            cur_cmds = []
+            continue
+
+        if cur_role is not None and c in (SOL, LINE, ARC, CIRCLE):
+            cur_cmds.append(c)
+
+    return tuple(signature)
+
+
+def extract_topology_signature_codebook(token_sequences):
+    """Collect valid full topology signatures from finalized train tokens."""
+    signatures = set()
+    for tokens in token_sequences:
+        sig = extract_topology_signature(tokens)
+        if sig:
+            signatures.add(sig)
+    return tuple(sorted(signatures, key=lambda s: (len(s), s)))
+
+
+def configure_decode_codebooks(model, dataset):
+    """Attach dataset-derived decode codebooks to an AE model."""
+    model.set_role_cmd_patterns(
+        getattr(dataset, "role_cmd_patterns", {}),
+        getattr(dataset, "role_id_to_name", {}),
+    )
+    if hasattr(model, "set_role_sequence_codebook"):
+        model.set_role_sequence_codebook(
+            getattr(dataset, "role_sequence_codebook", ()),
+        )
+    if hasattr(model, "set_topology_signature_codebook"):
+        model.set_topology_signature_codebook(
+            getattr(dataset, "topology_signature_codebook", ()),
+        )
+    return model
 
 
 def select_frequency_indices(raw_n_freq, target_n_freq, freq_start, freq_end, mode="linspace"):
@@ -477,11 +667,38 @@ def _hr(ch="═", w=72):
     return ch * w
 
 
+_LOG_VERBOSITY = "simple"
+
+
+def set_log_verbosity(v):
+    global _LOG_VERBOSITY
+    _LOG_VERBOSITY = str(v or "simple").lower()
+
+
+def log_is_compact():
+    return _LOG_VERBOSITY in ("compact", "quiet", "minimal")
+
+
+def log_is_quiet():
+    return _LOG_VERBOSITY in ("quiet", "minimal")
+
+
+def log_detail(*args, **kwargs):
+    if not log_is_compact():
+        print(*args, **kwargs)
+
+
 def section(title, ch="═"):
+    if log_is_compact():
+        print(f"\n[{title}]")
+        return
     print(f"\n{_hr(ch)}\n  {title}\n{_hr(ch)}")
 
 
 def subsection(title, ch="─"):
+    if log_is_compact():
+        print(f"\n- {title}")
+        return
     print(f"\n{_hr(ch)}\n  {title}\n{_hr(ch)}")
 
 
@@ -550,7 +767,20 @@ def save_inverse_design_outputs(inv_result, save_dir, run_tag,
         except Exception as e:
             print(f"  ⚠ S-param csv 저장 실패: {type(e).__name__}: {e}")
 
-    # ── 3) 인버스 디자인 figure 들 → png
+    # ── 3) 복원 형상 → STEP
+    sketches = inv_result.get("decoded_sketches")
+    if sketches:
+        step_path = os.path.join(save_dir, f"inverse_{run_tag}.step")
+        try:
+            export_decoded_sketches_to_step(sketches, step_path)
+            inv_result["decoded_step_path"] = step_path
+            saved.append(step_path)
+        except Exception as e:
+            print(f"  ⚠ STEP 저장 실패: {type(e).__name__}: {e}")
+
+
+
+    # ── 4) 인버스 디자인 figure 들 → png
     #   inverse 또는 decoded 와 관련된 suptitle 을 가진 figure 만 저장.
     fig_idx = 0
     for fn in plt.get_fignums():
@@ -572,6 +802,10 @@ def save_inverse_design_outputs(inv_result, save_dir, run_tag,
                 tag_part = "topview"
             elif "decoded" in stl:
                 tag_part = "decoded"
+            elif "latent trajectory" in stl:
+                tag_part = "latent_trajectory"
+            elif "coverage" in stl:
+                tag_part = "coverage_curve"
             elif "inverse design" in stl:
                 tag_part = "sparam_curve"
             fig_idx += 1
@@ -583,9 +817,153 @@ def save_inverse_design_outputs(inv_result, save_dir, run_tag,
         except Exception as e:
             print(f"  ⚠ figure fig{fn} 저장 실패: {type(e).__name__}: {e}")
 
-    print(f"  ✓ inversed 폴더에 {len(saved)} 개 파일 저장:")
-    for p in saved:
-        print(f"    · {os.path.basename(p)}")
+    if log_is_compact():
+        print(f"  saved inverse outputs: {len(saved)} file(s) → {save_dir}")
+    else:
+        print(f"  ✓ inversed 폴더에 {len(saved)} 개 파일 저장:")
+        for p in saved:
+            print(f"    · {os.path.basename(p)}")
+
+
+def _loop_area_3d(points):
+    pts = [np.asarray(p, dtype=float) for p in points]
+    if len(pts) < 3:
+        return 0.0
+    acc = np.zeros(3, dtype=float)
+    for a, b in zip(pts, pts[1:] + pts[:1]):
+        acc += np.cross(a, b)
+    return float(np.linalg.norm(acc) * 0.5)
+
+
+def _make_cq_wire_from_loop(loop_points, eps=1e-6):
+    import cadquery as cq
+
+    clean = []
+    for pt in loop_points:
+        arr = np.asarray(pt, dtype=float)
+        if arr.shape[0] < 3 or not np.all(np.isfinite(arr[:3])):
+            continue
+        if clean and np.linalg.norm(arr[:3] - clean[-1]) < eps:
+            continue
+        clean.append(arr[:3])
+
+    if len(clean) >= 2 and np.linalg.norm(clean[0] - clean[-1]) < eps:
+        clean.pop()
+    if len(clean) < 3:
+        return None
+
+    edges = []
+    for p0, p1 in zip(clean, clean[1:] + clean[:1]):
+        if np.linalg.norm(p1 - p0) < eps:
+            continue
+        edges.append(
+            cq.Edge.makeLine(
+                cq.Vector(float(p0[0]), float(p0[1]), float(p0[2])),
+                cq.Vector(float(p1[0]), float(p1[1]), float(p1[2])),
+            )
+        )
+    if len(edges) < 3:
+        return None
+    return cq.Wire.assembleEdges(edges)
+
+
+def _solid_from_decoded_sketch(sketch):
+    import cadquery as cq
+
+    loops = sketch.get("loops_3d", []) or []
+    wire_items = []
+    for loop in loops:
+        wire = _make_cq_wire_from_loop(loop)
+        if wire is not None:
+            wire_items.append((_loop_area_3d(loop), wire))
+
+    if not wire_items:
+        return None
+
+    wire_items.sort(key=lambda item: item[0], reverse=True)
+    wires = [w for _area, w in wire_items]
+    normal = np.asarray(sketch.get("normal", [0.0, 0.0, 1.0]), dtype=float)
+    n_norm = float(np.linalg.norm(normal))
+    if n_norm < 1e-9:
+        normal = np.asarray([0.0, 0.0, 1.0], dtype=float)
+    else:
+        normal = normal / n_norm
+
+    extent = float(sketch.get("extent_one", sketch.get("extent", 1.0)) or 1.0)
+    if abs(extent) < 1e-6:
+        extent = 1.0
+    vec = cq.Vector(
+        float(normal[0] * extent),
+        float(normal[1] * extent),
+        float(normal[2] * extent),
+    )
+
+    try:
+        return cq.Solid.extrudeLinear(wires[0], wires[1:], vec)
+    except Exception:
+        solids = []
+        for wire in wires:
+            try:
+                solids.append(cq.Solid.extrudeLinear(wire, [], vec))
+            except Exception:
+                continue
+        if not solids:
+            return None
+        solid = solids[0]
+        for other in solids[1:]:
+            try:
+                solid = solid.fuse(other)
+            except Exception:
+                pass
+        return solid
+
+
+def export_decoded_sketches_to_step(sketches, output_step_path, apply_boolean=False):
+    """Export real-coordinate decoded sketches to STEP using CadQuery.
+
+    In inverse/demo outputs the role sketches are semantic antenna bodies
+    (ports, grounds, frame, camera).  The decoded EXT bool flag can be noisy,
+    so the default export keeps every decoded sketch as an additive body to
+    match the structure preview image.
+    """
+    import cadquery as cq
+
+    solids = []
+    for sketch in sketches or []:
+        solid = _solid_from_decoded_sketch(sketch)
+        if solid is not None:
+            solids.append(solid)
+
+    if not solids:
+        raise ValueError("no valid solid to export")
+
+    if not apply_boolean:
+        master = solids[0] if len(solids) == 1 else cq.Compound.makeCompound(solids)
+        os.makedirs(os.path.dirname(os.path.abspath(output_step_path)), exist_ok=True)
+        cq.exporters.export(master, output_step_path)
+        return output_step_path
+
+    master = None
+    for sketch in sketches or []:
+        solid = _solid_from_decoded_sketch(sketch)
+        if solid is None:
+            continue
+        op = int(sketch.get("bool_op", 1))
+        if master is None:
+            master = solid
+        elif op == 2:
+            master = master.cut(solid)
+        elif op == 3:
+            master = master.intersect(solid)
+        else:
+            master = master.fuse(solid)
+
+    if master is None:
+        raise ValueError("no valid solid to export")
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_step_path)), exist_ok=True)
+    cq.exporters.export(master, output_step_path)
+    return output_step_path
 
 
 # ══════════════════════════════════════════════════════════════
@@ -642,8 +1020,8 @@ def extract_dequant_meta(json_data: dict) -> dict:
                 "z_axis": _v3(plane["z_axis"]),
             })
         elif op["type"] == "Extrude":
-            all_extents.append(op["extent_one"]["distance"])
-            all_extents.append(op["extent_two"]["distance"])
+            all_extents.append(op.get("extent_one", {}).get("distance", 0.0))
+            all_extents.append(op.get("extent_two", {}).get("distance", 0.0))
 
     max_ext = max(all_extents) if all_extents else 1.0
     if max_ext < 1e-8:
@@ -653,6 +1031,188 @@ def extract_dequant_meta(json_data: dict) -> dict:
         "g_min3": g_min3, "g_max3": g_max3, "g_max_dim": g_max_dim,
         "max_ext": max_ext, "sketches": sketch_metas,
     }
+
+
+# ══════════════════════════════════════════════════════════════
+# ★ JSON merging (same-role + coplanar + same extrude → multi-loop) + retokenizer
+# ══════════════════════════════════════════════════════════════
+_BOOL_MAP_TOK  = {"NewBody": 0, "Join": 1, "Cut": 2, "Intersect": 3}
+_ETYPE_MAP_TOK = {"OneSide": 0, "Symmetric": 1, "TwoSide": 2}
+
+
+def _q01_tok(v):
+    return int(round(float(np.clip(v, 0.0, 1.0)) * QMAX))
+
+
+def _norm_tok(v, lo, hi):
+    if hi - lo < 1e-8:
+        return 0.0
+    return float(np.clip((v - lo) / (hi - lo), 0.0, 1.0))
+
+
+def json_to_tokens(json_data):
+    """JSON dict → (N, 17) int32 token array.  extract_dequant_meta 활용."""
+    meta = extract_dequant_meta(json_data)
+    g_min3, g_max3, g_max_dim = meta["g_min3"], meta["g_max3"], meta["g_max_dim"]
+    max_ext = meta["max_ext"]
+    sk_metas = meta["sketches"]
+
+    def row(cmd, *args):
+        r = [PAD_V] * (1 + N_ARGS)
+        r[0] = cmd
+        for i, v in enumerate(args):
+            r[1 + i] = int(v)
+        return r
+
+    rows = []
+    seq = json_data["sequence"]
+    sk_idx = 0
+    for op in seq:
+        if op["type"] == "Sketch":
+            sm = sk_metas[sk_idx]
+            xy_min, xy_max, sk_scale = sm["xy_min"], sm["xy_max"], sm["sk_scale"]
+
+            def q2d(x, y):
+                return (_q01_tok(_norm_tok(x, xy_min[0], xy_max[0])),
+                        _q01_tok(_norm_tok(y, xy_min[1], xy_max[1])))
+
+            def qr(r):
+                return _q01_tok(_norm_tok(r, 0.0, sk_scale))
+
+            for loop in op.get("profile", {}).get("children", []):
+                rows.append(row(SOL))
+                for e in loop.get("children", []):
+                    et = e["type"]
+                    if et == "Line":
+                        qx, qy = q2d(e["end_point"]["x"], e["end_point"]["y"])
+                        rows.append(row(LINE, qx, qy))
+                    elif et == "Arc":
+                        qmx, qmy = q2d(e["mid_point"]["x"], e["mid_point"]["y"])
+                        qex, qey = q2d(e["end_point"]["x"], e["end_point"]["y"])
+                        rows.append(row(ARC, qmx, qmy, qex, qey))
+                    elif et == "Circle":
+                        qcx, qcy = q2d(e["center_point"]["x"], e["center_point"]["y"])
+                        rows.append(row(CIRCLE, qcx, qcy, qr(e["radius"])))
+            sk_idx += 1
+        elif op["type"] == "Extrude":
+            sm = sk_metas[sk_idx - 1] if sk_idx > 0 else sk_metas[0]
+            origin = sm["origin"]
+            q_sk_scale = _q01_tok(_norm_tok(sm["sk_scale"] / g_max_dim, 0.0, 1.0))
+            q_ox = _q01_tok(_norm_tok(origin[0], g_min3[0], g_max3[0]))
+            q_oy = _q01_tok(_norm_tok(origin[1], g_min3[1], g_max3[1]))
+            q_oz = _q01_tok(_norm_tok(origin[2], g_min3[2], g_max3[2]))
+            e1 = op.get("extent_one", {}).get("distance", 0.0)
+            e2 = op.get("extent_two", {}).get("distance", 0.0)
+            q_e1 = _q01_tok(_norm_tok(e1, 0.0, max_ext))
+            q_e2 = _q01_tok(_norm_tok(e2, 0.0, max_ext))
+            q_bool = _BOOL_MAP_TOK.get(op.get("operation", "NewBody"), 0)
+            q_etype = _ETYPE_MAP_TOK.get(op.get("extent_type", "OneSide"), 0)
+            rows.append(row(EXT, q_sk_scale, q_ox, q_oy, q_oz,
+                            q_e1, q_e2, q_bool, q_etype))
+    rows.append(row(EOS))
+    return np.asarray(rows, dtype=np.int32)
+
+
+
+def merge_coplanar_same_role_sketches(json_data, names,
+                                       plane_tol=1e-3, extent_tol=1e-3,
+                                       verbose=False):
+    """JSON sequence 에서 연속된 Sketch+Extrude pair 중
+    같은 role + coplanar + 같은 extrude 인 것들을 1개의 Sketch (multi-loop) + 1개의 Extrude 로 병합."""
+    seq = json_data["sequence"]
+    names = list(names) if names is not None else []
+
+    def is_pair(idx):
+        return (
+            idx + 1 < len(seq)
+            and seq[idx].get("type") == "Sketch"
+            and seq[idx + 1].get("type") == "Extrude"
+        )
+
+    def planes_match(p1, p2):
+        for k in ("origin", "x_axis", "y_axis", "z_axis"):
+            v1 = _v3(p1[k]); v2 = _v3(p2[k])
+            if np.linalg.norm(v1 - v2) > plane_tol:
+                return False
+        return True
+
+    def extrudes_match(e1, e2):
+        d1 = float(e1.get("extent_one", {}).get("distance", 0.0))
+        d2 = float(e2.get("extent_one", {}).get("distance", 0.0))
+        if abs(d1 - d2) > extent_tol:
+            return False
+        s1 = float(e1.get("extent_two", {}).get("distance", 0.0))
+        s2 = float(e2.get("extent_two", {}).get("distance", 0.0))
+        if abs(s1 - s2) > extent_tol:
+            return False
+        if e1.get("extent_type", "OneSide") != e2.get("extent_type", "OneSide"):
+            return False
+        if e1.get("operation", "NewBody") != e2.get("operation", "NewBody"):
+            return False
+        return True
+
+    new_seq = []
+    new_names = []
+    n_pairs = 0
+    n_merged = 0
+    pair_idx = 0
+    i = 0
+    while i < len(seq):
+        if not is_pair(i):
+            new_seq.append(seq[i])
+            i += 1
+            continue
+
+        sk, ex = seq[i], seq[i + 1]
+        nm = names[pair_idx] if pair_idx < len(names) else None
+        pair_idx += 1
+        n_pairs += 1
+
+        group = [(sk, ex)]
+        i += 2
+
+        while is_pair(i):
+            sk2, ex2 = seq[i], seq[i + 1]
+            nm2 = names[pair_idx] if pair_idx < len(names) else None
+            if (
+                nm is not None and nm == nm2
+                and planes_match(sk["plane"], sk2["plane"])
+                and extrudes_match(ex, ex2)
+            ):
+                group.append((sk2, ex2))
+                pair_idx += 1
+                n_pairs += 1
+                i += 2
+            else:
+                break
+
+        if len(group) > 1:
+            fixed_loops = []
+            for sk_g, _ex_g in group:
+                for lp in sk_g.get("profile", {}).get("children", []):
+                    fixed_loops.append(copy.deepcopy(lp))
+
+            new_sk = copy.deepcopy(sk)
+            new_sk["profile"] = copy.deepcopy(sk.get("profile", {}))
+            new_sk["profile"]["children"] = fixed_loops
+            new_seq.append(new_sk)
+            new_seq.append(copy.deepcopy(ex))
+            n_merged += len(group) - 1
+            if verbose:
+                print(f"    merged role={nm!r}: {len(group)} chunks → 1 chunk "
+                      f"({len(fixed_loops)} loops total)")
+        else:
+            new_seq.append(sk)
+            new_seq.append(ex)
+        new_names.append(nm)
+
+    if names and len(names) != n_pairs and verbose:
+        print(f"    [warn] role-name count mismatch: names={len(names)} pairs={n_pairs}")
+
+    new_json = dict(json_data)
+    new_json["sequence"] = new_seq
+
+    return new_json, new_names, n_merged
 
 
 def _arc_pts(sx, sy, mx, my, ex, ey, n=32):
@@ -681,6 +1241,8 @@ def _arc_pts(sx, sy, mx, my, ex, ey, n=32):
     return [(ux + r * math.cos(a), uy + r * math.sin(a)) for a in np.linspace(a1, a2, n)]
 
 
+
+
 def _circle_pts(cx, cy, r, n=48):
     a = np.linspace(0, 2 * math.pi, n, endpoint=False)
     return [(cx + r * math.cos(t), cy + r * math.sin(t)) for t in a]
@@ -699,7 +1261,7 @@ def json_to_real_sketches(json_data: dict) -> list:
             xa = _v3(plane["x_axis"])
             ya = _v3(plane["y_axis"])
             za = _v3(plane["z_axis"])
-            extent_one = float(ex["extent_one"]["distance"])
+            extent_one = float(ex.get("extent_one", {}).get("distance", 0.0))
             extent_two = float(ex.get("extent_two", {}).get("distance", 0.0))
             normal = za / (np.linalg.norm(za) + 1e-12)
 
@@ -752,65 +1314,147 @@ def _dequant(q, lo, hi):
     return lo + (q / QMAX) * (hi - lo)
 
 
+def _loop_endpoint_2d(row, xy_fn):
+    cmd = int(row[0])
+    p = row[1:]
+    if cmd == LINE:
+        if p[0] < 0 or p[1] < 0:
+            return None
+        return xy_fn(p[0], p[1])
+    if cmd == ARC:
+        if any(p[i] < 0 for i in range(4)):
+            return None
+        return xy_fn(p[2], p[3])
+    return None
+
+
+def _infer_loop_start_2d(loop_rows, xy_fn):
+    endpoints = []
+    for row in loop_rows:
+        ep = _loop_endpoint_2d(row, xy_fn)
+        if ep is not None:
+            endpoints.append(ep)
+    if endpoints:
+        return endpoints[-1]
+    return (0.0, 0.0)
+
+
+def _loop_rows_to_real_points(loop_rows, sm):
+    def qxy(qx, qy):
+        return (
+            _dequant(qx, sm["xy_min"][0], sm["xy_max"][0]),
+            _dequant(qy, sm["xy_min"][1], sm["xy_max"][1]),
+        )
+
+    def to3d(x, y):
+        return sm["origin"] + x * sm["x_axis"] + y * sm["y_axis"]
+
+    cur_2d = _infer_loop_start_2d(loop_rows, qxy)
+    pts = []
+    has_stream_curve = any(int(row[0]) in (LINE, ARC) for row in loop_rows)
+    if has_stream_curve:
+        pts.append(to3d(cur_2d[0], cur_2d[1]))
+
+    for row in loop_rows:
+        cmd = int(row[0])
+        p = row[1:]
+        if cmd == LINE:
+            if p[0] < 0 or p[1] < 0:
+                continue
+            ex, ey = qxy(p[0], p[1])
+            pts.append(to3d(ex, ey))
+            cur_2d = (ex, ey)
+        elif cmd == ARC:
+            if any(p[i] < 0 for i in range(4)):
+                continue
+            mx, my = qxy(p[0], p[1])
+            ex, ey = qxy(p[2], p[3])
+            sx, sy = cur_2d
+            a2d = _arc_pts(sx, sy, mx, my, ex, ey)
+            for ax2, ay2 in a2d[1:]:
+                pts.append(to3d(ax2, ay2))
+            cur_2d = (ex, ey)
+        elif cmd == CIRCLE:
+            if any(p[i] < 0 for i in range(3)):
+                continue
+            cx, cy = qxy(p[0], p[1])
+            r = (p[2] / QMAX) * sm["sk_scale"]
+            for x2, y2 in _circle_pts(cx, cy, r):
+                pts.append(to3d(x2, y2))
+    return pts
+
+
+
+
+def _loop_rows_to_normalized_points(loop_rows):
+    def qxy(qx, qy):
+        return (qx / QMAX, qy / QMAX)
+
+    cur_2d = _infer_loop_start_2d(loop_rows, qxy)
+    pts = []
+    has_stream_curve = any(int(row[0]) in (LINE, ARC) for row in loop_rows)
+    if has_stream_curve:
+        pts.append(cur_2d)
+
+    for row in loop_rows:
+        cmd = int(row[0])
+        p = row[1:]
+        if cmd == LINE:
+            if p[0] < 0 or p[1] < 0:
+                continue
+            ex, ey = qxy(p[0], p[1])
+            pts.append((ex, ey))
+            cur_2d = (ex, ey)
+        elif cmd == ARC:
+            if any(p[i] < 0 for i in range(4)):
+                continue
+            mx, my = qxy(p[0], p[1])
+            ex, ey = qxy(p[2], p[3])
+            sx, sy = cur_2d
+            a2d = _arc_pts(sx, sy, mx, my, ex, ey)
+            for ax2, ay2 in a2d[1:]:
+                pts.append((ax2, ay2))
+            cur_2d = (ex, ey)
+        elif cmd == CIRCLE:
+            if any(p[i] < 0 for i in range(3)):
+                continue
+            cx, cy = qxy(p[0], p[1])
+            r = (p[2] / QMAX) * 0.45
+            pts.extend(_circle_pts(cx, cy, r))
+    return pts
+
+
 def tokens_to_real_sketches(tokens: np.ndarray, dq_meta: dict) -> list:
     sk_metas = dq_meta["sketches"]
     max_ext = dq_meta["max_ext"]
     sketches = []
     cur_loops = []
-    cur_pts = []
+    cur_loop_rows = []
     sketch_idx = 0
-    cur_2d = (0.0, 0.0)
 
     for row in tokens:
         cmd = int(row[0])
         p = row[1:]
 
         if cmd == SOL:
-            if cur_pts:
-                cur_loops.append(cur_pts)
-            cur_pts = []
-            cur_2d = (0.0, 0.0)
-        elif cmd == LINE:
-            if p[0] < 0 or p[1] < 0:
-                continue
-            if sketch_idx < len(sk_metas):
-                sm = sk_metas[sketch_idx]
-                ex = _dequant(p[0], sm["xy_min"][0], sm["xy_max"][0])
-                ey = _dequant(p[1], sm["xy_min"][1], sm["xy_max"][1])
-                cur_pts.append(sm["origin"] + ex * sm["x_axis"] + ey * sm["y_axis"])
-                cur_2d = (ex, ey)
-        elif cmd == ARC:
-            if any(p[i] < 0 for i in range(4)):
-                continue
-            if sketch_idx < len(sk_metas):
-                sm = sk_metas[sketch_idx]
-                mx = _dequant(p[0], sm["xy_min"][0], sm["xy_max"][0])
-                my = _dequant(p[1], sm["xy_min"][1], sm["xy_max"][1])
-                ex = _dequant(p[2], sm["xy_min"][0], sm["xy_max"][0])
-                ey = _dequant(p[3], sm["xy_min"][1], sm["xy_max"][1])
-                sx, sy = cur_2d
-                a2d = _arc_pts(sx, sy, mx, my, ex, ey)
-                for ax2, ay2 in a2d[1:]:
-                    cur_pts.append(sm["origin"] + ax2 * sm["x_axis"] + ay2 * sm["y_axis"])
-                cur_2d = (ex, ey)
-        elif cmd == CIRCLE:
-            if any(p[i] < 0 for i in range(3)):
-                continue
-            if sketch_idx < len(sk_metas):
-                sm = sk_metas[sketch_idx]
-                cx = _dequant(p[0], sm["xy_min"][0], sm["xy_max"][0])
-                cy = _dequant(p[1], sm["xy_min"][1], sm["xy_max"][1])
-                r = (p[2] / QMAX) * sm["sk_scale"]
-                for x2, y2 in _circle_pts(cx, cy, r):
-                    cur_pts.append(sm["origin"] + x2 * sm["x_axis"] + y2 * sm["y_axis"])
+            if cur_loop_rows and sketch_idx < len(sk_metas):
+                pts = _loop_rows_to_real_points(cur_loop_rows, sk_metas[sketch_idx])
+                if pts:
+                    cur_loops.append(pts)
+            cur_loop_rows = []
+        elif cmd in (LINE, ARC, CIRCLE):
+            cur_loop_rows.append(row.copy())
         elif cmd == EXT:
-            if cur_pts:
-                cur_loops.append(cur_pts)
-            cur_pts = []
+            if cur_loop_rows and sketch_idx < len(sk_metas):
+                pts = _loop_rows_to_real_points(cur_loop_rows, sk_metas[sketch_idx])
+                if pts:
+                    cur_loops.append(pts)
+            cur_loop_rows = []
             if cur_loops and sketch_idx < len(sk_metas):
                 sm = sk_metas[sketch_idx]
                 e1_val = _dequant(p[P_E1], 0, max_ext)
                 e2_val = _dequant(p[P_E2], 0, max_ext) if int(p[P_E2]) >= 0 else 0.0
+                bool_op = int(p[P_BOOL]) if int(p[P_BOOL]) >= 0 else 0
                 z_axis_raw = sm["z_axis"]
                 normal = z_axis_raw / (np.linalg.norm(z_axis_raw) + 1e-12)
                 vl = [lp for lp in cur_loops if len(lp) >= 2]
@@ -823,6 +1467,7 @@ def tokens_to_real_sketches(tokens: np.ndarray, dq_meta: dict) -> list:
                         "origin_z": float(sm["origin"][2]),
                         "extent_one": float(e1_val),
                         "extent_two": float(e2_val),
+                        "bool_op": bool_op,
                     })
             cur_loops = []
             sketch_idx += 1
@@ -836,45 +1481,26 @@ def tokens_to_real_sketches(tokens: np.ndarray, dq_meta: dict) -> list:
 def tokens_to_sketches_normalized(tokens: np.ndarray) -> list:
     sketches = []
     cur_loops = []
-    cur_pts = []
-    cur_2d = (0.0, 0.0)
+    cur_loop_rows = []
     for row in tokens:
         cmd = int(row[0])
         p = row[1:]
         if cmd not in CMD_NAME:
             continue
         if cmd == SOL:
-            if cur_pts:
-                cur_loops.append(cur_pts)
-            cur_pts = []
-            cur_2d = (0.0, 0.0)
-        elif cmd == LINE:
-            if p[0] < 0 or p[1] < 0:
-                continue
-            ex, ey = p[0] / QMAX, p[1] / QMAX
-            cur_pts.append((ex, ey))
-            cur_2d = (ex, ey)
-        elif cmd == ARC:
-            if any(p[i] < 0 for i in range(4)):
-                continue
-            mx, my = p[0] / QMAX, p[1] / QMAX
-            ex, ey = p[2] / QMAX, p[3] / QMAX
-            sx, sy = cur_2d
-            a2d = _arc_pts(sx, sy, mx, my, ex, ey)
-            for ax2, ay2 in a2d[1:]:
-                cur_pts.append((ax2, ay2))
-            cur_2d = (ex, ey)
-        elif cmd == CIRCLE:
-            if any(p[i] < 0 for i in range(3)):
-                continue
-            cx, cy = p[0] / QMAX, p[1] / QMAX
-            r = (p[2] / QMAX) * 0.45
-            for x2, y2 in _circle_pts(cx, cy, r):
-                cur_pts.append((x2, y2))
+            if cur_loop_rows:
+                pts = _loop_rows_to_normalized_points(cur_loop_rows)
+                if pts:
+                    cur_loops.append(pts)
+            cur_loop_rows = []
+        elif cmd in (LINE, ARC, CIRCLE):
+            cur_loop_rows.append(row.copy())
         elif cmd == EXT:
-            if cur_pts:
-                cur_loops.append(cur_pts)
-            cur_pts = []
+            if cur_loop_rows:
+                pts = _loop_rows_to_normalized_points(cur_loop_rows)
+                if pts:
+                    cur_loops.append(pts)
+            cur_loop_rows = []
 
             def gp(i):
                 return p[i] / QMAX if p[i] >= 0 else 0.5
@@ -890,6 +1516,8 @@ def tokens_to_sketches_normalized(tokens: np.ndarray) -> list:
         elif cmd == EOS:
             break
     return sketches
+
+
 
 
 # ── 3D rendering helpers ──
@@ -1003,11 +1631,8 @@ def render_3d_normalized(ax, sketches: list) -> list:
 
 
 def _equal_axes(ax):
-    """데이터의 실제 비율 그대로 box aspect 설정.
-    (1,1,1) 강제하면 길쭉한 구조도 정육면체처럼 보여서 왜곡됨."""
     lims = np.array([ax.get_xlim3d(), ax.get_ylim3d(), ax.get_zlim3d()])
     extents = lims[:, 1] - lims[:, 0]
-    # 0/음수 방지 (flat sketch 등)
     max_ext = float(extents.max()) if extents.size else 1.0
     floor = max(max_ext * 0.02, 1e-3)
     extents = np.maximum(extents, floor)
@@ -1018,8 +1643,6 @@ def _equal_axes(ax):
 
 
 def _style(ax, title):
-    # ★ Orthographic projection — perspective 왜곡 제거
-    #   기본은 'persp' 라 top/side view 에서 평면이 사다리꼴로 비틀려 보임.
     try:
         ax.set_proj_type("ortho")
     except Exception:
@@ -1041,11 +1664,12 @@ def _style(ax, title):
     ax.set_title(title, color="#222", fontsize=9.5, fontweight="normal", pad=8)
 
 
+
+
 def _set_axes_and_render(ax, sketches, use_real):
     pts = render_3d_real(ax, sketches) if use_real else render_3d_normalized(ax, sketches)
     if pts:
         arr = np.array(pts)
-        # ★ 더 넉넉한 padding (확대해도 잘려나가는 느낌 줄임)
         ext = arr.max(axis=0) - arr.min(axis=0)
         pad = max(float(ext.max()) * 0.18, 0.1)
         ax.set_xlim(arr[:, 0].min() - pad, arr[:, 0].max() + pad)
@@ -1062,10 +1686,6 @@ def _set_axes_and_render(ax, sketches, use_real):
 
 
 def _compute_sketch_centers(sketches, use_real):
-    """각 sketch 의 3D 중심점 (extruded body 의 가운데).
-    real: bot vertices 평균 + normal * extent/2
-    normalized: render_3d_normalized 와 동일한 변환으로 중심 계산.
-    """
     centers = []
     for sk in sketches:
         if use_real:
@@ -1105,7 +1725,6 @@ def _compute_sketch_centers(sketches, use_real):
 
 
 def _annotate_centers(ax, centers, with_coords=True, with_label=True):
-    """각 중심점을 marker + 좌표 라벨로 표시."""
     for i, c in enumerate(centers):
         if c is None:
             continue
@@ -1138,6 +1757,8 @@ def _annotate_centers(ax, centers, with_coords=True, with_label=True):
 def _print_sketch_centers(centers, use_real):
     if not centers:
         return
+    if log_is_compact():
+        return
     unit = "mm" if use_real else "norm"
     print(f"\n  Sketch centers ({len(centers)} entries, {unit}):")
     for i, c in enumerate(centers):
@@ -1151,7 +1772,6 @@ def _print_sketch_centers(centers, use_real):
 
 
 def _describe_sketches_z(sketches, use_real):
-    """sketch별 z축 진단 문자열 (현재 미사용 — 호출부가 패치로 제거됨)."""
     lines = []
     if not sketches:
         lines.append("  (no sketches)")
@@ -1161,9 +1781,6 @@ def _describe_sketches_z(sketches, use_real):
 
 def show_comparison(orig_tok, recon_tok, fname, save_path,
                     json_data=None):
-    """2×2: (3D View / Top View) × (Original, Recon).
-    ★ 패치: 터미널에 z축 정보 출력 부분 제거됨.
-    plt.show() 호출하지 않음."""
     orig_tok = trim_after_eos(orig_tok)
     recon_tok = trim_after_eos(recon_tok)
     use_real = json_data is not None
@@ -1187,7 +1804,6 @@ def show_comparison(orig_tok, recon_tok, fname, save_path,
 
     coord_label = "real coord (mm)" if use_real else "normalized"
 
-    # ── 2행 × 2열 layout ──
     fig = plt.figure(figsize=(15, 14), facecolor="white")
     fig.suptitle(
         f"Geometry Comparison [{coord_label}]\n{fname}",
@@ -1218,6 +1834,8 @@ def show_comparison(orig_tok, recon_tok, fname, save_path,
         _style(ax, f"{label}\n{ne} extrude · {nl} loop · {tok.shape[0]} token")
         ax.view_init(elev=elev, azim=azim)
 
+
+
     n_leg = max(ne_o, ne_r)
     if n_leg:
         fig.legend(
@@ -1229,7 +1847,7 @@ def show_comparison(orig_tok, recon_tok, fname, save_path,
         )
 
     plt.tight_layout(rect=[0, 0.04, 1, 0.97])
-    print(f"  ✓ 비교 figure 생성: {fname}")
+    log_detail(f"  ✓ 비교 figure 생성: {fname}")
 
 
 @torch.no_grad()
@@ -1281,7 +1899,7 @@ def visualize_reconstruction(ae, dataset, indices, device, max_samples=2):
             )
             figs.append(plt.gcf())
             mode = "real" if json_data is not None else "normalized"
-            print(
+            log_detail(
                 f"  · recon viz [{k+1}/{len(sel)}]: idx={idx} type={t_name} "
                 f"mode={mode}  orig_tok={len(trim_after_eos(orig))} "
                 f"recon_tok={len(trim_after_eos(recon))}"
@@ -1360,6 +1978,14 @@ def load_sparam_data(sparam_files, raw_n_freq, expected_cols=None, verbose=True)
 
         sd = data[:, col_idx].astype(np.float64)
         n_block = sd.shape[0] // raw_n_freq
+        remainder = sd.shape[0] % raw_n_freq
+        if verbose and remainder:
+            print(
+                f"      warn: {remainder} trailing row(s) ignored "
+                f"(rows={sd.shape[0]}, raw_n_freq={raw_n_freq})"
+            )
+        if verbose and n_block == 0:
+            print(f"      warn: no complete {raw_n_freq}-row S-param block")
         for si in range(n_block):
             chunk = sd[si * raw_n_freq:(si + 1) * raw_n_freq]
             if chunk.shape == (raw_n_freq, len(ref_cols)):
@@ -1372,6 +1998,7 @@ def load_sparam_data(sparam_files, raw_n_freq, expected_cols=None, verbose=True)
     if verbose:
         print(f"  loaded S-param raw shape: {arr.shape}")
     return arr, ref_cols
+
 
 
 def _parse_sparam_pair(name):
@@ -1454,6 +2081,20 @@ def return3_reim_to_db_np(return3_reim):
     return np.stack(outs, axis=-1).astype(np.float32)
 
 
+def check_token_json_alignment(token_path, json_data):
+    token_id = sample_id_from_path(token_path)
+    source = json_data.get("metadata", {}).get("source_file", "")
+    source_id = sample_id_from_path(source)
+    if token_id is None or source_id is None:
+        return None
+    if token_id != source_id:
+        return (
+            f"token id {token_id} != JSON metadata.source_file id {source_id} "
+            f"({os.path.basename(token_path)} vs {source})"
+        )
+    return None
+
+
 # ══════════════════════════════════════════════════════════════
 # Dataset
 # ══════════════════════════════════════════════════════════════
@@ -1470,23 +2111,213 @@ class JointDataset(Dataset):
         interp_matrix,
         type_ids=None,
         type_names=None,
+        use_json_names=True,
+        merge_same_role_chunks=True,
+        validate_json_alignment=True,
     ):
         self.npy_files = list(npy_files)
         self.max_len = max_len
+        self.use_json_names = bool(use_json_names)
+        self.merge_same_role_chunks = bool(merge_same_role_chunks)
+        self.validate_json_alignment = bool(validate_json_alignment)
+        self.merged_json_cache = [None] * len(self.npy_files)
 
         self.json_files = []
         for f in self.npy_files:
             jf = f.replace("_tokens.npy", "_deepcad.json")
             self.json_files.append(jf if os.path.exists(jf) else None)
 
+
+
+
+        # ★ JSON metadata.solids[i].name → global role_id 매핑 구축
+        per_sample_names = []
+        alignment_warnings = []
+        if self.use_json_names:
+            for tok_path, jf in zip(self.npy_files, self.json_files):
+                if jf is None or not os.path.exists(jf):
+                    per_sample_names.append(None)
+                    continue
+                try:
+                    import json as _json
+                    with open(jf, "r", encoding="utf-8") as f:
+                        jd = _json.load(f)
+                    if self.validate_json_alignment:
+                        msg = check_token_json_alignment(tok_path, jd)
+                        if msg is not None:
+                            alignment_warnings.append(msg)
+                    solids_meta = jd.get("metadata", {}).get("solids", [])
+                    names = [str(s.get("name", "")) for s in solids_meta]
+                    per_sample_names.append(names if any(names) else None)
+                except Exception:
+                    per_sample_names.append(None)
+        else:
+            per_sample_names = [None] * len(self.npy_files)
+
+        all_names_set = set()
+        for names in per_sample_names:
+            if names is None:
+                continue
+            for n in names:
+                if n:
+                    all_names_set.add(n)
+        self.role_name_to_id = {n: i for i, n in enumerate(sorted(all_names_set))}
+        self.role_id_to_name = {i: n for n, i in self.role_name_to_id.items()}
+        if len(self.role_name_to_id) > N_QUANT:
+            raise ValueError(
+                f"too many ROLE ids: {len(self.role_name_to_id)} > param vocab {N_QUANT}"
+            )
+        n_with_names = sum(1 for n in per_sample_names if n is not None)
+        if self.role_name_to_id:
+            if log_is_compact():
+                print(
+                    f"  roles: {len(self.role_name_to_id)} "
+                    f"from {n_with_names}/{len(self.npy_files)} JSON sample(s)"
+                )
+            else:
+                print(f"  [roletoken] {len(self.role_name_to_id)} unique role(s) "
+                      f"from {n_with_names}/{len(self.npy_files)} samples with JSON names")
+                for n, i in sorted(self.role_name_to_id.items(), key=lambda kv: kv[1]):
+                    print(f"    role_id={i:>2d}  {n!r}")
+        else:
+            reason = "disabled by cfg.use_json_names=False" if not self.use_json_names else "no JSON names"
+            print(f"  [roletoken] {reason} — ROLE tokens not inserted (base behavior)")
+        if alignment_warnings:
+            print(f"  [data-check] JSON source_file mismatch: {len(alignment_warnings)} sample(s)")
+            if not log_is_compact():
+                for msg in alignment_warnings[:5]:
+                    print(f"    {msg}")
+                if len(alignment_warnings) > 5:
+                    print(f"    ... {len(alignment_warnings) - 5} more")
+
         self.raw = []
         self.padded = []
+        n_inserted_total = 0
+        n_merge_total = 0
+        n_samples_merged = 0
+        n_truncated = 0
+        max_seen_len = 0
 
-        for f in self.npy_files:
-            t = np.load(f).astype(np.int32)
+        for i, (f, names) in enumerate(zip(self.npy_files, per_sample_names)):
+            jf = self.json_files[i]
+            t = None
+            updated_names = names
+
+            # ★ JSON 레벨에서 same-role + coplanar + same-extrude chunk 자동 병합
+            if (self.merge_same_role_chunks and names is not None
+                    and jf is not None and os.path.exists(jf)):
+                try:
+                    import json as _json
+                    with open(jf, "r", encoding="utf-8") as fh:
+                        jd_orig = _json.load(fh)
+                    jd_merged, new_names, n_merged = merge_coplanar_same_role_sketches(
+                        jd_orig, names, verbose=(i < 3),
+                    )
+                    if n_merged > 0:
+                        t = json_to_tokens(jd_merged)
+                        updated_names = new_names
+                        self.merged_json_cache[i] = jd_merged
+                        n_merge_total += n_merged
+                        n_samples_merged += 1
+                        if i < 3 and not log_is_compact():
+                            print(f"    sample {i}: {len(names)} → {len(new_names)} chunks "
+                                  f"(merged {n_merged})")
+                except Exception as e:
+                    print(f"    [warn] sample {i}: merge failed: {e}")
+                    t = None
+
+            if t is None:
+                t = np.load(f).astype(np.int32)
+
+            t, n_inserted = self._insert_role_tokens(t, updated_names)
+            n_inserted_total += n_inserted
+            max_seen_len = max(max_seen_len, int(t.shape[0]))
+            if t.shape[0] > max_len:
+                n_truncated += 1
             t = ensure_eos_when_truncated(t, max_len)
             self.raw.append(t)
             self.padded.append(self._pad(t))
+
+        if self.role_name_to_id:
+            if log_is_compact():
+                print(f"  role tokens: {n_inserted_total} inserted")
+            else:
+                print(f"  [roletoken] inserted {n_inserted_total} ROLE tokens "
+                      f"across {len(self.npy_files)} samples")
+        if self.merge_same_role_chunks:
+            if log_is_compact():
+                print(
+                    f"  chunk merge: {n_merge_total} merged "
+                    f"({n_samples_merged}/{len(self.npy_files)} sample(s))"
+                )
+            else:
+                print(f"  [roletoken] merged {n_merge_total} chunks across "
+                      f"{n_samples_merged}/{len(self.npy_files)} samples "
+                      f"(same role + coplanar + same extrude → multi-loop)")
+        if n_truncated:
+            print(f"  [warn] {n_truncated}/{len(self.npy_files)} token sequence(s) truncated "
+                  f"to max_len={max_len} (max observed after ROLE={max_seen_len})")
+
+        self.role_cmd_patterns = extract_role_cmd_patterns(self.raw)
+        self.role_sequence_codebook = extract_role_sequence_codebook(self.raw)
+        self.topology_signature_codebook = extract_topology_signature_codebook(self.raw)
+        if self.role_cmd_patterns:
+            n_patterns = sum(len(v) for v in self.role_cmd_patterns.values())
+            if log_is_compact():
+                print(
+                    f"  role patterns: {n_patterns} pattern(s), "
+                    f"{len(self.role_cmd_patterns)} role(s)"
+                )
+            else:
+                print(
+                    f"  [role-pattern] {n_patterns} command pattern(s) "
+                    f"from {len(self.role_cmd_patterns)} role(s)"
+                )
+                for rid, patterns in sorted(self.role_cmd_patterns.items()):
+                    name = self.role_id_to_name.get(rid, f"role_{rid}")
+                    loops = sorted({p.count(SOL) for p in patterns})
+                    shown = ", ".join(cmd_pattern_to_string(p) for p in patterns[:3])
+                    if len(patterns) > 3:
+                        shown += f", ...(+{len(patterns) - 3})"
+                    print(
+                        f"    role_id={rid:>2d} {name!r}: "
+                        f"{len(patterns)} pattern(s), loops={loops}  {shown}"
+                )
+        else:
+            print("  [role-pattern] no ROLE command patterns available")
+        if self.role_sequence_codebook:
+            if log_is_compact():
+                print(f"  role sequences: {len(self.role_sequence_codebook)} codebook item(s)")
+            else:
+                print(
+                    f"  [role-sequence] {len(self.role_sequence_codebook)} "
+                    f"ROLE order codebook item(s)"
+                )
+                for seq in self.role_sequence_codebook[:8]:
+                    names = [
+                        self.role_id_to_name.get(int(r), f"role_{int(r)}")
+                        for r in seq
+                    ]
+                    print(f"    {seq}  ({' > '.join(names)})")
+        if self.topology_signature_codebook:
+            if log_is_compact():
+                print(
+                    f"  topology signatures: "
+                    f"{len(self.topology_signature_codebook)} codebook item(s)"
+                )
+            else:
+                print(
+                    f"  [topology-signature] "
+                    f"{len(self.topology_signature_codebook)} codebook item(s)"
+                )
+                for sig in self.topology_signature_codebook[:8]:
+                    chunks = []
+                    for rid, pattern in sig:
+                        name = self.role_id_to_name.get(int(rid), f"role_{int(rid)}")
+                        chunks.append(f"{name}:{cmd_pattern_to_string(pattern)}")
+                    print(f"    {' > '.join(chunks)}")
+
+
 
         self.sparam_db = sparam_db.astype(np.float32)
         self.freqs = np.asarray(freqs, dtype=np.float32)
@@ -1529,16 +2360,56 @@ class JointDataset(Dataset):
             for i, name in enumerate(self.type_names)
         )
 
-        print(f"  loaded {N} token sequences + Return-3 dB target")
-        print(f"    type distribution       : {dist}")
-        print(f"    token range             : cmd=[0..{max_cmd}], param=[0..{max_prm}]")
-        print(f"    selected S-param shape  : {self.sparam_db.shape}")
-        print(f"    selected frequency shape: {self.freqs.shape}")
-        print(f"    selected freq range     : {self.freqs[0]:.4f} ~ {self.freqs[-1]:.4f} GHz")
-        print(f"    full S-param shape      : {self.sparam_db_full.shape}")
-        print(f"    full frequency shape    : {self.freqs_full.shape}")
-        print(f"    full freq range         : {self.freqs_full[0]:.4f} ~ {self.freqs_full[-1]:.4f} GHz")
-        print(f"    interp matrix shape     : {self.interp_matrix.shape}")
+        if log_is_compact():
+            print(
+                f"  dataset: {N} samples | {dist} | "
+                f"tokens cmd=[0..{max_cmd}], prm=[0..{max_prm}] | "
+                f"S-param sel={self.sparam_db.shape}, full={self.sparam_db_full.shape}"
+            )
+        else:
+            print(f"  loaded {N} token sequences + Return-3 dB target")
+            print(f"    type distribution       : {dist}")
+            print(f"    token range             : cmd=[0..{max_cmd}], param=[0..{max_prm}]")
+            print(f"    selected S-param shape  : {self.sparam_db.shape}")
+            print(f"    selected frequency shape: {self.freqs.shape}")
+            print(f"    selected freq range     : {self.freqs[0]:.4f} ~ {self.freqs[-1]:.4f} GHz")
+            print(f"    full S-param shape      : {self.sparam_db_full.shape}")
+            print(f"    full frequency shape    : {self.freqs_full.shape}")
+            print(f"    full freq range         : {self.freqs_full[0]:.4f} ~ {self.freqs_full[-1]:.4f} GHz")
+            print(f"    interp matrix shape     : {self.interp_matrix.shape}")
+
+    def _insert_role_tokens(self, tokens, names):
+        if not self.role_name_to_id or not names:
+            return tokens, 0
+        out_rows = []
+        chunk_idx = -1
+        expecting_first_sol = True
+        n_inserted = 0
+        for i in range(tokens.shape[0]):
+            c = int(tokens[i, 0])
+            if c == EOS or c < 0:
+                out_rows.append(tokens[i])
+                continue
+            if c == SOL:
+                if expecting_first_sol:
+                    chunk_idx += 1
+                    if 0 <= chunk_idx < len(names):
+                        nm = names[chunk_idx]
+                        rid = self.role_name_to_id.get(nm)
+                        if rid is not None:
+                            role_row = np.full(17, PAD_V, dtype=tokens.dtype)
+                            role_row[0] = ROLE
+                            role_row[1] = int(rid)
+                            out_rows.append(role_row)
+                            n_inserted += 1
+                    expecting_first_sol = False
+                out_rows.append(tokens[i])
+            elif c == EXT:
+                out_rows.append(tokens[i])
+                expecting_first_sol = True
+            else:
+                out_rows.append(tokens[i])
+        return np.stack(out_rows, axis=0).astype(tokens.dtype), n_inserted
 
     def _pad(self, t):
         L = t.shape[0]
@@ -1548,6 +2419,10 @@ class JointDataset(Dataset):
         return np.concatenate([t, pad], axis=0).astype(np.float32)
 
     def load_json(self, idx):
+        if 0 <= idx < len(self.merged_json_cache):
+            cached = self.merged_json_cache[idx]
+            if cached is not None:
+                return cached
         jf = self.json_files[idx] if idx < len(self.json_files) else None
         if jf is None:
             return None
@@ -1570,6 +2445,7 @@ class JointDataset(Dataset):
         )
 
 
+
 class SubsetDataset(Dataset):
     def __init__(self, dataset, indices):
         self.dataset = dataset
@@ -1581,19 +2457,6 @@ class SubsetDataset(Dataset):
     def __getitem__(self, i):
         return self.dataset[self.indices[i]]
 
-
-# ============================================================
-# main_patched_part2.py
-# ============================================================
-# 이 파일은 main_patched_part1.py 의 *연속* 입니다.
-# 사용법: Part 1 의 끝에 Part 2 의 내용을 그대로 이어붙여 하나의
-# 파일로 합쳐서 실행하세요.
-#
-# Part 1 끝   = SubsetDataset 클래스
-# Part 2 시작 = AE model (SinPosEnc / DeepCADBaselineAE)
-# Part 2 끝   = main 블록 (USE_TYPES = [1, 2], 두 타입 학습)
-# 두 파일을 합치면 총 3110줄.
-# ============================================================
 
 # ══════════════════════════════════════════════════════════════
 # AE model
@@ -1679,7 +2542,10 @@ class DeepCADBaselineAE(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(
             enc_layer, num_layers=n_enc, norm=nn.LayerNorm(d_model),
+            enable_nested_tensor=False,
         )
+
+
 
         if self.n_pool >= 2:
             self.pool_queries = nn.Parameter(torch.randn(self.n_pool, d_model) * 0.02)
@@ -1710,6 +2576,11 @@ class DeepCADBaselineAE(nn.Module):
 
         self.cmd_head = nn.Linear(d_model, N_CMD)
         self.param_head = nn.Linear(d_model, N_ARGS * N_QUANT)
+        self.role_cmd_patterns = {}
+        self.role_pattern_role_ids = ()
+        self.role_id_to_name_for_patterns = {}
+        self.role_sequence_codebook = ()
+        self.topology_signature_codebook = ()
 
         if aux_numeric:
             aux_h = max(int(latent * aux_hidden_mult), 64)
@@ -1802,6 +2673,8 @@ class DeepCADBaselineAE(nn.Module):
 
         return z
 
+
+
     def _memory_from_z(self, z):
         return self.from_z(z).view(
             z.size(0), self.mem_tokens, self.d_model,
@@ -1839,13 +2712,490 @@ class DeepCADBaselineAE(nn.Module):
         out = self.aux_numeric_head(z)
         return out.view(B, self.max_len, N_ARGS)
 
+    def set_role_cmd_patterns(self, role_cmd_patterns, role_id_to_name=None):
+        cleaned = {}
+        for rid, patterns in (role_cmd_patterns or {}).items():
+            seqs = set()
+            for pattern in patterns:
+                seq = tuple(int(c) for c in pattern)
+                if len(seq) >= 2 and seq[0] == SOL and seq[-1] == EXT:
+                    seqs.add(seq)
+            if seqs:
+                cleaned[int(rid)] = tuple(sorted(seqs, key=lambda p: (len(p), p)))
+
+        self.role_cmd_patterns = cleaned
+        self.role_pattern_role_ids = tuple(sorted(cleaned.keys()))
+        self.role_id_to_name_for_patterns = {
+            int(k): str(v) for k, v in (role_id_to_name or {}).items()
+        }
+
+    def set_role_sequence_codebook(self, role_sequences):
+        cleaned = set()
+        for seq in (role_sequences or ()):
+            vals = tuple(int(x) for x in seq if int(x) >= 0)
+            if vals:
+                cleaned.add(vals)
+        self.role_sequence_codebook = tuple(sorted(cleaned, key=lambda s: (len(s), s)))
+
+    def set_topology_signature_codebook(self, topology_signatures):
+        cleaned = set()
+        for sig in (topology_signatures or ()):
+            chunks = []
+            for item in sig:
+                if len(item) != 2:
+                    continue
+                rid, pattern = item
+                pat = tuple(int(c) for c in pattern)
+                if int(rid) >= 0 and len(pat) >= 2 and pat[0] == SOL and pat[-1] == EXT:
+                    chunks.append((int(rid), pat))
+            if chunks:
+                cleaned.add(tuple(chunks))
+        self.topology_signature_codebook = tuple(
+            sorted(cleaned, key=lambda s: (len(s), s))
+        )
+
+    def _active_role_pattern_prefix(self, steps, batch_idx):
+        role_id = None
+        prefix = []
+
+        for tok in steps:
+            cmd = int(tok[batch_idx, 0].item())
+            if cmd < 0 or cmd == EOS:
+                role_id = None
+                prefix = []
+                break
+
+            if cmd == ROLE:
+                rid = int(tok[batch_idx, 1].item())
+                role_id = rid if rid in self.role_cmd_patterns else None
+                prefix = []
+                continue
+
+            if cmd == EXT:
+                role_id = None
+                prefix = []
+                continue
+
+            if role_id is not None and cmd in (SOL, LINE, ARC, CIRCLE):
+                prefix.append(cmd)
+
+        return role_id, tuple(prefix)
+
+
+
+    def _topology_signature_state(self, steps, batch_idx):
+        completed = []
+        active_role = None
+        active_prefix = []
+
+        for tok in steps:
+            cmd = int(tok[batch_idx, 0].item())
+            if cmd < 0 or cmd == EOS:
+                break
+
+            if cmd == ROLE:
+                rid = int(tok[batch_idx, 1].item())
+                active_role = rid if rid >= 0 else None
+                active_prefix = []
+                continue
+
+            if cmd == EXT:
+                if active_role is not None and active_prefix:
+                    completed.append((
+                        int(active_role),
+                        tuple(int(c) for c in active_prefix + [EXT]),
+                    ))
+                active_role = None
+                active_prefix = []
+                continue
+
+            if active_role is not None and cmd in (SOL, LINE, ARC, CIRCLE):
+                active_prefix.append(cmd)
+
+        return tuple(completed), active_role, tuple(active_prefix)
+
+    def _allowed_next_roles_by_topology_codebook(self, completed):
+        if not self.topology_signature_codebook:
+            return None
+        completed = tuple(completed or ())
+        allowed = set()
+        for sig in self.topology_signature_codebook:
+            if len(completed) < len(sig) and tuple(sig[:len(completed)]) == completed:
+                allowed.add(int(sig[len(completed)][0]))
+        return tuple(sorted(allowed))
+
+    def _topology_prefix_is_complete(self, completed):
+        completed = tuple(completed or ())
+        return any(tuple(sig) == completed for sig in self.topology_signature_codebook)
+
+    def _allowed_next_cmds_by_topology_codebook(self, completed, role_id, prefix):
+        if not self.topology_signature_codebook or role_id is None:
+            return None
+        completed = tuple(completed or ())
+        prefix = tuple(int(c) for c in (prefix or ()))
+        role_id = int(role_id)
+        allowed = set()
+
+        for sig in self.topology_signature_codebook:
+            if len(completed) >= len(sig):
+                continue
+            if tuple(sig[:len(completed)]) != completed:
+                continue
+            rid, pattern = sig[len(completed)]
+            if int(rid) != role_id:
+                continue
+            pattern = tuple(int(c) for c in pattern)
+            if len(prefix) < len(pattern) and pattern[:len(prefix)] == prefix:
+                allowed.add(int(pattern[len(prefix)]))
+
+        return tuple(sorted(allowed))
+
+    def _allowed_next_roles_by_sequence_codebook(self, prefix):
+        if not self.role_sequence_codebook:
+            return None
+        prefix = tuple(int(x) for x in (prefix or ()))
+        allowed = set()
+        for seq in self.role_sequence_codebook:
+            if len(prefix) < len(seq) and tuple(seq[:len(prefix)]) == prefix:
+                allowed.add(int(seq[len(prefix)]))
+        return tuple(sorted(allowed))
+
+    def _role_sequence_prefix(self, steps, batch_idx):
+        prefix = []
+        for tok in steps:
+            cmd = int(tok[batch_idx, 0].item())
+            if cmd < 0 or cmd == EOS:
+                break
+            if cmd == ROLE:
+                rid = int(tok[batch_idx, 1].item())
+                if rid >= 0:
+                    prefix.append(rid)
+        return tuple(prefix)
+
+    def _normalize_forced_role_sequences(self, forced_role_sequence, batch_size):
+        if forced_role_sequence is None:
+            return [None] * batch_size
+
+        if isinstance(forced_role_sequence, torch.Tensor):
+            forced_role_sequence = forced_role_sequence.detach().cpu().tolist()
+
+        seq = list(forced_role_sequence)
+        if not seq:
+            return [None] * batch_size
+
+        if all(isinstance(x, (int, np.integer)) for x in seq):
+            one = tuple(int(x) for x in seq)
+            return [one] * batch_size
+
+
+
+        out = []
+        for i in range(batch_size):
+            item = seq[i] if i < len(seq) else seq[-1]
+            out.append(tuple(int(x) for x in item))
+        return out
+
+    def _mask_cmd_logits_by_grammar(self, cmd_logits, steps):
+        allowed = torch.zeros_like(cmd_logits, dtype=torch.bool)
+
+        if not steps:
+            allowed[:, ROLE] = True
+            allowed[:, SOL] = True
+            return cmd_logits.masked_fill(~allowed, -1e9)
+
+        last_cmd = steps[-1][:, 0].long()
+
+        mask = last_cmd == ROLE
+        if mask.any():
+            allowed[mask, SOL] = True
+
+        mask = last_cmd == SOL
+        if mask.any():
+            allowed[mask, LINE] = True
+            allowed[mask, ARC] = True
+            allowed[mask, CIRCLE] = True
+
+        mask = (last_cmd == LINE) | (last_cmd == ARC)
+        if mask.any():
+            allowed[mask, LINE] = True
+            allowed[mask, ARC] = True
+            allowed[mask, SOL] = True
+            allowed[mask, EXT] = True
+
+        mask = last_cmd == CIRCLE
+        if mask.any():
+            allowed[mask, SOL] = True
+            allowed[mask, EXT] = True
+
+        mask = last_cmd == EXT
+        if mask.any():
+            allowed[mask, ROLE] = True
+            allowed[mask, SOL] = True
+            allowed[mask, EOS] = True
+
+        mask = last_cmd == EOS
+        if mask.any():
+            allowed[mask, EOS] = True
+
+        empty = ~allowed.any(dim=-1)
+        if empty.any():
+            allowed[empty, ROLE] = True
+            allowed[empty, SOL] = True
+            allowed[empty, EOS] = True
+
+        return cmd_logits.masked_fill(~allowed, -1e9)
+
+    def _mask_cmd_logits_by_role_patterns(self, cmd_logits, steps):
+        if not self.role_cmd_patterns or not steps:
+            return cmd_logits
+
+        allowed = torch.zeros_like(cmd_logits, dtype=torch.bool)
+
+        for bi in range(cmd_logits.size(0)):
+            role_id, prefix = self._active_role_pattern_prefix(steps, bi)
+            if role_id is None:
+                continue
+
+            next_cmds = set()
+            for pattern in self.role_cmd_patterns.get(role_id, ()):
+                if len(prefix) < len(pattern) and pattern[:len(prefix)] == prefix:
+                    next_cmds.add(int(pattern[len(prefix)]))
+
+            for cmd in next_cmds:
+                if 0 <= cmd < N_CMD:
+                    allowed[bi, cmd] = True
+
+        constrained = allowed.any(dim=-1)
+        if not constrained.any():
+            return cmd_logits
+
+        out = cmd_logits.clone()
+        out[constrained] = out[constrained].masked_fill(~allowed[constrained], -1e9)
+        return out
+
+    def _mask_cmd_logits_by_topology_codebook(self, cmd_logits, steps):
+        if not self.topology_signature_codebook:
+            return cmd_logits
+
+        allowed = torch.zeros_like(cmd_logits, dtype=torch.bool)
+        constrained = torch.zeros(
+            (cmd_logits.size(0),), dtype=torch.bool, device=cmd_logits.device,
+        )
+
+        for bi in range(cmd_logits.size(0)):
+            if not steps:
+                allowed[bi, ROLE] = True
+                constrained[bi] = True
+                continue
+
+            last_cmd = int(steps[-1][bi, 0].item())
+            if last_cmd == EOS:
+                allowed[bi, EOS] = True
+                constrained[bi] = True
+                continue
+
+            completed, active_role, active_prefix = self._topology_signature_state(
+                steps, bi,
+            )
+
+            if active_role is not None:
+                next_cmds = self._allowed_next_cmds_by_topology_codebook(
+                    completed, active_role, active_prefix,
+                )
+                if next_cmds:
+                    for cmd in next_cmds:
+                        if 0 <= int(cmd) < N_CMD:
+                            allowed[bi, int(cmd)] = True
+                    constrained[bi] = True
+                continue
+
+
+
+            if last_cmd != EXT:
+                continue
+
+            next_roles = self._allowed_next_roles_by_topology_codebook(completed)
+            if next_roles:
+                allowed[bi, ROLE] = True
+            if self._topology_prefix_is_complete(completed):
+                allowed[bi, EOS] = True
+            if not allowed[bi].any():
+                allowed[bi, EOS] = True
+            constrained[bi] = True
+
+        if not constrained.any():
+            return cmd_logits
+
+        out = cmd_logits.clone()
+        for bi in torch.where(constrained)[0].tolist():
+            row_allowed = allowed[bi]
+            masked = out[bi].masked_fill(~row_allowed, -1e9)
+            if row_allowed.any() and torch.max(masked[row_allowed]) <= -1e8:
+                masked = torch.full_like(out[bi], -1e9)
+                masked[row_allowed] = 0.0
+            out[bi] = masked
+        return out
+
+    def _mask_cmd_logits_by_role_sequence_codebook(self, cmd_logits, steps):
+        if not self.role_sequence_codebook:
+            return cmd_logits
+
+        allowed = torch.zeros_like(cmd_logits, dtype=torch.bool)
+        constrained = torch.zeros(
+            (cmd_logits.size(0),), dtype=torch.bool, device=cmd_logits.device,
+        )
+
+        for bi in range(cmd_logits.size(0)):
+            if not steps:
+                allowed[bi, ROLE] = True
+                constrained[bi] = True
+                continue
+
+            last_cmd = int(steps[-1][bi, 0].item())
+            if last_cmd == EOS:
+                allowed[bi, EOS] = True
+                constrained[bi] = True
+                continue
+
+            if last_cmd != EXT:
+                continue
+
+            prefix = self._role_sequence_prefix(steps, bi)
+            next_roles = self._allowed_next_roles_by_sequence_codebook(prefix)
+            if next_roles:
+                allowed[bi, ROLE] = True
+            if tuple(prefix) in self.role_sequence_codebook:
+                allowed[bi, EOS] = True
+            if not allowed[bi].any():
+                allowed[bi, EOS] = True
+            constrained[bi] = True
+
+        if not constrained.any():
+            return cmd_logits
+
+        out = cmd_logits.clone()
+        out[constrained] = out[constrained].masked_fill(~allowed[constrained], -1e9)
+        return out
+
+    def _mask_cmd_logits_by_forced_role_sequence(
+        self, cmd_logits, steps, forced_role_sequences,
+    ):
+        if not forced_role_sequences:
+            return cmd_logits
+
+        allowed = torch.zeros_like(cmd_logits, dtype=torch.bool)
+        constrained = torch.zeros((cmd_logits.size(0),), dtype=torch.bool, device=cmd_logits.device)
+
+        for bi, seq in enumerate(forced_role_sequences):
+            if not seq:
+                continue
+
+            if not steps:
+                allowed[bi, ROLE] = True
+                constrained[bi] = True
+                continue
+
+            last_cmd = int(steps[-1][bi, 0].item())
+            if last_cmd == EOS:
+                allowed[bi, EOS] = True
+                constrained[bi] = True
+                continue
+
+            if last_cmd != EXT:
+                continue
+
+            prefix = self._role_sequence_prefix(steps, bi)
+            if len(prefix) < len(seq) and tuple(seq[:len(prefix)]) == prefix:
+                allowed[bi, ROLE] = True
+            elif prefix == tuple(seq):
+                allowed[bi, EOS] = True
+            else:
+                allowed[bi, EOS] = True
+            constrained[bi] = True
+
+        if not constrained.any():
+            return cmd_logits
+
+        out = cmd_logits.clone()
+        out[constrained] = out[constrained].masked_fill(~allowed[constrained], -1e9)
+        return out
+
+    def _mask_role_param_logits(
+        self, prm_logits, next_cmd, steps=None, forced_role_sequences=None,
+    ):
+        if not self.role_pattern_role_ids:
+            return prm_logits
+
+        role_rows = next_cmd == ROLE
+        if not role_rows.any():
+            return prm_logits
+
+        valid = [
+            rid for rid in self.role_pattern_role_ids
+            if 0 <= int(rid) < N_QUANT
+        ]
+        if not valid:
+            return prm_logits
+
+        out = prm_logits.clone()
+
+        for bi in torch.where(role_rows)[0].tolist():
+            allowed_ids = list(valid)
+            topology_next_roles = None
+            if self.topology_signature_codebook:
+                completed, active_role, _prefix = self._topology_signature_state(
+                    steps or [], bi,
+                )
+                if active_role is None:
+                    topology_next_roles = self._allowed_next_roles_by_topology_codebook(
+                        completed,
+                    )
+
+            if forced_role_sequences and bi < len(forced_role_sequences):
+                seq = forced_role_sequences[bi]
+                if seq:
+                    prefix = self._role_sequence_prefix(steps or [], bi)
+                    if len(prefix) < len(seq) and tuple(seq[:len(prefix)]) == prefix:
+                        allowed_ids = [int(seq[len(prefix)])]
+                    elif prefix == tuple(seq):
+                        allowed_ids = []
+            elif self.role_sequence_codebook:
+                prefix = self._role_sequence_prefix(steps or [], bi)
+                next_roles = self._allowed_next_roles_by_sequence_codebook(prefix)
+                if next_roles is not None:
+                    allowed_ids = [rid for rid in allowed_ids if rid in next_roles]
+
+            if topology_next_roles is not None:
+                topo_allowed = [rid for rid in allowed_ids if rid in topology_next_roles]
+                if topo_allowed:
+                    allowed_ids = topo_allowed
+                elif topology_next_roles:
+                    allowed_ids = [rid for rid in valid if rid in topology_next_roles]
+                else:
+                    allowed_ids = []
+
+            if not allowed_ids:
+                continue
+
+            allowed = torch.zeros((N_QUANT,), dtype=torch.bool, device=prm_logits.device)
+            allowed[
+                torch.tensor(allowed_ids, dtype=torch.long, device=prm_logits.device)
+            ] = True
+            out[bi, 0, :] = out[bi, 0, :].masked_fill(~allowed, -1e9)
+        return out
+
+
+
     @torch.no_grad()
-    def generate(self, z, max_gen_len=None):
+    def generate(self, z, max_gen_len=None, forced_role_sequence=None):
         if max_gen_len is None:
             max_gen_len = self.max_len
 
         B = z.size(0)
         device = z.device
+        forced_role_sequences = self._normalize_forced_role_sequences(
+            forced_role_sequence, B,
+        )
 
         memory = self._memory_from_z(z)
         bos = self.bos.expand(B, 1, self.d_model)
@@ -1879,7 +3229,18 @@ class DeepCADBaselineAE(nn.Module):
             cmd_logits = self.cmd_head(last)
             prm_logits = self.param_head(last).view(B, N_ARGS, N_QUANT)
 
+            cmd_logits = self._mask_cmd_logits_by_grammar(cmd_logits, steps)
+            cmd_logits = self._mask_cmd_logits_by_role_patterns(cmd_logits, steps)
+            cmd_logits = self._mask_cmd_logits_by_role_sequence_codebook(cmd_logits, steps)
+            cmd_logits = self._mask_cmd_logits_by_forced_role_sequence(
+                cmd_logits, steps, forced_role_sequences,
+            )
+            cmd_logits = self._mask_cmd_logits_by_topology_codebook(cmd_logits, steps)
             next_cmd = torch.argmax(cmd_logits, dim=-1)
+            prm_logits = self._mask_role_param_logits(
+                prm_logits, next_cmd, steps=steps,
+                forced_role_sequences=forced_role_sequences,
+            )
             next_prm = torch.argmax(prm_logits, dim=-1)
 
             next_tok = torch.full((B, 17), PAD_V, dtype=torch.long, device=device)
@@ -1928,6 +3289,7 @@ class DeepCADBaselineAE(nn.Module):
         cmd_logits, prm_logits = self.decode_teacher(z, x)
         aux = self.aux_numeric_predict(z)
         return cmd_logits, prm_logits, aux, z
+
 
 
 # ══════════════════════════════════════════════════════════════
@@ -2048,6 +3410,7 @@ def vicreg_z_loss(z, var_target=1.0, eps=1e-4):
     return var_loss, cov_loss
 
 
+
 # ══════════════════════════════════════════════════════════════
 # Epoch
 # ══════════════════════════════════════════════════════════════
@@ -2164,19 +3527,25 @@ def build_common_curve_and_print_baseline(dataset, train_idx, val_idx_per_type, 
         sel_rmse = float(np.sqrt(np.mean((pred_sel - true_sel) ** 2)))
         full_rmse = float(np.sqrt(np.mean((pred_full - true_full) ** 2)))
 
-        print(f"  [{tname}]")
-        print(f"    common selected RMSE : {sel_rmse:.3f} dB")
-        print(f"    common full RMSE     : {full_rmse:.3f} dB")
+        if not log_is_compact():
+            print(f"  [{tname}]")
+            print(f"    common selected RMSE : {sel_rmse:.3f} dB")
+            print(f"    common full RMSE     : {full_rmse:.3f} dB")
 
         total_sel_sq += float(np.sum((pred_sel - true_sel) ** 2))
         total_sel_n += int(np.prod(true_sel.shape))
         total_full_sq += float(np.sum((pred_full - true_full) ** 2))
         total_full_n += int(np.prod(true_full.shape))
 
-    if total_sel_n > 0:
-        print(f"\n  TOTAL common selected RMSE : {math.sqrt(total_sel_sq / total_sel_n):.3f} dB")
-    if total_full_n > 0:
-        print(f"  TOTAL common full RMSE     : {math.sqrt(total_full_sq / total_full_n):.3f} dB")
+    if log_is_compact():
+        sel_msg = math.sqrt(total_sel_sq / total_sel_n) if total_sel_n > 0 else float("nan")
+        full_msg = math.sqrt(total_full_sq / total_full_n) if total_full_n > 0 else float("nan")
+        print(f"  common baseline RMSE: selected={sel_msg:.3f} dB, full={full_msg:.3f} dB")
+    else:
+        if total_sel_n > 0:
+            print(f"\n  TOTAL common selected RMSE : {math.sqrt(total_sel_sq / total_sel_n):.3f} dB")
+        if total_full_n > 0:
+            print(f"  TOTAL common full RMSE     : {math.sqrt(total_full_sq / total_full_n):.3f} dB")
 
     return common_sel
 
@@ -2217,16 +3586,23 @@ def diagnose_reconstruction(ae, dataset, indices, device, max_samples=8):
     cmd_acc = cmd_correct / max(cmd_total, 1)
     prm_mae = prm_abs / max(prm_count, 1)
 
-    print(f"  Recon diagnostic:")
-    print(f"    samples evaluated    : {len(sel)}")
-    print(f"    cmd accuracy aligned : {cmd_acc * 100:.2f}%")
-    print(f"    struct match         : {struct_match}/{len(sel)}")
-    print(f"    param MAE quant      : {prm_mae:.3f}")
-    print(f"    param MAE normalized : {prm_mae / QMAX:.5f}")
+    if log_is_compact():
+        print(
+            f"  recon: cmd_acc={cmd_acc * 100:.2f}%, "
+            f"struct={struct_match}/{len(sel)}, prm_MAE={prm_mae:.3f}"
+        )
+    else:
+        print(f"  Recon diagnostic:")
+        print(f"    samples evaluated    : {len(sel)}")
+        print(f"    cmd accuracy aligned : {cmd_acc * 100:.2f}%")
+        print(f"    struct match         : {struct_match}/{len(sel)}")
+        print(f"    param MAE quant      : {prm_mae:.3f}")
+        print(f"    param MAE normalized : {prm_mae / QMAX:.5f}")
 
     return {
         "cmd_acc": cmd_acc, "struct_match": struct_match, "prm_mae": prm_mae,
     }
+
 
 
 @torch.no_grad()
@@ -2348,6 +3724,20 @@ def diagnose_latent_simple(ae, dataset, indices, device):
 def print_eval_diagnostics(eval_metrics, latent_diag, recon_diag, type_names):
     section("EVALUATION DIAGNOSTICS")
 
+    if log_is_compact():
+        print(
+            f"  eval RMSE: selected={eval_metrics['overall_selected_rmse']:.4f} dB, "
+            f"full={eval_metrics['overall_full_rmse']:.4f} dB, "
+            f"|res|={eval_metrics['overall_residual_abs']:.4f} dB"
+        )
+        print(
+            f"  latent: z_std={latent_diag['z_std_mean']:.4f}, "
+            f"dead={latent_diag['dead_dims']}/{latent_diag['latent_dim']} | "
+            f"recon cmd={recon_diag['cmd_acc'] * 100:.2f}%, "
+            f"struct={recon_diag['struct_match']}"
+        )
+        return
+
     for tname in type_names:
         if tname not in eval_metrics["per_type"]:
             continue
@@ -2383,6 +3773,7 @@ def print_eval_diagnostics(eval_metrics, latent_diag, recon_diag, type_names):
     print(f"    struct_match  : {recon_diag['struct_match']}")
 
 
+
 def plot_training_curves(hist):
     fig, axes = plt.subplots(1, 3, figsize=(15, 4), facecolor="white")
     ep = np.arange(1, len(hist["tr_full"]) + 1)
@@ -2407,7 +3798,7 @@ def plot_training_curves(hist):
     axes[2].grid(True, alpha=0.25); axes[2].legend()
 
     plt.tight_layout()
-    print("  ✓ training curves figure generated")
+    log_detail("  ✓ training curves figure generated")
 
 
 @torch.no_grad()
@@ -2528,7 +3919,8 @@ def analyze_latent_space(z_all, type_ids=None, type_names=None):
     ax.grid(True, alpha=0.2)
 
     plt.tight_layout()
-    print("  ✓ latent 분석 figure 생성 (PCA + t-SNE + cumvar)")
+    log_detail("  ✓ latent 분석 figure 생성 (PCA + t-SNE + cumvar)")
+
 
 
 @torch.no_grad()
@@ -2630,7 +4022,7 @@ def visualize_sparam_predictions(
         )
 
     plt.tight_layout()
-    print(f"  ✓ S-param prediction figure 생성 (n={n_pick} samples, freqs={len(freqs_full)})")
+    log_detail(f"  ✓ S-param prediction figure 생성 (n={n_pick} samples, freqs={len(freqs_full)})")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -2654,9 +4046,15 @@ def load_multitype_data(cfg, script_dir):
         else tuple([0] * n_types)
     )
 
-    print(f"  Types: {list(type_names)}")
-    print(f"  n_samples per type: {list(n_samples_per_type)}")
-    print(f"  raw_n_freq={cfg.raw_n_freq}, selected n_freq target={cfg.n_freq}")
+    if log_is_compact():
+        print(
+            f"  data config: types={list(type_names)}, "
+            f"samples/type={list(n_samples_per_type)}, freq={cfg.raw_n_freq}->{cfg.n_freq}"
+        )
+    else:
+        print(f"  Types: {list(type_names)}")
+        print(f"  n_samples per type: {list(n_samples_per_type)}")
+        print(f"  raw_n_freq={cfg.raw_n_freq}, selected n_freq target={cfg.n_freq}")
 
     freq_idx, freqs_full, freqs_sel = select_frequency_indices(
         raw_n_freq=cfg.raw_n_freq,
@@ -2666,18 +4064,27 @@ def load_multitype_data(cfg, script_dir):
         mode=cfg.freq_select_mode,
     )
 
+
+
     cfg.n_freq = int(len(freq_idx))
     interp_matrix = build_interp_matrix_np(freqs_sel, freqs_full)
 
-    print(f"\n  Frequency point selection")
-    print(f"    mode             : {cfg.freq_select_mode}")
-    print(f"    raw_n_freq       : {cfg.raw_n_freq}")
-    print(f"    selected n_freq  : {cfg.n_freq}")
-    print(f"    first/last index : {int(freq_idx[0])} / {int(freq_idx[-1])}")
-    print(f"    first/last freq  : {freqs_sel[0]:.4f} / {freqs_sel[-1]:.4f} GHz")
-    if len(freq_idx) >= 2:
-        print(f"    approx df        : {float(freqs_sel[1] - freqs_sel[0]):.4f} GHz")
-    print(f"    interp matrix    : {interp_matrix.shape}")
+    if log_is_compact():
+        df_msg = f", df≈{float(freqs_sel[1] - freqs_sel[0]):.4f}GHz" if len(freq_idx) >= 2 else ""
+        print(
+            f"  frequency: {cfg.n_freq} points "
+            f"({freqs_sel[0]:.2f}-{freqs_sel[-1]:.2f}GHz{df_msg})"
+        )
+    else:
+        print(f"\n  Frequency point selection")
+        print(f"    mode             : {cfg.freq_select_mode}")
+        print(f"    raw_n_freq       : {cfg.raw_n_freq}")
+        print(f"    selected n_freq  : {cfg.n_freq}")
+        print(f"    first/last index : {int(freq_idx[0])} / {int(freq_idx[-1])}")
+        print(f"    first/last freq  : {freqs_sel[0]:.4f} / {freqs_sel[-1]:.4f} GHz")
+        if len(freq_idx) >= 2:
+            print(f"    approx df        : {float(freqs_sel[1] - freqs_sel[0]):.4f} GHz")
+        print(f"    interp matrix    : {interp_matrix.shape}")
 
     all_npy = []
     all_sp_reim = []
@@ -2693,9 +4100,10 @@ def load_multitype_data(cfg, script_dir):
         npy_dir_abs = npy_dir if os.path.isabs(npy_dir) else os.path.join(script_dir, npy_dir)
         sp_glob_abs = sp_glob if os.path.isabs(sp_glob) else os.path.join(script_dir, sp_glob)
 
-        print(f"\n  · [{tname}]")
-        print(f"    npy_dir     = {npy_dir_abs}")
-        print(f"    sparam_glob = {sp_glob_abs}")
+        if not log_is_compact():
+            print(f"\n  · [{tname}]")
+            print(f"    npy_dir     = {npy_dir_abs}")
+            print(f"    sparam_glob = {sp_glob_abs}")
 
         npy_files = sorted(
             glob.glob(os.path.join(npy_dir_abs, "*_tokens.npy")),
@@ -2708,6 +4116,24 @@ def load_multitype_data(cfg, script_dir):
         if not sp_files:
             raise FileNotFoundError(f"No S-param files: {sp_glob_abs}")
 
+        npy_ids_all = [sample_id_from_path(p) for p in npy_files]
+        sp_ids_all = [sample_id_from_path(p) for p in sp_files]
+        if (
+            len(sp_files) == len(npy_files)
+            and all(i is not None for i in npy_ids_all)
+            and all(i is not None for i in sp_ids_all)
+            and len(set(npy_ids_all)) == len(npy_ids_all)
+            and len(set(sp_ids_all)) == len(sp_ids_all)
+        ):
+            if set(npy_ids_all) == set(sp_ids_all):
+                sp_by_id = {sample_id_from_path(p): p for p in sp_files}
+                aligned_sp_files = [sp_by_id[i] for i in npy_ids_all]
+                if aligned_sp_files != sp_files:
+                    log_detail("    [data-check] reordered S-param files by sample id")
+                    sp_files = aligned_sp_files
+            else:
+                print(f"    [{tname}] token/S-param ids differ; using natural order")
+
         sp_arr_raw, sp_names = load_sparam_data(
             sp_files, cfg.raw_n_freq,
             expected_cols=sparam_names_ref, verbose=False,
@@ -2718,9 +4144,10 @@ def load_multitype_data(cfg, script_dir):
 
         n_match = min(len(npy_files), sp_arr_raw.shape[0])
         if len(npy_files) != sp_arr_raw.shape[0]:
-            print(f"    count mismatch token/S-param → use first {n_match}")
-            print(f"      token files : {len(npy_files)}")
-            print(f"      sparam rows : {sp_arr_raw.shape[0]}")
+            print(
+                f"    [{tname}] count mismatch token/S-param: "
+                f"tokens={len(npy_files)}, sparam={sp_arr_raw.shape[0]} → use {n_match}"
+            )
 
         npy_files = npy_files[:n_match]
         sp_arr_raw = sp_arr_raw[:n_match]
@@ -2734,9 +4161,27 @@ def load_multitype_data(cfg, script_dir):
                 pick = sorted(rng.sample(range(n_match), n_pick))
             npy_files = [npy_files[i] for i in pick]
             sp_arr_raw = sp_arr_raw[pick]
-            print(f"    selected: {len(npy_files)} by {mode}")
+            if log_is_compact():
+                print(f"  [{tname}] selected {len(npy_files)} sample(s) by {mode}")
+            else:
+                print(f"    selected: {len(npy_files)} by {mode}")
         else:
-            print(f"    use all: {len(npy_files)}")
+            if log_is_compact():
+                print(f"  [{tname}] using all {len(npy_files)} sample(s)")
+            else:
+                print(f"    use all: {len(npy_files)}")
+
+        sample_ids = [sample_id_from_path(p) for p in npy_files]
+        if any(sid is None for sid in sample_ids):
+            print(f"    [{tname}] some token file ids could not be parsed")
+        elif len(set(sample_ids)) != len(sample_ids):
+            print(f"    [{tname}] duplicate token file ids detected")
+        if len(sp_files) != len(npy_files):
+            log_detail("    [data-check] token/S-param pairing assumes natural token order == CSV block order")
+        else:
+            sp_ids = [sample_id_from_path(p) for p in sp_files]
+            if all(sid is not None for sid in sp_ids) and set(sp_ids) != set(sample_ids):
+                print(f"    [{tname}] S-param file ids differ from selected token ids")
 
         all_npy.extend(npy_files)
         all_sp_reim.append(sp_arr_raw)
@@ -2747,7 +4192,7 @@ def load_multitype_data(cfg, script_dir):
 
     sparam_return3_reim_raw, _sparam_return3_names = filter_return3_sparams(
         sparam_reim_all_raw, sparam_names_ref,
-        return_pairs=RETURN_PORT_PAIRS, verbose=True,
+        return_pairs=RETURN_PORT_PAIRS, verbose=not log_is_compact(),
     )
 
     sparam_db_full = return3_reim_to_db_np(sparam_return3_reim_raw)
@@ -2760,17 +4205,29 @@ def load_multitype_data(cfg, script_dir):
 
     sparam_db = sparam_db_full[:, freq_idx, :]
 
-    print(f"\n  Convert Return-3 re/im → dB target")
-    print(f"    raw re/im shape     : {sparam_return3_reim_raw.shape}")
-    print(f"    full dB shape       : {sparam_db_full.shape}")
-    print(f"    selected dB shape   : {sparam_db.shape}")
-    print(f"    full dB range       : min={sparam_db_full.min():.2f}, max={sparam_db_full.max():.2f}")
-    print(f"    selected dB range   : min={sparam_db.min():.2f}, max={sparam_db.max():.2f}")
+    if log_is_compact():
+        print(
+            f"  S-param dB: selected={sparam_db.shape}, full={sparam_db_full.shape}, "
+            f"range={sparam_db_full.min():.2f}..{sparam_db_full.max():.2f} dB"
+        )
+    else:
+        print(f"\n  Convert Return-3 re/im → dB target")
+        print(f"    raw re/im shape     : {sparam_return3_reim_raw.shape}")
+        print(f"    full dB shape       : {sparam_db_full.shape}")
+        print(f"    selected dB shape   : {sparam_db.shape}")
+        print(f"    full dB range       : min={sparam_db_full.min():.2f}, max={sparam_db_full.max():.2f}")
+        print(f"    selected dB range   : min={sparam_db.min():.2f}, max={sparam_db.max():.2f}")
 
+    def _post_role_len(p):
+        t = np.load(p)
+        n_chunks = int((t[:, 0] == EXT).sum())
+        return t.shape[0] + n_chunks
     max_len = min(
-        max(np.load(f).shape[0] for f in all_npy) + 4,
+        max(_post_role_len(f) for f in all_npy) + 4,
         cfg.max_len_cap,
     )
+
+
 
     dataset = JointDataset(
         all_npy, max_len, sparam_db,
@@ -2781,6 +4238,9 @@ def load_multitype_data(cfg, script_dir):
         interp_matrix=interp_matrix,
         type_ids=type_ids,
         type_names=type_names,
+        use_json_names=getattr(cfg, "use_json_names", True),
+        merge_same_role_chunks=getattr(cfg, "merge_same_role_chunks", True),
+        validate_json_alignment=getattr(cfg, "validate_json_alignment", True),
     )
 
     return dataset, all_npy, type_ids, type_names, sparam_db, max_len
@@ -2811,8 +4271,11 @@ def make_stratified_split(cfg, dataset, type_ids, type_names):
         for ti in range(n_types)
     )
 
-    print(f"  train={len(train_idx)} val={len(val_idx)}")
-    print(f"  per-type train/val: {per_type_msg}")
+    if log_is_compact():
+        print(f"  split: train={len(train_idx)}, val={len(val_idx)} | {per_type_msg}")
+    else:
+        print(f"  train={len(train_idx)} val={len(val_idx)}")
+        print(f"  per-type train/val: {per_type_msg}")
 
     return train_idx, val_idx, val_idx_per_type
 
@@ -2820,7 +4283,7 @@ def make_stratified_split(cfg, dataset, type_ids, type_names):
 # ══════════════════════════════════════════════════════════════
 # Train
 # ══════════════════════════════════════════════════════════════
-def train_fixed_medium_var(
+def train_compact_vicreg(
     cfg,
     dataset,
     type_names,
@@ -2836,16 +4299,22 @@ def train_fixed_medium_var(
         dataset.interp_matrix, dtype=torch.float32, device=device,
     )
 
-    section("RUN START — fixed medium_var")
+    section("RUN START — compact VICReg")
 
-    print(f"  preset             : {cfg.preset}")
-    print(f"  use_vicreg          : {cfg.use_vicreg}")
-    print(f"  w_var / w_cov       : {cfg.w_var} / {cfg.w_cov}")
-    print(f"  var_target          : {cfg.vicreg_var_target}")
-    print(f"  epochs / bs         : {cfg.epochs} / {cfg.batch_size}")
-    print(f"  d_model / latent    : {cfg.d_model} / {cfg.latent}")
-    print(f"  selected_n_freq     : {cfg.n_freq}")
-    print(f"  full_n_freq         : {cfg.raw_n_freq}")
+    if log_is_compact():
+        print(
+            f"  preset={cfg.preset}, epochs={cfg.epochs}, bs={cfg.batch_size}, "
+            f"d_model={cfg.d_model}, latent={cfg.latent}, freq={cfg.n_freq}/{cfg.raw_n_freq}"
+        )
+    else:
+        print(f"  preset             : {cfg.preset}")
+        print(f"  use_vicreg          : {cfg.use_vicreg}")
+        print(f"  w_var / w_cov       : {cfg.w_var} / {cfg.w_cov}")
+        print(f"  var_target          : {cfg.vicreg_var_target}")
+        print(f"  epochs / bs         : {cfg.epochs} / {cfg.batch_size}")
+        print(f"  d_model / latent    : {cfg.d_model} / {cfg.latent}")
+        print(f"  selected_n_freq     : {cfg.n_freq}")
+        print(f"  full_n_freq         : {cfg.raw_n_freq}")
 
     train_set = SubsetDataset(dataset, train_idx)
     val_set = SubsetDataset(dataset, val_idx)
@@ -2873,6 +4342,7 @@ def train_fixed_medium_var(
         aux_numeric=cfg.aux_numeric,
         aux_hidden_mult=cfg.aux_hidden_mult,
     ).to(device)
+    configure_decode_codebooks(ae, dataset)
 
     mlp = SparamCommonResidualMLP(
         latent_dim=cfg.latent,
@@ -2884,14 +4354,23 @@ def train_fixed_medium_var(
         zero_init_residual=cfg.zero_init_residual,
     ).to(device)
 
-    # ★ Checkpoint load (선택) — ckpt_load_path 있으면 학습 skip, 인버스만 진행
+
+
     loaded_from_ckpt = False
+    ckpt_best_metric = None
     ckpt_load_path = getattr(cfg, "ckpt_load_path", "")
     if ckpt_load_path and os.path.exists(ckpt_load_path):
         try:
             ckpt = torch.load(ckpt_load_path, map_location=device, weights_only=False)
             ae.load_state_dict(ckpt["ae_state_dict"])
             mlp.load_state_dict(ckpt["mlp_state_dict"])
+            saved_map = ckpt.get("role_name_to_id", {})
+            cur_map = getattr(dataset, "role_name_to_id", {})
+            if (saved_map or cur_map) and saved_map != cur_map:
+                raise ValueError(
+                    f"role_name_to_id mismatch — saved={saved_map}, current={cur_map}"
+                )
+            ckpt_best_metric = ckpt.get("best_val_metric", None)
             loaded_from_ckpt = True
             print(f"\n  ✓ loaded ckpt ← {ckpt_load_path}")
             print(f"    → training will be skipped (0 epochs)\n")
@@ -2904,14 +4383,38 @@ def train_fixed_medium_var(
     mlp_params = sum(p.numel() for p in mlp.parameters())
 
     section("BUILD MODEL")
-    print(f"  AE params           : {ae_params:,}")
-    print(f"  Residual MLP params : {mlp_params:,}")
-    print(f"  Total params        : {ae_params + mlp_params:,}")
-    print(f"  Surrogate form      : pred = common_curve + residual(z)")
-    print(f"  VICReg fixed        : w_var={cfg.w_var}, w_cov={cfg.w_cov}, target={cfg.vicreg_var_target}")
-    print(f"  Aux numeric         : {cfg.aux_numeric}")
-    print(f"  selected output dim : {cfg.n_freq * 3}")
-    print(f"  full target dim     : {cfg.raw_n_freq * 3}")
+    n_role_patterns = sum(len(v) for v in getattr(ae, "role_cmd_patterns", {}).values())
+    n_role_sequences = len(getattr(ae, "role_sequence_codebook", ()))
+    n_topology_signatures = len(getattr(ae, "topology_signature_codebook", ()))
+    if log_is_compact():
+        rp = f"ON ({n_role_patterns}/{len(ae.role_cmd_patterns)})" if n_role_patterns else "OFF"
+        rs = f"ON ({n_role_sequences})" if n_role_sequences else "OFF"
+        ts = f"ON ({n_topology_signatures})" if n_topology_signatures else "OFF"
+        print(
+            f"  params={ae_params + mlp_params:,} | "
+            f"role-pattern={rp} | role-seq={rs} | topology={ts}"
+        )
+    else:
+        print(f"  AE params           : {ae_params:,}")
+        print(f"  Residual MLP params : {mlp_params:,}")
+        print(f"  Total params        : {ae_params + mlp_params:,}")
+        print(f"  Surrogate form      : pred = common_curve + residual(z)")
+        print(f"  VICReg fixed        : w_var={cfg.w_var}, w_cov={cfg.w_cov}, target={cfg.vicreg_var_target}")
+        print(f"  Aux numeric         : {cfg.aux_numeric}")
+        if n_role_patterns:
+            print(
+                f"  Role pattern decode : ON "
+                f"({n_role_patterns} pattern(s), {len(ae.role_cmd_patterns)} role(s))"
+            )
+        else:
+            print("  Role pattern decode : OFF")
+        print(f"  Role sequence decode: {'ON' if n_role_sequences else 'OFF'} ({n_role_sequences})")
+        print(
+            f"  Topology codebook   : "
+            f"{'ON' if n_topology_signatures else 'OFF'} ({n_topology_signatures})"
+        )
+        print(f"  selected output dim : {cfg.n_freq * 3}")
+        print(f"  full target dim     : {cfg.raw_n_freq * 3}")
 
     optimizer = torch.optim.AdamW(
         [
@@ -2932,7 +4435,7 @@ def train_fixed_medium_var(
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_sched)
 
-    best_metric = float("inf")
+    best_metric = float(ckpt_best_metric) if ckpt_best_metric is not None else float("inf")
     best_ae_state = None
     best_mlp_state = None
 
@@ -2948,21 +4451,29 @@ def train_fixed_medium_var(
 
     section("JOINT TRAINING — AE + Common-Residual MLP")
 
-    print(f"  epochs={cfg.epochs}, batch_size={cfg.batch_size}")
-    print(f"  lr_ae={cfg.lr_ae:.2e}, lr_mlp={cfg.lr_mlp:.2e}, wd={cfg.weight_decay}")
-    print(f"  loss = cmd({cfg.w_cmd}) + prm({cfg.w_prm}) + aux({cfg.w_aux})")
-    print(f"       + sparam_full_interp({cfg.w_sparam})")
-    print(f"       + var({cfg.w_var}) + cov({cfg.w_cov})")
-    print(f"  db_loss_scale={cfg.db_loss_scale}")
+    if log_is_compact():
+        print(
+            f"  loss weights: cmd={cfg.w_cmd}, prm={cfg.w_prm}, "
+            f"aux={cfg.w_aux}, sparam={cfg.w_sparam}, vicreg=({cfg.w_var},{cfg.w_cov})"
+        )
+        print(f"\n  {'ep':>4s} | {'tr_full':>8s} {'va_full':>8s} {'best':>8s} | {'lr':>8s}")
+        print("  " + "-" * 45)
+    else:
+        print(f"  epochs={cfg.epochs}, batch_size={cfg.batch_size}")
+        print(f"  lr_ae={cfg.lr_ae:.2e}, lr_mlp={cfg.lr_mlp:.2e}, wd={cfg.weight_decay}")
+        print(f"  loss = cmd({cfg.w_cmd}) + prm({cfg.w_prm}) + aux({cfg.w_aux})")
+        print(f"       + sparam_full_interp({cfg.w_sparam})")
+        print(f"       + var({cfg.w_var}) + cov({cfg.w_cov})")
+        print(f"  db_loss_scale={cfg.db_loss_scale}")
 
-    print(
-        f"\n  {'ep':>4s} | "
-        f"{'tr_tot':>8s} {'cmd':>6s} {'prm':>6s} {'aux':>7s} "
-        f"{'tr_full':>8s} {'tr_sel':>8s} {'res':>7s} "
-        f"{'var':>7s} {'cov':>7s} {'zstd':>6s} "
-        f"{'va_tot':>8s} {'va_full':>8s} {'va_sel':>8s} {'va_res':>7s} | {'lr':>8s}"
-    )
-    print("  " + "-" * 154)
+        print(
+            f"\n  {'ep':>4s} | "
+            f"{'tr_tot':>8s} {'cmd':>6s} {'prm':>6s} {'aux':>7s} "
+            f"{'tr_full':>8s} {'tr_sel':>8s} {'res':>7s} "
+            f"{'var':>7s} {'cov':>7s} {'zstd':>6s} "
+            f"{'va_tot':>8s} {'va_full':>8s} {'va_sel':>8s} {'va_res':>7s} | {'lr':>8s}"
+        )
+        print("  " + "-" * 154)
 
     n_epochs_eff = 0 if loaded_from_ckpt else cfg.epochs
     for ep in range(1, n_epochs_eff + 1):
@@ -2999,23 +4510,31 @@ def train_fixed_medium_var(
             }
 
         if ep == 1 or ep % log_every == 0 or ep == cfg.epochs:
-            print(
-                f"  {ep:4d} | "
-                f"{tr['total']:8.4f} {tr['cmd']:6.3f} {tr['prm']:6.3f} {tr['aux']:7.4f} "
-                f"{tr['rmse_db_full']:8.3f} {tr['rmse_db_sel']:8.3f} {tr['res_abs']:7.3f} "
-                f"{tr['var']:7.4f} {tr['cov']:7.4f} {tr['z_std']:6.3f} "
-                f"{va['total']:8.4f} {va['rmse_db_full']:8.3f} {va['rmse_db_sel']:8.3f} {va['res_abs']:7.3f} | "
-                f"{optimizer.param_groups[0]['lr']:8.2e}"
-            )
+            if log_is_compact():
+                print(
+                    f"  {ep:4d} | "
+                    f"{tr['rmse_db_full']:8.3f} {va['rmse_db_full']:8.3f} "
+                    f"{best_metric:8.3f} | {optimizer.param_groups[0]['lr']:8.2e}"
+                )
+            else:
+                print(
+                    f"  {ep:4d} | "
+                    f"{tr['total']:8.4f} {tr['cmd']:6.3f} {tr['prm']:6.3f} {tr['aux']:7.4f} "
+                    f"{tr['rmse_db_full']:8.3f} {tr['rmse_db_sel']:8.3f} {tr['res_abs']:7.3f} "
+                    f"{tr['var']:7.4f} {tr['cov']:7.4f} {tr['z_std']:6.3f} "
+                    f"{va['total']:8.4f} {va['rmse_db_full']:8.3f} {va['rmse_db_sel']:8.3f} {va['res_abs']:7.3f} | "
+                    f"{optimizer.param_groups[0]['lr']:8.2e}"
+                )
 
     print(f"\n  Best full-grid interpolated val RMSE dB: {best_metric:.4f}")
+
+
 
     if best_ae_state is not None:
         ae.load_state_dict({k: v.to(device) for k, v in best_ae_state.items()})
     if best_mlp_state is not None:
         mlp.load_state_dict({k: v.to(device) for k, v in best_mlp_state.items()})
 
-    # ★ Checkpoint save — 학습 후 (로드한 경우엔 다시 저장 안 함)
     ckpt_save_path = getattr(cfg, "ckpt_save_path", "")
     if (ckpt_save_path and getattr(cfg, "save_ckpt_after_train", True)
             and not loaded_from_ckpt):
@@ -3023,7 +4542,6 @@ def train_fixed_medium_var(
             _dir = os.path.dirname(ckpt_save_path)
             if _dir:
                 os.makedirs(_dir, exist_ok=True)
-            # 자기 자신의 소스 코드 embed (인버스 단계에서 .py 따로 안 들고 다녀도 되도록)
             _src = None
             _src_name = None
             try:
@@ -3033,7 +4551,6 @@ def train_fixed_medium_var(
                 _src_name = os.path.basename(_src_path)
             except Exception:
                 pass
-            # cfg 도 dict 로 직렬화 → 추론 시 동일 architecture 재현
             try:
                 import dataclasses as _dc
                 _cfg_dict = _dc.asdict(cfg)
@@ -3042,8 +4559,14 @@ def train_fixed_medium_var(
             torch.save({
                 "ae_state_dict": ae.state_dict(),
                 "mlp_state_dict": mlp.state_dict(),
+                "role_name_to_id": getattr(dataset, "role_name_to_id", {}),
+                "role_id_to_name": getattr(dataset, "role_id_to_name", {}),
+                "role_cmd_patterns": getattr(dataset, "role_cmd_patterns", {}),
+                "role_sequence_codebook": getattr(dataset, "role_sequence_codebook", ()),
+                "topology_signature_codebook": getattr(
+                    dataset, "topology_signature_codebook", (),
+                ),
                 "max_len": dataset.max_len,
-                "type_names": list(getattr(dataset, "type_names", [])),
                 "cfg_repr": repr(cfg),
                 "cfg_dict": _cfg_dict,
                 "best_val_metric": float(best_metric),
@@ -3051,8 +4574,7 @@ def train_fixed_medium_var(
                 "source_filename": _src_name,
             }, ckpt_save_path)
             extra = f"  (+source: {_src_name})" if _src else "  (source not embedded)"
-            print(f"\n  ✓ saved ckpt → {ckpt_save_path}  "
-                  f"(best val RMSE dB={best_metric:.4f}){extra}\n")
+            print(f"\n  ✓ saved ckpt → {ckpt_save_path}  (best val RMSE dB={best_metric:.4f}){extra}\n")
         except Exception as e:
             print(f"  ⚠ failed to save ckpt {ckpt_save_path}: {e}")
 
@@ -3065,10 +4587,8 @@ def train_fixed_medium_var(
         max_samples=min(8, len(val_idx) or len(train_idx)),
     )
 
-    # ── ★ 구조 복원 시각화 (encoder 입력 vs decoder 복원) ──
     if cfg.show_figures:
         subsection("Reconstruction structure visualization")
-        # type 별로 한 개씩 우선 뽑고, n_preview 더 많으면 나머지 채움
         pool_source = list(val_idx) if len(val_idx) > 0 else list(train_idx)
         n_show = max(1, int(cfg.n_preview))
 
@@ -3083,7 +4603,6 @@ def train_fixed_medium_var(
                 stratified.append(idx)
                 seen_types.add(t_id)
 
-        # 모든 type 1 개씩은 무조건 보이고, n_show 가 더 크면 추가로 채움
         viz_pool = list(stratified)
         if n_show > len(viz_pool):
             for idx in pool_source:
@@ -3093,7 +4612,7 @@ def train_fixed_medium_var(
                         break
         max_to_show = max(n_show, len(stratified))
 
-        print(
+        log_detail(
             f"  recon viz: showing {min(len(viz_pool), max_to_show)} samples "
             f"(stratified by type, n_types={len(seen_types)})"
         )
@@ -3119,7 +4638,6 @@ def train_fixed_medium_var(
 
     print_eval_diagnostics(eval_metrics, latent_diag, recon_diag, type_names)
 
-    # ── training curves / latent analysis / sparam prediction figures ──
     if cfg.show_figures:
         subsection("Training curves")
         try:
@@ -3157,21 +4675,30 @@ def train_fixed_medium_var(
         "latent_dim": latent_diag["latent_dim"],
     }
 
-    section("FINAL SUMMARY — fixed medium_var")
+    section("FINAL SUMMARY — compact VICReg")
 
-    print(f"  VICReg       : ON")
-    print(f"  w_var        : {cfg.w_var}")
-    print(f"  w_cov        : {cfg.w_cov}")
-    print(f"  var_target   : {cfg.vicreg_var_target}")
-    print(f"  best_val     : {result['best_val']:.4f} dB")
-    print(f"  eval_full    : {result['eval_full']:.4f} dB")
-    print(f"  eval_sel     : {result['eval_sel']:.4f} dB")
-    print(f"  res_abs      : {result['res_abs']:.4f} dB")
-    print(f"  z_std        : {result['z_std']:.4f}")
-    print(f"  z_norm       : {result['z_norm']:.4f}")
-    print(f"  dead dims    : {result['dead']} / {result['latent_dim']}")
+    if log_is_compact():
+        print(
+            f"  best_val={result['best_val']:.4f} dB | "
+            f"eval_full={result['eval_full']:.4f} dB | "
+            f"eval_sel={result['eval_sel']:.4f} dB | "
+            f"dead={result['dead']}/{result['latent_dim']}"
+        )
+    else:
+        print(f"  VICReg       : ON")
+        print(f"  w_var        : {cfg.w_var}")
+        print(f"  w_cov        : {cfg.w_cov}")
+        print(f"  var_target   : {cfg.vicreg_var_target}")
+        print(f"  best_val     : {result['best_val']:.4f} dB")
+        print(f"  eval_full    : {result['eval_full']:.4f} dB")
+        print(f"  eval_sel     : {result['eval_sel']:.4f} dB")
+        print(f"  res_abs      : {result['res_abs']:.4f} dB")
+        print(f"  z_std        : {result['z_std']:.4f}")
+        print(f"  z_norm       : {result['z_norm']:.4f}")
+        print(f"  dead dims    : {result['dead']} / {result['latent_dim']}")
 
     return ae, mlp, result
+
 
 
 # ══════════════════════════════════════════════════════════════
@@ -3184,7 +4711,6 @@ def make_target_db_curve(
     deep_db=-20.0,
     flat_db=0.0,
 ):
-    """채널별 target 주파수에서 bandwidth 안만 deep_db, 외부는 flat_db."""
     freqs_full = np.asarray(freqs_full, dtype=np.float32)
     n_freq = len(freqs_full)
     n_ch = len(channel_target_freqs)
@@ -3215,31 +4741,24 @@ def inverse_design_optimize(
     out_band_weight=0.0,
     z_prior_weight=1e-3,
     z_prior_weight_end=1e-5,
+    z_nn_weight=2e-2,
+    z_nn_weight_end=2e-3,
+    z_nn_margin=1.5,
     deep_db=-20.0,
     flat_db=0.0,
     seed=0,
     verbose_every=100,
-    # Tier 1
     cosine_lr=True,
     lr_min_ratio=0.05,
     early_stop_patience=200,
-    # Tier 2(a) — random restart on stagnation
     restart_patience=80,
     restart_frac=0.25,
     restart_noise=0.3,
     max_restarts=10,
+    candidate_limit=12,
+    balanced_type_starts=False,
+    type_conditioned_nn=False,
 ):
-    """Multi-start latent optimization with cosine LR + prior decay + random restart.
-
-    Tier1:
-      - cosine LR schedule (lr → lr * lr_min_ratio)
-      - z_prior_weight 선형 감소 (초반엔 분포 안 유지, 후반엔 풀어줘서 fine search)
-      - early stopping (early_stop_patience iter 정체)
-
-    Tier2(a):
-      - 정체(restart_patience iter 동안 best 개선 없음) 시 worst restart_frac
-        만큼을 학습 latent 무작위 샘플 + noise 로 교체 + Adam moments 리셋
-    """
     ae.eval()
     mlp.eval()
 
@@ -3248,6 +4767,37 @@ def inverse_design_optimize(
     z_prior_t = torch.tensor(z_prior, dtype=torch.float32, device=device)
     z_mean = z_prior_t.mean(dim=0)
     z_std = z_prior_t.std(dim=0).clamp(min=1e-3)
+    z_prior_norm = ((z_prior_t - z_mean) / z_std).detach()
+    type_ids_np = np.asarray(getattr(dataset, "type_ids", []), dtype=np.int64)
+    has_type_ids = (
+        type_ids_np.ndim == 1
+        and int(type_ids_np.shape[0]) == int(z_prior_t.size(0))
+        and np.unique(type_ids_np).size > 1
+    )
+
+    def _nearest_prior_rmse(z_normed, current_idx_np=None):
+        if (
+            not type_conditioned_nn
+            or not has_type_ids
+            or current_idx_np is None
+            or len(current_idx_np) != int(z_normed.size(0))
+        ):
+            nn_d2 = torch.cdist(z_normed, z_prior_norm).pow(2).min(dim=1).values
+            return torch.sqrt(nn_d2 / max(z_normed.size(1), 1) + 1e-8)
+
+        current_idx_np = np.asarray(current_idx_np, dtype=np.int64)
+        current_types = type_ids_np[np.clip(current_idx_np, 0, len(type_ids_np) - 1)]
+        out = torch.empty(z_normed.size(0), dtype=z_normed.dtype, device=z_normed.device)
+        for tid in np.unique(current_types):
+            row_idx_np = np.where(current_types == int(tid))[0]
+            prior_idx_np = np.where(type_ids_np == int(tid))[0]
+            if row_idx_np.size == 0 or prior_idx_np.size == 0:
+                continue
+            row_idx = torch.as_tensor(row_idx_np, dtype=torch.long, device=z_normed.device)
+            prior_idx = torch.as_tensor(prior_idx_np, dtype=torch.long, device=z_normed.device)
+            nn_d2 = torch.cdist(z_normed.index_select(0, row_idx), z_prior_norm.index_select(0, prior_idx)).pow(2).min(dim=1).values
+            out.index_copy_(0, row_idx, torch.sqrt(nn_d2 / max(z_normed.size(1), 1) + 1e-8))
+        return out
 
     target_full, masks = make_target_db_curve(
         dataset.freqs_full,
@@ -3265,22 +4815,53 @@ def inverse_design_optimize(
 
     rng = np.random.default_rng(seed)
     n_starts = min(int(n_starts), z_prior_t.size(0))
-    init_idx = rng.choice(z_prior_t.size(0), size=n_starts, replace=False)
+    if (
+        balanced_type_starts
+        and has_type_ids
+    ):
+        unique_types = np.unique(type_ids_np)
+        rng.shuffle(unique_types)
+        base = n_starts // len(unique_types)
+        rem = n_starts % len(unique_types)
+        chosen = []
+        for pos, tid in enumerate(unique_types):
+            n_pick = base + (1 if pos < rem else 0)
+            if n_pick <= 0:
+                continue
+            pool = np.where(type_ids_np == int(tid))[0]
+            if pool.size == 0:
+                continue
+            take = min(n_pick, pool.size)
+            chosen.extend(rng.choice(pool, size=take, replace=False).tolist())
+        if len(chosen) < n_starts:
+            remaining = np.setdiff1d(np.arange(z_prior_t.size(0)), np.asarray(chosen, dtype=np.int64))
+            fill = rng.choice(
+                remaining if remaining.size else np.arange(z_prior_t.size(0)),
+                size=n_starts - len(chosen),
+                replace=remaining.size < n_starts - len(chosen),
+            )
+            chosen.extend(fill.tolist())
+        init_idx = np.asarray(chosen[:n_starts], dtype=np.int64)
+        rng.shuffle(init_idx)
+    else:
+        init_idx = rng.choice(z_prior_t.size(0), size=n_starts, replace=False)
+    current_train_idx = np.asarray(init_idx, dtype=np.int64).copy()
     z_init = z_prior_t[init_idx].clone()
 
     z = z_init.clone().detach().requires_grad_(True)
     optimizer = torch.optim.Adam([z], lr=lr)
 
     best_z = None
+    best_objective = float("inf")
     best_loss = float("inf")
     best_pred_full = None
     best_in_band = None
     best_start_idx = -1
+    best_train_idx = -1
 
     in_band_count = masks_t.float().sum(dim=0).clamp(min=1.0).unsqueeze(0)
     out_band_count = (~masks_t).float().sum(dim=0).clamp(min=1.0).unsqueeze(0)
 
-    # ★ z trajectory 추적 (PCA 시각화 용)
     track_every = max(1, n_iters // 50)
     z_trajectory = [z.detach().cpu().numpy().copy()]
     track_iters = [0]
@@ -3291,28 +4872,39 @@ def inverse_design_optimize(
     iters_used = n_iters
     early_stopped = False
 
-    print(
-        f"  multi-start optimization | "
-        f"n_starts={n_starts}, n_iters={n_iters}, lr={lr} "
-        f"({'cosine→' + f'{lr * lr_min_ratio:.1e}' if cosine_lr else 'constant'})"
-    )
-    print(
-        f"  loss weights: in_band={in_band_weight}, out_band={out_band_weight}"
-    )
-    print(
-        f"  prior weight schedule: {z_prior_weight:.1e} → {z_prior_weight_end:.1e}"
-    )
-    print(
-        f"  random restart: worst {int(restart_frac * 100)}% replaced after "
-        f"{restart_patience} stagnant iters (max {max_restarts}x)"
-    )
-    print(
-        f"  early stop: after {early_stop_patience} stagnant iters"
-    )
-    print(f"  target: deep_db={deep_db}, flat_db={flat_db}")
+    if log_is_compact():
+        print(
+            f"  inverse opt: starts={n_starts}, iters={n_iters}, lr={lr:.1e}, "
+            f"in_band_w={in_band_weight}, "
+            f"prior={z_prior_weight:.1e}->{z_prior_weight_end:.1e}, "
+            f"nn_prior={z_nn_weight:.1e}->{z_nn_weight_end:.1e}"
+        )
+    else:
+        print(
+            f"  multi-start optimization | "
+            f"n_starts={n_starts}, n_iters={n_iters}, lr={lr} "
+            f"({'cosine→' + f'{lr * lr_min_ratio:.1e}' if cosine_lr else 'constant'})"
+        )
+        print(
+            f"  loss weights: in_band={in_band_weight}, out_band={out_band_weight}"
+        )
+        print(
+            f"  prior weight schedule: {z_prior_weight:.1e} → {z_prior_weight_end:.1e}"
+        )
+        print(
+            f"  nearest latent prior : {z_nn_weight:.1e} → {z_nn_weight_end:.1e}, "
+            f"margin={z_nn_margin:.2f}"
+        )
+        print(
+            f"  random restart: worst {int(restart_frac * 100)}% replaced after "
+            f"{restart_patience} stagnant iters (max {max_restarts}x)"
+        )
+        print(
+            f"  early stop: after {early_stop_patience} stagnant iters"
+        )
+        print(f"  target: deep_db={deep_db}, flat_db={flat_db}")
 
     for it in range(n_iters):
-        # ── Tier1: schedules ──
         progress = it / max(n_iters - 1, 1)
         if cosine_lr:
             cos_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
@@ -3325,6 +4917,10 @@ def inverse_design_optimize(
         cur_prior_w = (
             z_prior_weight
             + (z_prior_weight_end - z_prior_weight) * progress
+        )
+        cur_nn_w = (
+            z_nn_weight
+            + (z_nn_weight_end - z_nn_weight) * progress
         )
 
         optimizer.zero_grad()
@@ -3348,29 +4944,35 @@ def inverse_design_optimize(
         ).mean(dim=-1)
 
         z_reg_per = (((z - z_mean) / z_std) ** 2).mean(dim=-1)
-        total_per = match_per + cur_prior_w * z_reg_per
+        if cur_nn_w > 0:
+            z_normed = (z - z_mean) / z_std
+            z_nn_rmse = _nearest_prior_rmse(z_normed, current_train_idx)
+            z_nn_per = F.relu(z_nn_rmse - float(z_nn_margin)) ** 2
+        else:
+            z_nn_per = torch.zeros_like(z_reg_per)
+        total_per = match_per + cur_prior_w * z_reg_per + cur_nn_w * z_nn_per
         loss = total_per.sum()
 
         loss.backward()
         optimizer.step()
 
-        # ★ z snapshot for PCA trajectory
         if (it + 1) % track_every == 0:
             z_trajectory.append(z.detach().cpu().numpy().copy())
             track_iters.append(it + 1)
 
         with torch.no_grad():
-            bi = int(torch.argmin(match_per).item())
-            cur = float(match_per[bi].item())
-            if cur < best_loss - 1e-8:
-                best_loss = cur
+            bi = int(torch.argmin(total_per).item())
+            cur_obj = float(total_per[bi].item())
+            if cur_obj < best_objective - 1e-8:
+                best_objective = cur_obj
+                best_loss = float(match_per[bi].item())
                 best_z = z[bi:bi + 1].detach().clone()
                 best_pred_full = pred_full[bi].detach().cpu().numpy()
                 best_in_band = in_band[bi].detach().cpu().numpy()
                 best_start_idx = bi
+                best_train_idx = int(current_train_idx[bi]) if 0 <= bi < len(current_train_idx) else -1
                 last_improve_iter = it
 
-        # ── Tier2(a): random restart on stagnation ──
         if (
             restart_count < max_restarts
             and it - last_improve_iter >= restart_patience
@@ -3379,7 +4981,7 @@ def inverse_design_optimize(
             with torch.no_grad():
                 n_replace = max(1, int(round(n_starts * restart_frac)))
                 worst_idx = torch.topk(
-                    match_per, k=n_replace, largest=True
+                    total_per, k=n_replace, largest=True
                 ).indices
 
                 new_pick = rng.choice(
@@ -3389,25 +4991,24 @@ def inverse_design_optimize(
                 if restart_noise > 0:
                     new_init = new_init + restart_noise * torch.randn_like(new_init)
                 z.data[worst_idx] = new_init
+                worst_np = worst_idx.detach().cpu().numpy().astype(np.int64)
+                current_train_idx[worst_np] = np.asarray(new_pick, dtype=np.int64)
 
-                # Adam moments 리셋 (해당 슬롯만)
                 state = optimizer.state.get(z, {})
                 if "exp_avg" in state:
                     state["exp_avg"][worst_idx] = 0
                     state["exp_avg_sq"][worst_idx] = 0
                 if "step" in state:
-                    # tensor 형태 step (PyTorch >=1.7) 대비
                     pass
 
             restart_count += 1
             last_restart_iter = it
-            last_improve_iter = it  # 새 init 에 patience 부여
+            last_improve_iter = it
             print(
                 f"    iter {it + 1:4d}/{n_iters} | RESTART worst {n_replace}/{n_starts} "
                 f"(restart #{restart_count})"
             )
 
-        # ── Tier1: early stop ──
         if (
             it - last_improve_iter >= early_stop_patience
             and it - last_restart_iter >= early_stop_patience
@@ -3420,28 +5021,108 @@ def inverse_design_optimize(
             )
             break
 
-        # ── verbose logging ──
-        if it == 0 or (it + 1) % verbose_every == 0 or it == n_iters - 1:
+
+
+        log_every_eff = max(int(verbose_every), max(1, n_iters // 4)) if log_is_compact() else int(verbose_every)
+        if it == 0 or (it + 1) % log_every_eff == 0 or it == n_iters - 1:
             with torch.no_grad():
                 avg = float(match_per.mean().item())
                 zr = float(z_reg_per.mean().item())
-                print(
-                    f"    iter {it + 1:4d}/{n_iters} | best={best_loss:.4f} | "
-                    f"avg={avg:.4f} | z_reg={zr:.2f} | "
-                    f"lr={cur_lr:.2e} | prior_w={cur_prior_w:.1e}"
-                )
+                zn = float(z_nn_per.mean().item())
+                if log_is_compact():
+                    print(
+                        f"    iter {it + 1:4d}/{n_iters} | "
+                        f"best={best_loss:.4f} | avg={avg:.4f}"
+                    )
+                else:
+                    print(
+                        f"    iter {it + 1:4d}/{n_iters} | best={best_loss:.4f} | "
+                        f"avg={avg:.4f} | z_reg={zr:.2f} | z_nn={zn:.2f} | "
+                        f"lr={cur_lr:.2e} | prior_w={cur_prior_w:.1e}"
+                    )
 
     print(
-        f"\n  optimization stats: iters_used={iters_used}, "
-        f"restarts={restart_count}, early_stopped={early_stopped}"
+        f"\n  optimization stats: iters={iters_used}, "
+        f"restarts={restart_count}, early_stop={early_stopped}"
     )
+
+    candidates = []
+    with torch.no_grad():
+        cand_z = z.detach()
+        pred_sel = mlp(cand_z)
+        pred_full = interpolate_selected_to_full_torch(pred_sel, interp_w)
+        diff = pred_full - target_full_t.unsqueeze(0)
+        in_band_violation_sq = F.relu(diff) ** 2
+        out_band_sq = diff ** 2
+        in_band = (
+            in_band_violation_sq * masks_t.unsqueeze(0).float()
+        ).sum(dim=1) / in_band_count
+        out_band = (
+            out_band_sq * (~masks_t).unsqueeze(0).float()
+        ).sum(dim=1) / out_band_count
+        match_per = (
+            in_band_weight * in_band + out_band_weight * out_band
+        ).mean(dim=-1)
+        z_reg_per = (((cand_z - z_mean) / z_std) ** 2).mean(dim=-1)
+        if z_nn_weight_end > 0:
+            z_normed = (cand_z - z_mean) / z_std
+            z_nn_rmse = _nearest_prior_rmse(z_normed, current_train_idx)
+            z_nn_per = F.relu(z_nn_rmse - float(z_nn_margin)) ** 2
+        else:
+            z_nn_per = torch.zeros_like(z_reg_per)
+        final_total = (
+            match_per
+            + z_prior_weight_end * z_reg_per
+            + z_nn_weight_end * z_nn_per
+        )
+
+        if best_z is not None:
+            candidates.append({
+                "rank": 0,
+                "source": "best_seen",
+                "start_idx": int(best_start_idx),
+                "train_idx": int(best_train_idx),
+                "z": best_z.detach().clone(),
+                "objective": float(best_objective),
+                "match_loss": float(best_loss),
+                "pred_full": np.asarray(best_pred_full, dtype=np.float32),
+                "in_band_mse": np.asarray(best_in_band, dtype=np.float32),
+            })
+
+        k = min(max(int(candidate_limit), 1), int(cand_z.size(0)))
+        order = torch.argsort(final_total)[:k]
+        for rank, idx_t in enumerate(order.tolist(), start=1):
+            idx = int(idx_t)
+            candidates.append({
+                "rank": rank,
+                "source": "final_start",
+                "start_idx": idx,
+                "train_idx": int(current_train_idx[idx]) if 0 <= idx < len(current_train_idx) else -1,
+                "z": cand_z[idx:idx + 1].detach().clone(),
+                "objective": float(final_total[idx].item()),
+                "match_loss": float(match_per[idx].item()),
+                "pred_full": pred_full[idx].detach().cpu().numpy().astype(np.float32),
+                "in_band_mse": in_band[idx].detach().cpu().numpy().astype(np.float32),
+            })
+
+    if candidates and best_z is None:
+        first = candidates[0]
+        best_z = first["z"]
+        best_objective = float(first["objective"])
+        best_loss = float(first["match_loss"])
+        best_pred_full = np.asarray(first["pred_full"], dtype=np.float32)
+        best_in_band = np.asarray(first["in_band_mse"], dtype=np.float32)
+        best_start_idx = int(first["start_idx"])
+        best_train_idx = int(first.get("train_idx", -1))
 
     return {
         "best_z": best_z,
+        "best_objective": best_objective,
         "best_loss": best_loss,
         "best_pred_full": best_pred_full,
         "best_in_band_mse": best_in_band,
         "best_start_idx": best_start_idx,
+        "best_train_idx": best_train_idx,
         "target_full": target_full,
         "masks": masks,
         "freqs_full": np.asarray(dataset.freqs_full, dtype=np.float32),
@@ -3454,6 +5135,7 @@ def inverse_design_optimize(
         "early_stopped": early_stopped,
         "z_trajectory": z_trajectory,
         "track_iters": track_iters,
+        "candidates": candidates,
     }
 
 
@@ -3461,16 +5143,6 @@ def visualize_inverse_z_on_pca(
     z_train, type_ids_train, type_names,
     z_trajectory, track_iters, best_start_idx,
 ):
-    """학습 z 의 PCA / t-SNE 위에 inverse design z 궤적 시각화.
-
-    Args:
-        z_train: (N, D) training latents
-        type_ids_train: (N,) type IDs
-        type_names: list of type names
-        z_trajectory: list of (n_starts, D) numpy arrays, snapshot per iter
-        track_iters: list of iteration indices for each snapshot
-        best_start_idx: which start was best (highlighted)
-    """
     try:
         from sklearn.decomposition import PCA
     except ImportError:
@@ -3484,20 +5156,18 @@ def visualize_inverse_z_on_pca(
     type_ids_np = np.asarray(type_ids_train, dtype=np.int64)
     N, D = z_train_np.shape
 
-    # PCA fit on training z (analyze_latent_space 와 동일 축)
     pca = PCA(n_components=2).fit(z_train_np)
     z_train_pca = pca.transform(z_train_np)
     ev2 = pca.explained_variance_ratio_
 
-    # Project trajectories
     n_snaps = len(z_trajectory)
     n_starts = z_trajectory[0].shape[0]
-    # traj_pca shape: (n_snaps, n_starts, 2)
     traj_pca = np.stack(
         [pca.transform(z_snap) for z_snap in z_trajectory], axis=0,
     )
 
-    # t-SNE: training z 로만 fit (parametric 아니라 inverse z project 못 함)
+
+
     z_tsne_train = None
     try:
         from sklearn.manifold import TSNE
@@ -3510,7 +5180,6 @@ def visualize_inverse_z_on_pca(
     except Exception:
         z_tsne_train = None
 
-    # 1개 figure, 1~2 panel (PCA + 옵션 t-SNE for reference only)
     if z_tsne_train is not None:
         fig, axes = plt.subplots(1, 2, figsize=(15, 7), facecolor="white")
     else:
@@ -3525,7 +5194,6 @@ def visualize_inverse_z_on_pca(
     colors_t = ["#4C9BE8", "#E05C5C", "#6DBF67", "#F4A340", "#A57CC1", "#4ECBCB"]
     n_types = len(type_names) if type_names is not None else int(type_ids_np.max()) + 1
 
-    # ── Panel 1: PCA ──
     ax = axes[0]
     for ti in range(n_types):
         m = (type_ids_np == ti)
@@ -3538,7 +5206,6 @@ def visualize_inverse_z_on_pca(
             label=f"train {tname}", edgecolor="none",
         )
 
-    # 각 multi-start trajectory 표시
     for k in range(n_starts):
         xs = traj_pca[:, k, 0]
         ys = traj_pca[:, k, 1]
@@ -3562,7 +5229,6 @@ def visualize_inverse_z_on_pca(
     ax.grid(True, alpha=0.2)
     ax.legend(fontsize=8, loc="best", framealpha=0.85)
 
-    # ── Panel 2: t-SNE (reference only) ──
     if z_tsne_train is not None:
         ax = axes[1]
         for ti in range(n_types):
@@ -3575,7 +5241,6 @@ def visualize_inverse_z_on_pca(
                 c=colors_t[ti % len(colors_t)], s=15, alpha=0.5,
                 label=tname, edgecolor="none",
             )
-        # inverse z 의 NN training sample 찾아서 그 좌표에 마커
         z_best_final = z_trajectory[-1][best_start_idx]
         dists = np.linalg.norm(z_train_np - z_best_final[None, :], axis=1)
         nn_idx = int(np.argmin(dists))
@@ -3598,7 +5263,7 @@ def visualize_inverse_z_on_pca(
         ax.legend(fontsize=8, loc="best", framealpha=0.85)
 
     plt.tight_layout()
-    print(
+    log_detail(
         f"  ✓ inverse z trajectory figure 생성 "
         f"(n_starts={n_starts}, n_snaps={n_snaps})"
     )
@@ -3630,36 +5295,33 @@ def visualize_inverse_design_curve(result):
     ref_color = "#888888"
     ref_db = -10.0
 
+
+
     for c, lbl in enumerate(RETURN_LABELS):
         ax = axes[c]
         f0 = target_freqs[c]
         f_lo, f_hi = f0 - bw / 2.0, f0 + bw / 2.0
 
-        # -10 dB reference (전 주파수 점선)
         ax.axhline(
             ref_db, color=ref_color, ls=":", lw=0.8, alpha=0.7,
             label=f"{ref_db:.0f} dB ref",
         )
 
-        # surrogate 예측 (얇게)
         ax.plot(
             freqs, pred[:, c],
             color=pred_color, lw=1.0, alpha=0.9,
             label="surrogate pred",
         )
 
-        # spec 한계선: in-band 안에서만 ≤ deep_db
         ax.hlines(
             deep_db, f_lo, f_hi,
             colors=spec_color, linestyles="-", lw=1.0,
             label=f"spec ≤ {deep_db:.0f} dB",
         )
 
-        # band 경계: 얇은 dashed 수직선만
         for fx in (f_lo, f_hi):
             ax.axvline(fx, color=band_color, ls="--", lw=0.6, alpha=0.55)
 
-        # 위쪽 brackets + bw label
         bracket_y = ymax - (ymax - ymin) * 0.04
         ax.annotate(
             "",
@@ -3676,11 +5338,10 @@ def visualize_inverse_design_curve(result):
             fontsize=8, color=band_color,
         )
 
-        # in-band worst
         band_mask = (freqs >= f_lo) & (freqs <= f_hi)
         if band_mask.any():
             worst = float(pred[band_mask, c].max())
-            margin = deep_db - worst  # >0 이면 spec 만족
+            margin = deep_db - worst
             ok = "✓" if margin >= 0 else "✗"
             title = (
                 f"{lbl}  f={f0:.2f} GHz  "
@@ -3698,50 +5359,33 @@ def visualize_inverse_design_curve(result):
         ax.legend(fontsize=8, loc="lower left", framealpha=0.85)
 
     plt.tight_layout()
-    print(f"  ✓ inverse design curve figure 생성")
+    log_detail(f"  ✓ inverse design curve figure 생성")
 
 
-def extract_decoded_dimensions(tokens, dq_meta):
-    """Decoded tokens → 실좌표(mm) 단위의 dimension list.
-    - tokens_to_real_sketches() 와 달리 ARC/CIRCLE 을 polyline 화 하지 않고
-      각 곡선의 진짜 파라미터(length / radius / 직경 / extrude height) 를 보존."""
-    if dq_meta is None:
-        return []
-
-    sk_metas = dq_meta["sketches"]
-    max_ext = dq_meta["max_ext"]
-
+def _loop_rows_to_dimension_records(loop_rows, sm, sketch_idx):
     dims = []
-    cur_2d = (0.0, 0.0)
-    loop_first_2d = None
-    sketch_idx = 0
+    def qxy(qx, qy):
+        return (
+            _dequant(qx, sm["xy_min"][0], sm["xy_max"][0]),
+            _dequant(qy, sm["xy_min"][1], sm["xy_max"][1]),
+        )
 
-    for row in tokens:
+    def to3d(x, y):
+        return sm["origin"] + x * sm["x_axis"] + y * sm["y_axis"]
+
+    cur_2d = _infer_loop_start_2d(loop_rows, qxy)
+
+    for row in loop_rows:
         cmd = int(row[0])
         p = row[1:]
 
-        if sketch_idx >= len(sk_metas):
-            if cmd == EOS:
-                break
-            if cmd == EXT:
-                sketch_idx += 1
-            continue
-
-        sm = sk_metas[sketch_idx]
-
-        if cmd == SOL:
-            cur_2d = (0.0, 0.0)
-            loop_first_2d = None
-        elif cmd == LINE:
+        if cmd == LINE:
             if p[0] < 0 or p[1] < 0:
                 continue
-            ex = _dequant(p[0], sm["xy_min"][0], sm["xy_max"][0])
-            ey = _dequant(p[1], sm["xy_min"][1], sm["xy_max"][1])
+            ex, ey = qxy(p[0], p[1])
             sx, sy = cur_2d
-            if loop_first_2d is None:
-                loop_first_2d = (sx, sy)
-            p_s_3d = sm["origin"] + sx * sm["x_axis"] + sy * sm["y_axis"]
-            p_e_3d = sm["origin"] + ex * sm["x_axis"] + ey * sm["y_axis"]
+            p_s_3d = to3d(sx, sy)
+            p_e_3d = to3d(ex, ey)
             length = float(np.linalg.norm(p_e_3d - p_s_3d))
             dims.append({
                 "kind": "line",
@@ -3754,20 +5398,18 @@ def extract_decoded_dimensions(tokens, dq_meta):
         elif cmd == ARC:
             if any(p[i] < 0 for i in range(4)):
                 continue
-            mx = _dequant(p[0], sm["xy_min"][0], sm["xy_max"][0])
-            my = _dequant(p[1], sm["xy_min"][1], sm["xy_max"][1])
-            ex = _dequant(p[2], sm["xy_min"][0], sm["xy_max"][0])
-            ey = _dequant(p[3], sm["xy_min"][1], sm["xy_max"][1])
+            mx, my = qxy(p[0], p[1])
+            ex, ey = qxy(p[2], p[3])
             sx, sy = cur_2d
 
-            mid_3d = sm["origin"] + mx * sm["x_axis"] + my * sm["y_axis"]
-            p_s_3d = sm["origin"] + sx * sm["x_axis"] + sy * sm["y_axis"]
-            p_e_3d = sm["origin"] + ex * sm["x_axis"] + ey * sm["y_axis"]
 
-            # 원의 중심·반지름 (2D 평면 안에서 계산)
+
+            mid_3d = to3d(mx, my)
+            p_s_3d = to3d(sx, sy)
+            p_e_3d = to3d(ex, ey)
+
             D = 2 * (sx * (my - ey) + mx * (ey - sy) + ex * (sy - my))
             if abs(D) < 1e-9:
-                # 거의 직선 — line 으로 취급
                 length = float(np.linalg.norm(p_e_3d - p_s_3d))
                 dims.append({
                     "kind": "line",
@@ -3784,11 +5426,9 @@ def extract_decoded_dimensions(tokens, dq_meta):
                       + (mx ** 2 + my ** 2) * (sx - ex)
                       + (ex ** 2 + ey ** 2) * (mx - sx)) / D
                 r = math.sqrt((sx - ux) ** 2 + (sy - uy) ** 2)
-                # arc sweep angle (대략)
                 a1 = math.atan2(sy - uy, sx - ux)
                 a2 = math.atan2(ey - uy, ex - ux)
                 am = math.atan2(my - uy, mx - ux)
-                # use _arc_pts logic to get correct sweep
                 def _fix(a, ref):
                     while a - ref > math.pi:
                         a -= 2 * math.pi
@@ -3815,10 +5455,9 @@ def extract_decoded_dimensions(tokens, dq_meta):
         elif cmd == CIRCLE:
             if any(p[i] < 0 for i in range(3)):
                 continue
-            cx = _dequant(p[0], sm["xy_min"][0], sm["xy_max"][0])
-            cy = _dequant(p[1], sm["xy_min"][1], sm["xy_max"][1])
+            cx, cy = qxy(p[0], p[1])
             r = (p[2] / QMAX) * sm["sk_scale"]
-            c_3d = sm["origin"] + cx * sm["x_axis"] + cy * sm["y_axis"]
+            c_3d = to3d(cx, cy)
             dims.append({
                 "kind": "circle",
                 "sketch_idx": sketch_idx,
@@ -3826,7 +5465,42 @@ def extract_decoded_dimensions(tokens, dq_meta):
                 "radius": float(r),
                 "diameter": float(2 * r),
             })
+    return dims
+
+
+def extract_decoded_dimensions(tokens, dq_meta):
+    if dq_meta is None:
+        return []
+
+    sk_metas = dq_meta["sketches"]
+    max_ext = dq_meta["max_ext"]
+
+    dims = []
+    cur_loop_rows = []
+    sketch_idx = 0
+
+    for row in tokens:
+        cmd = int(row[0])
+        p = row[1:]
+
+        if cmd == SOL:
+            if cur_loop_rows and sketch_idx < len(sk_metas):
+                dims.extend(_loop_rows_to_dimension_records(
+                    cur_loop_rows, sk_metas[sketch_idx], sketch_idx,
+                ))
+            cur_loop_rows = []
+        elif cmd in (LINE, ARC, CIRCLE):
+            cur_loop_rows.append(row.copy())
         elif cmd == EXT:
+            if cur_loop_rows and sketch_idx < len(sk_metas):
+                dims.extend(_loop_rows_to_dimension_records(
+                    cur_loop_rows, sk_metas[sketch_idx], sketch_idx,
+                ))
+            cur_loop_rows = []
+            if sketch_idx >= len(sk_metas):
+                sketch_idx += 1
+                continue
+            sm = sk_metas[sketch_idx]
             e1_val = _dequant(p[P_E1], 0, max_ext)
             e2_val = (
                 _dequant(p[P_E2], 0, max_ext)
@@ -3847,12 +5521,11 @@ def extract_decoded_dimensions(tokens, dq_meta):
                 "extent_two": float(e2_val),
             })
             sketch_idx += 1
-            cur_2d = (0.0, 0.0)
-            loop_first_2d = None
         elif cmd == EOS:
             break
 
     return dims
+
 
 
 def _format_dim_label(d):
@@ -3869,7 +5542,6 @@ def _format_dim_label(d):
 
 
 def _annotate_dimensions(ax, dims):
-    """3D axes 에 각 dimension 라벨을 표시."""
     if not dims:
         return
     label_kwargs = dict(
@@ -3908,9 +5580,12 @@ def _annotate_dimensions(ax, dims):
 
 def _print_decoded_dimensions(dims):
     if not dims:
-        print("  (no dimensions extracted)")
+        log_detail("  (no dimensions extracted)")
         return
-    # sketch 별로 묶어서 출력
+    if log_is_compact():
+        n_ext = sum(1 for d in dims if d.get("kind") == "extrude")
+        print(f"  decoded geometry: {len(dims)} dimension record(s), {n_ext} extrude height(s)")
+        return
     by_sk = {}
     for d in dims:
         by_sk.setdefault(d["sketch_idx"], []).append(d)
@@ -3937,8 +5612,6 @@ def _print_decoded_dimensions(dims):
 
 @torch.no_grad()
 def _find_nn_dequant_meta(dataset, ae, z_target, device):
-    """latent 공간에서 z_target 에 가장 가까운 training sample 의
-    JSON 으로 dequant_meta 를 만든다. 실패하면 (None, -1, inf)."""
     all_indices = list(range(len(dataset)))
     z_all, _ = collect_latents(ae, dataset, all_indices, device)
 
@@ -3965,7 +5638,6 @@ def _find_nn_dequant_meta(dataset, ae, z_target, device):
 
 
 def _extend_dequant_meta(dq_meta, n_needed):
-    """sketch meta 가 부족하면 마지막 항목 복제로 확장."""
     if dq_meta is None:
         return None
     sk = list(dq_meta["sketches"])
@@ -3978,25 +5650,53 @@ def _extend_dequant_meta(dq_meta, n_needed):
     return dq_meta
 
 
+
 @torch.no_grad()
 def visualize_decoded_structure(
     ae, z, dataset, device, title="Decoded structure",
     separate_windows=False,
+    decoded_tokens=None,
+    forced_nn_idx=None,
 ):
-    """latent z → AE.generate() → 앞쪽 reconstruction viz 와 동일한 스타일로 표시.
-    NN training sample 의 JSON 을 빌려서 real-coord(mm) 모드로 렌더.
-
-    separate_windows=True 면 4 개 view 를 각각 다른 figure (큰 창) 로 띄움.
-    확대해서 자세히 보고 싶을 때 유용.
-    """
     ae.eval()
 
-    gen = ae.generate(z, max_gen_len=dataset.max_len)
-    recon = gen[0].detach().cpu().numpy().astype(np.int32)
-    recon_trim = trim_after_eos(recon)
+    if forced_nn_idx is not None and int(forced_nn_idx) >= 0:
+        nn_idx = int(forced_nn_idx)
+        nn_dist = 0.0
+        try:
+            z_all, _ = collect_latents(ae, dataset, list(range(len(dataset))), device)
+            z_t = z.detach().cpu().numpy() if torch.is_tensor(z) else np.asarray(z)
+            if z_t.ndim == 2:
+                z_t = z_t[0]
+            nn_dist = float(np.linalg.norm(z_all[nn_idx] - z_t))
+        except Exception:
+            pass
+        dq_meta = None
+        jd = dataset.load_json(nn_idx)
+        if jd is not None:
+            try:
+                dq_meta = extract_dequant_meta(jd)
+            except Exception:
+                dq_meta = None
+    else:
+        dq_meta, nn_idx, nn_dist = _find_nn_dequant_meta(dataset, ae, z, device)
+    forced_role_sequence = None
+    if nn_idx is not None and int(nn_idx) >= 0:
+        try:
+            forced_role_sequence = extract_role_sequence(dataset.raw[int(nn_idx)])
+        except Exception:
+            forced_role_sequence = None
 
-    # nearest-neighbor 의 JSON 으로 실좌표 dequant meta 확보
-    dq_meta, nn_idx, nn_dist = _find_nn_dequant_meta(dataset, ae, z, device)
+    if decoded_tokens is not None:
+        recon_trim = trim_after_eos(np.asarray(decoded_tokens, dtype=np.int32))
+    else:
+        gen = ae.generate(
+            z, max_gen_len=dataset.max_len,
+            forced_role_sequence=forced_role_sequence,
+        )
+        recon = gen[0].detach().cpu().numpy().astype(np.int32)
+        recon_trim = trim_after_eos(recon)
+
     n_ext = int((recon_trim[:, 0] == EXT).sum())
 
     if dq_meta is not None and n_ext > 0:
@@ -4026,7 +5726,6 @@ def visualize_decoded_structure(
         dims = []
         print("  (dimensions not annotated — normalized mode, no real-coord meta)")
 
-    # ★ 각 sketch 중심점 (한 번만 계산해 모든 view 에서 재사용)
     centers = _compute_sketch_centers(sketches, use_real)
     _print_sketch_centers(centers, use_real)
 
@@ -4060,7 +5759,6 @@ def visualize_decoded_structure(
         if annotate:
             if use_real and dims:
                 _annotate_dimensions(ax, dims)
-            # ★ 중심점 마커 + 좌표 라벨
             _annotate_centers(ax, centers, with_coords=use_real, with_label=True)
         _style(
             ax,
@@ -4069,7 +5767,6 @@ def visualize_decoded_structure(
         ax.view_init(elev=elev, azim=azim)
 
     if separate_windows:
-        # ── (옵션) 4 개 view 를 각각 별도 figure 로 ──
         for label, elev, azim in views:
             fig = plt.figure(figsize=(10, 9), facecolor="white")
             fig.suptitle(
@@ -4091,7 +5788,6 @@ def visualize_decoded_structure(
             plt.tight_layout(rect=[0, 0.04, 1, 0.94])
         n_figs_created = 4
     else:
-        # ── 기본: Top View 2 창 (숫자 포함 / 구조만) ──
         top_label, top_elev, top_azim = "Decoded — Top View", 89.9, -90.0
 
         def _make_top_fig(annotate, suffix):
@@ -4114,16 +5810,22 @@ def visualize_decoded_structure(
                 )
             plt.tight_layout(rect=[0, 0.05, 1, 0.94])
 
-        # (1) 숫자/중심점 포함 — dimension 확인용
+
+
         _make_top_fig(annotate=True, suffix="(annotated) ")
-        # (2) 구조만 — 깔끔한 형상 확인용
         _make_top_fig(annotate=False, suffix="(clean) ")
         n_figs_created = 2
-    print(
-        f"  ✓ decoded structure figure 생성 "
-        f"(tokens={recon_trim.shape[0]}, mode={'real' if use_real else 'normalized'}, "
-        f"nn_idx={nn_idx}, nn_dist={nn_dist:.2f}, figs={n_figs_created})"
-    )
+    if log_is_compact():
+        print(
+            f"  decoded structure: tokens={recon_trim.shape[0]}, "
+            f"extrude={len(sketches)}, loops={nl_total}, nn_dist={nn_dist:.2f}"
+        )
+    else:
+        print(
+            f"  ✓ decoded structure figure 생성 "
+            f"(tokens={recon_trim.shape[0]}, mode={'real' if use_real else 'normalized'}, "
+            f"nn_idx={nn_idx}, nn_dist={nn_dist:.2f}, figs={n_figs_created})"
+        )
 
     return recon_trim, sketches, (dq_meta if use_real else None)
 
@@ -4134,7 +5836,7 @@ def run_inverse_design_pipeline(
     dataset,
     device,
     channel_target_freqs=(2.0, 3.0, 4.0),
-    bandwidth_ghz=0.1,
+    bandwidth_ghz=0.2,
     n_starts=32,
     n_iters=2000,
     lr=5e-2,
@@ -4142,6 +5844,9 @@ def run_inverse_design_pipeline(
     out_band_weight=0.0,
     z_prior_weight=1e-3,
     z_prior_weight_end=1e-5,
+    z_nn_weight=2e-2,
+    z_nn_weight_end=2e-3,
+    z_nn_margin=1.5,
     deep_db=-20.0,
     seed=0,
     cosine_lr=True,
@@ -4150,17 +5855,28 @@ def run_inverse_design_pipeline(
     restart_frac=0.25,
     restart_noise=0.3,
     max_restarts=10,
+    candidate_limit=12,
     separate_windows=False,
 ):
     section("INVERSE DESIGN — latent search + decode")
 
-    print(f"  Targets")
-    for c, lbl in enumerate(RETURN_LABELS):
-        f0 = channel_target_freqs[c]
-        print(
-            f"    {lbl}: f={f0:.2f} GHz, band=±{bandwidth_ghz / 2 * 1000:.0f} MHz, "
-            f"deep_db={deep_db}"
+    if log_is_compact():
+        target_msg = ", ".join(
+            f"{RETURN_LABELS[c]}@{channel_target_freqs[c]:.2f}GHz"
+            for c in range(len(RETURN_LABELS))
         )
+        print(
+            f"  target: {target_msg}, "
+            f"BW=±{bandwidth_ghz / 2 * 1000:.0f}MHz, spec={deep_db:.0f}dB"
+        )
+    else:
+        print(f"  Targets")
+        for c, lbl in enumerate(RETURN_LABELS):
+            f0 = channel_target_freqs[c]
+            print(
+                f"    {lbl}: f={f0:.2f} GHz, band=±{bandwidth_ghz / 2 * 1000:.0f} MHz, "
+                f"deep_db={deep_db}"
+            )
 
     result = inverse_design_optimize(
         ae=ae,
@@ -4176,6 +5892,9 @@ def run_inverse_design_pipeline(
         out_band_weight=out_band_weight,
         z_prior_weight=z_prior_weight,
         z_prior_weight_end=z_prior_weight_end,
+        z_nn_weight=z_nn_weight,
+        z_nn_weight_end=z_nn_weight_end,
+        z_nn_margin=z_nn_margin,
         deep_db=deep_db,
         cosine_lr=cosine_lr,
         early_stop_patience=early_stop_patience,
@@ -4183,16 +5902,26 @@ def run_inverse_design_pipeline(
         restart_frac=restart_frac,
         restart_noise=restart_noise,
         max_restarts=max_restarts,
+        candidate_limit=candidate_limit,
         seed=seed,
     )
 
-    print(f"\n  Optimization result")
-    print(f"    best match loss  : {result['best_loss']:.4f}")
-    print(f"    best start index : {result['best_start_idx']}")
-    print(f"    in-band MSE      : "
-          f"S11={result['best_in_band_mse'][0]:.3f}  "
-          f"S22={result['best_in_band_mse'][1]:.3f}  "
-          f"S33={result['best_in_band_mse'][2]:.3f}")
+    if log_is_compact():
+        print(
+            f"  inverse result: loss={result['best_loss']:.4f}, "
+            f"start={result['best_start_idx']}, "
+            f"in_band=({result['best_in_band_mse'][0]:.3f}, "
+            f"{result['best_in_band_mse'][1]:.3f}, "
+            f"{result['best_in_band_mse'][2]:.3f})"
+        )
+    else:
+        print(f"\n  Optimization result")
+        print(f"    best match loss  : {result['best_loss']:.4f}")
+        print(f"    best start index : {result['best_start_idx']}")
+        print(f"    in-band MSE      : "
+              f"S11={result['best_in_band_mse'][0]:.3f}  "
+              f"S22={result['best_in_band_mse'][1]:.3f}  "
+              f"S33={result['best_in_band_mse'][2]:.3f}")
 
     subsection("Inverse design — S-param curve figure")
     try:
@@ -4202,7 +5931,6 @@ def run_inverse_design_pipeline(
         print(f"  ⚠ visualize_inverse_design_curve failed: {type(e).__name__}: {e}")
         _tb.print_exc()
 
-    # ★ Inverse z trajectory on training PCA (latent space 위치 추적)
     subsection("Inverse design — z trajectory on training PCA")
     try:
         all_indices = list(range(len(dataset)))
@@ -4220,6 +5948,8 @@ def run_inverse_design_pipeline(
         import traceback as _tb
         print(f"  ⚠ visualize_inverse_z_on_pca failed: {type(e).__name__}: {e}")
         _tb.print_exc()
+
+
 
     subsection("Inverse design — decoded structure figure")
     try:
@@ -4250,11 +5980,9 @@ if __name__ == "__main__":
 
     t0 = time.time()
 
-    # ---------------------------------------------------------
-    # 실행 설정
-    # ---------------------------------------------------------
-    PRESET = "tiny"   # tiny / small / full / custom
-    LOG_VERBOSITY = "simple"
+    PRESET = "full"
+    LOG_VERBOSITY = "compact"
+    set_log_verbosity(LOG_VERBOSITY)
 
     USE_TYPES = [1, 2, 3]
 
@@ -4262,31 +5990,16 @@ if __name__ == "__main__":
     SELECTED_N_FREQ = 81
     FREQ_SELECT_MODE = "linspace"
 
-    # ★ SAMPLES_PER_TYPE는 PRESET="custom"일 때만 반영됨.
-    #   tiny/small/full preset 사용 시 preset이 정의한 n_samples_each가 우선 적용된다:
-    #     tiny  → 300/type
-    #     small → 800/type
-    #     full  → 0(전체)/type
-    #   per-type 다른 개수가 필요하면 PRESET="custom" 으로 두고 아래 값 조정.
     SAMPLES_PER_TYPE = (800, 800, 800)
 
     SHOW_FIGURES = True
 
-    # ★ Inverse design 켜고/끄기.
-    #   True  : 학습 + 평가 후 latent 최적화 → 디코딩 → spec 매칭 figure 까지 표시
-    #   False : 학습 + 평가만 (AE 단독 모드. 기존 AE.py 와 동등)
-    RUN_INVERSE_DESIGN = True
-
-    # ★ 학습 끝나고 띄울 구조 복원 figure 개수 (sample 1개당 창 1개)
     N_PREVIEW = 2
 
-    # ---------------------------------------------------------
-    # fixed medium_var VICReg
-    # ---------------------------------------------------------
     USE_VICREG = True
-    VICREG_W_VAR = 0.5
-    VICREG_W_COV = 0.05
-    VICREG_VAR_TARGET = 1.0
+    VICREG_W_VAR = 0.2
+    VICREG_W_COV = 0.02
+    VICREG_VAR_TARGET = 0.7
 
     _TYPE_DATA = {
         1: (
@@ -4320,23 +6033,29 @@ if __name__ == "__main__":
             f"{len(SAMPLES_PER_TYPE)} vs USE_TYPES {len(USE_TYPES)}"
         )
 
-    print(f"[CONFIG] USE_TYPES={USE_TYPES} → {type_names}")
-    print(f"[CONFIG] preset={PRESET}")
-    print(f"[CONFIG] raw_n_freq={RAW_N_FREQ}, selected_n_freq={SELECTED_N_FREQ}")
-    print(f"[CONFIG] samples_per_type={SAMPLES_PER_TYPE}")
-    print(f"[CONFIG] surrogate = common_curve + residual(z)")
-    print(f"[CONFIG] loss basis = selected output → interpolated full-grid")
-    print(f"[CONFIG] fixed VICReg medium_var")
-    print(f"         use_vicreg={USE_VICREG}")
-    print(f"         w_var={VICREG_W_VAR}")
-    print(f"         w_cov={VICREG_W_COV}")
-    print(f"         var_target={VICREG_VAR_TARGET}")
-    print(f"[CONFIG] n_preview (recon viz windows)={N_PREVIEW}")
+    if log_is_compact():
+        print(
+            f"[CONFIG] preset={PRESET}, types={USE_TYPES}, "
+            f"freq={RAW_N_FREQ}->{SELECTED_N_FREQ}, log={LOG_VERBOSITY}"
+        )
+    else:
+        print(f"[CONFIG] USE_TYPES={USE_TYPES} → {type_names}")
+        print(f"[CONFIG] preset={PRESET}")
+        print(f"[CONFIG] raw_n_freq={RAW_N_FREQ}, selected_n_freq={SELECTED_N_FREQ}")
+        print(f"[CONFIG] samples_per_type={SAMPLES_PER_TYPE}")
+        print(f"[CONFIG] surrogate = common_curve + residual(z)")
+        print(f"[CONFIG] loss basis = selected output → interpolated full-grid")
+        print(f"[CONFIG] fixed VICReg compact")
+        print(f"         use_vicreg={USE_VICREG}")
+        print(f"         w_var={VICREG_W_VAR}")
+        print(f"         w_cov={VICREG_W_COV}")
+        print(f"         var_target={VICREG_VAR_TARGET}")
+        print(f"[CONFIG] n_preview (recon viz windows)={N_PREVIEW}")
 
     cfg = CFG(
         preset=PRESET,
         seed=7,
-        run_name="medium_var_fixed",
+        run_name="compact_vicreg",
         log_verbosity=LOG_VERBOSITY,
         show_figures=SHOW_FIGURES,
 
@@ -4386,10 +6105,11 @@ if __name__ == "__main__":
         n_preview=N_PREVIEW,
     )
 
+
+
     try:
         apply_preset(cfg)
 
-        # preset 적용 후에도 fixed medium_var 값 재고정
         cfg.use_vicreg = USE_VICREG
         cfg.w_var = VICREG_W_VAR
         cfg.w_cov = VICREG_W_COV
@@ -4398,12 +6118,16 @@ if __name__ == "__main__":
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        section("DeepCAD AE + Return-3 Common-Curve Residual Surrogate — fixed medium_var")
-        print(f"  Python : {_sys.version.split()[0]}")
-        print(f"  Torch  : {torch.__version__}")
-        print(f"  Device : {device}" + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
-        print(f"  Preset : {cfg.preset}")
-        print(f"  Backend: {_MPL_BACKEND}")
+        section("DeepCAD AE + Return-3 Common-Curve Residual Surrogate — compact VICReg")
+        if log_is_compact():
+            dev_msg = str(device) + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else "")
+            print(f"  env: python={_sys.version.split()[0]}, torch={torch.__version__}, device={dev_msg}")
+        else:
+            print(f"  Python : {_sys.version.split()[0]}")
+            print(f"  Torch  : {torch.__version__}")
+            print(f"  Device : {device}" + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
+            print(f"  Preset : {cfg.preset}")
+            print(f"  Backend: {_MPL_BACKEND}")
 
         section("LOAD DATA")
         dataset, npy_files, type_ids, type_names, sparam_db, max_len = load_multitype_data(
@@ -4426,7 +6150,7 @@ if __name__ == "__main__":
             type_names=type_names,
         )
 
-        ae, mlp, result = train_fixed_medium_var(
+        ae, mlp, result = train_compact_vicreg(
             cfg=cfg,
             dataset=dataset,
             type_names=type_names,
@@ -4437,95 +6161,16 @@ if __name__ == "__main__":
             device=device,
         )
 
-        # ── ★ Inverse design: target S11/S22/S33 = 2/3/4 GHz, BW 100 MHz ──
-        INV_CHANNEL_TARGET_FREQS = (2.0, 3.0, 4.0)
-        INV_BANDWIDTH_GHZ = 0.1
-        INV_DEEP_DB = -15.0
-
-        # Tier 1 + Tier 2(a) — stronger optimizer
-        INV_N_STARTS = 32              # 8 → 32 (4배)
-        INV_N_ITERS = 2000             # 500 → 2000 (early stop 으로 줄어들 수 있음)
-        INV_LR = 5e-2
-        INV_IN_BAND_WEIGHT = 10.0
-        INV_OUT_BAND_WEIGHT = 0.0
-        INV_Z_PRIOR_WEIGHT = 1e-3      # 초기값
-        INV_Z_PRIOR_WEIGHT_END = 1e-5  # 종료값 (선형 감소)
-        INV_COSINE_LR = True           # cosine LR schedule
-        INV_EARLY_STOP_PATIENCE = 200  # 200 iter 정체 시 중단
-        INV_RESTART_PATIENCE = 80      # 80 iter 정체 시 worst restart
-        INV_RESTART_FRAC = 0.25        # 하위 25% 교체
-        INV_RESTART_NOISE = 0.3        # restart 시 noise 크기
-        INV_MAX_RESTARTS = 10          # 최대 restart 횟수
-
-        # ★ 디코딩된 구조 figure 를 별도 4 개 창으로 띄울지
-        #   False: 한 figure 안에 2×2 (overview, 기본)
-        #   True : 4 개 view 각각 별도 큰 창 (확대해서 자세히 볼 때 유용)
-        INV_SEPARATE_WINDOWS = False
-
-        if cfg.show_figures and RUN_INVERSE_DESIGN:
-            try:
-                inv_result = run_inverse_design_pipeline(
-                    ae=ae,
-                    mlp=mlp,
-                    dataset=dataset,
-                    device=device,
-                    channel_target_freqs=INV_CHANNEL_TARGET_FREQS,
-                    bandwidth_ghz=INV_BANDWIDTH_GHZ,
-                    n_starts=INV_N_STARTS,
-                    n_iters=INV_N_ITERS,
-                    lr=INV_LR,
-                    in_band_weight=INV_IN_BAND_WEIGHT,
-                    out_band_weight=INV_OUT_BAND_WEIGHT,
-                    z_prior_weight=INV_Z_PRIOR_WEIGHT,
-                    z_prior_weight_end=INV_Z_PRIOR_WEIGHT_END,
-                    deep_db=INV_DEEP_DB,
-                    seed=cfg.seed,
-                    cosine_lr=INV_COSINE_LR,
-                    early_stop_patience=INV_EARLY_STOP_PATIENCE,
-                    restart_patience=INV_RESTART_PATIENCE,
-                    restart_frac=INV_RESTART_FRAC,
-                    restart_noise=INV_RESTART_NOISE,
-                    max_restarts=INV_MAX_RESTARTS,
-                    separate_windows=INV_SEPARATE_WINDOWS,
-                )
-            except Exception as e:
-                import traceback as _tb
-                print(f"\n[INVERSE DESIGN] failed: {type(e).__name__}: {e}")
-                _tb.print_exc()
-                inv_result = None
-
-            # ★ 결과 파일 저장: tokens.txt, sparam.csv, figures.png
-            if inv_result is not None:
-                subsection("Saving inverse design outputs to inversed/")
-                inversed_dir = os.path.join(script_dir, "inversed")
-                try:
-                    save_inverse_design_outputs(
-                        inv_result, inversed_dir, run_tag,
-                        channel_target_freqs=INV_CHANNEL_TARGET_FREQS,
-                        bandwidth_ghz=INV_BANDWIDTH_GHZ,
-                        deep_db=INV_DEEP_DB,
-                    )
-                except Exception as e:
-                    import traceback as _tb
-                    print(f"  ⚠ save_inverse_design_outputs failed: {type(e).__name__}: {e}")
-                    _tb.print_exc()
-
         section("DONE")
         print(f"  Final eval_full RMSE : {result['eval_full']:.4f} dB")
         print(f"  figures: {len(plt.get_fignums())} (backend={_MPL_BACKEND})")
 
-        # ★ 패치: figure 표시 전에 경과 시간 lock ──
         elapsed = time.time() - t0
         h = int(elapsed // 3600)
         m = int((elapsed % 3600) // 60)
         s = elapsed % 60
         print(f"\n  경과 시간 (figure 표시 전): {h}h {m}m {s:.1f}s")
 
-        # plt.show() 는 blocking — 사용자가 창 닫을 때까지 대기.
-        # 이 대기 시간은 위에서 측정한 elapsed 에 안 들어감.
-        # ★ Ctrl+C 로 즉시 종료 가능하도록 SIGINT 를 기본(프로세스 kill)으로 복원.
-        #   matplotlib GUI mainloop 가 SIGINT 를 가로채서 Python 에 안 넘기는 백엔드
-        #   (특히 TkAgg) 에서 Ctrl+C 가 먹지 않는 문제를 해결.
         import signal as _signal
         try:
             _signal.signal(_signal.SIGINT, _signal.SIG_DFL)
