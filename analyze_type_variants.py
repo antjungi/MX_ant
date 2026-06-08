@@ -72,6 +72,13 @@ USE_JSON_NAMES  = True
 #     0 으로 두면 exact 동작 (머지 안 함).
 COUNT_TOLERANCE = 2
 
+# ── ★ Canonicalize Preview ★ ──
+# True 면 각 type 의 exact variant 1 (가장 흔한) 을 template 으로 잡고,
+# variant 2 의 sample 1개를 template 의 LINE 개수에 맞춰 강제 변환했을 때
+# geometry 가 얼마나 왜곡되는지 2D 로 비교 (sample 파일은 안 건드림).
+# 결과: {type_variants/}{type_label}_canonicalize_preview.png
+CANONICALIZE_PREVIEW = True
+
 # ── ★ Variant 제외 ★ ──
 # type 별로 따로 지정.  키 = TYPE_DIRS 의 label, 값 = 제외할 rank 리스트.
 # 빈 dict {} 또는 키가 없는 type 은 아무 것도 안 함 (기본).
@@ -412,6 +419,212 @@ def _set_axes_struct(ax, pts):
 
 
 # ══════════════════════════════════════════════════════════════
+# Canonicalize: variant 2 의 sample 을 variant 1 의 LINE 개수에 맞춰 강제 변환
+# (sample 파일은 안 건드리고 토큰만 변환해서 시각화)
+# ══════════════════════════════════════════════════════════════
+def _chunk_lines_indices(chunk_rows):
+    """chunk (numpy 2D) 안에서 LINE 행들의 인덱스 + 첫 loop 의 (s, e) 범위."""
+    sol_idxs = [i for i, r in enumerate(chunk_rows) if int(r[0]) == SOL]
+    if not sol_idxs:
+        return [], (0, 0)
+    s = sol_idxs[0] + 1
+    if len(sol_idxs) >= 2:
+        e = sol_idxs[1]
+    else:
+        ext_idx = next((i for i, r in enumerate(chunk_rows) if int(r[0]) == EXT), len(chunk_rows))
+        e = ext_idx
+    line_idxs = [i for i in range(s, e) if int(chunk_rows[i][0]) == LINE]
+    return line_idxs, (s, e)
+
+
+def canonicalize_chunk_lines(chunk, target_n_line):
+    """chunk 의 첫 loop 안에서 LINE 개수를 target_n_line 에 맞춤.
+    over → 인접한 LINE 두 개를 하나로 병합 (중간점 drop), under → 가장 긴 LINE 을 중간에서 split.
+    """
+    rows = [r.copy() for r in chunk]
+    while True:
+        line_idxs, (s, e) = _chunk_lines_indices(rows)
+        cur_n = len(line_idxs)
+        if cur_n == target_n_line or cur_n < 2:
+            break
+
+        if cur_n > target_n_line:
+            # 가장 "병합해도 무해" 한 LINE 한 개 drop
+            # heuristic: 인접한 두 LINE 의 끝점 사이가 가장 짧은 쪽 (그쪽이 거의 일직선)
+            best_drop = line_idxs[1]
+            best_d = float("inf")
+            for k in range(1, len(line_idxs)):
+                ip = line_idxs[k - 1]
+                ic = line_idxs[k]
+                px, py = int(rows[ip][1]), int(rows[ip][2])
+                cx, cy = int(rows[ic][1]), int(rows[ic][2])
+                d = (cx - px) ** 2 + (cy - py) ** 2
+                if d < best_d:
+                    best_d = d
+                    best_drop = ic
+            del rows[best_drop]
+        else:
+            # 가장 긴 LINE 을 둘로 split (중간점 끼워넣기)
+            best_split = None
+            best_len = -1
+            for k in range(1, len(line_idxs)):
+                ip = line_idxs[k - 1]
+                ic = line_idxs[k]
+                px, py = int(rows[ip][1]), int(rows[ip][2])
+                cx, cy = int(rows[ic][1]), int(rows[ic][2])
+                d = (cx - px) ** 2 + (cy - py) ** 2
+                if d > best_len:
+                    best_len = d
+                    best_split = (ip, ic)
+            if best_split is None:
+                break
+            ip, ic = best_split
+            px, py = int(rows[ip][1]), int(rows[ip][2])
+            cx, cy = int(rows[ic][1]), int(rows[ic][2])
+            mx = (px + cx) // 2
+            my = (py + cy) // 2
+            new_row = np.full(17, -1, dtype=rows[ic].dtype)
+            new_row[0] = LINE
+            new_row[1] = mx
+            new_row[2] = my
+            rows.insert(ic, new_row)
+
+    return np.stack(rows, axis=0) if rows else chunk
+
+
+def canonicalize_sample_to_template(sample_tokens, template_chunk_sigs):
+    """sample 의 각 chunk 의 LINE 개수를 template chunk_sigs 의 LINE 개수에 맞춤.
+    role 행, ARC, CIRCLE, SOL, EXT 는 그대로 둠.
+    """
+    out_rows = []
+    cur_chunk = []
+    chunk_idx = 0
+    in_chunk = False
+    for row in sample_tokens:
+        c = int(row[0])
+        if c < 0:
+            break
+        if c == EOS:
+            out_rows.append(row.copy())
+            break
+        if c == ROLE:
+            out_rows.append(row.copy())
+            continue
+        if c == SOL and not in_chunk:
+            in_chunk = True
+            cur_chunk = [row.copy()]
+        elif in_chunk and c == EXT:
+            cur_chunk.append(row.copy())
+            chunk_arr = np.stack(cur_chunk, axis=0)
+            if chunk_idx < len(template_chunk_sigs):
+                tgt_l = template_chunk_sigs[chunk_idx][1][0]   # (role, (L, A, C, SOL))
+                chunk_arr = canonicalize_chunk_lines(chunk_arr, tgt_l)
+            for r in chunk_arr:
+                out_rows.append(r)
+            cur_chunk = []
+            in_chunk = False
+            chunk_idx += 1
+        elif in_chunk:
+            cur_chunk.append(row.copy())
+    return np.stack(out_rows, axis=0)
+
+
+# ══════════════════════════════════════════════════════════════
+# Token-only 2D 렌더 (canonicalize 결과는 JSON 이 없으므로 토큰 직접 그림)
+# ══════════════════════════════════════════════════════════════
+def render_tokens_2d(ax, tokens, color="#2E4172", title=""):
+    """tokens 의 모든 chunk × 모든 loop 의 LINE 끝점들을 2D 폐곡선으로 그림.
+    좌표축은 0~1023 토큰 스케일."""
+    in_chunk = False
+    cur_loop_pts = None
+    chunk_pal = ["#2E4172", "#8B5A3C", "#3F6E5C", "#6B5B7A", "#555555", "#8B7E3D"]
+    ci = 0
+    for row in tokens:
+        c = int(row[0])
+        if c < 0 or c == EOS:
+            break
+        if c == ROLE:
+            continue
+        if c == SOL:
+            if cur_loop_pts and len(cur_loop_pts) >= 2:
+                xs = [p[0] for p in cur_loop_pts] + [cur_loop_pts[0][0]]
+                ys = [p[1] for p in cur_loop_pts] + [cur_loop_pts[0][1]]
+                ax.plot(xs, ys, color=chunk_pal[ci % len(chunk_pal)], lw=1.3)
+                ax.fill(xs, ys, color=chunk_pal[ci % len(chunk_pal)], alpha=0.18)
+            cur_loop_pts = []
+            in_chunk = True
+            continue
+        if c == EXT:
+            if cur_loop_pts and len(cur_loop_pts) >= 2:
+                xs = [p[0] for p in cur_loop_pts] + [cur_loop_pts[0][0]]
+                ys = [p[1] for p in cur_loop_pts] + [cur_loop_pts[0][1]]
+                ax.plot(xs, ys, color=chunk_pal[ci % len(chunk_pal)], lw=1.3)
+                ax.fill(xs, ys, color=chunk_pal[ci % len(chunk_pal)], alpha=0.18)
+            cur_loop_pts = None
+            in_chunk = False
+            ci += 1
+            continue
+        if in_chunk and c == LINE:
+            cur_loop_pts.append((int(row[1]), int(row[2])))
+        elif in_chunk and c == ARC:
+            cur_loop_pts.append((int(row[3]), int(row[4])))   # mid
+            cur_loop_pts.append((int(row[1]), int(row[2])))   # end
+        elif in_chunk and c == CIRCLE:
+            cx, cy, r = int(row[1]), int(row[2]), int(row[3])
+            ang = np.linspace(0, 2 * math.pi, 48, endpoint=False)
+            xs = cx + r * np.cos(ang)
+            ys = cy + r * np.sin(ang)
+            ax.plot(np.append(xs, xs[0]), np.append(ys, ys[0]),
+                    color=chunk_pal[ci % len(chunk_pal)], lw=1.3)
+            ax.fill(xs, ys, color=chunk_pal[ci % len(chunk_pal)], alpha=0.18)
+    ax.set_aspect("equal")
+    ax.set_xlim(-50, 1080); ax.set_ylim(-50, 1080)
+    ax.set_xticks([0, 512, 1023]); ax.set_yticks([0, 512, 1023])
+    ax.tick_params(labelsize=7, colors="#666")
+    ax.set_title(title, fontsize=9)
+    for s in ax.spines.values():
+        s.set_color("#bbb")
+
+
+def preview_canonicalize(type_label, exact_groups, save_path):
+    """exact variant 1 을 template 으로 잡고 variant 2 → template skeleton 으로 강제 변환,
+    그 결과를 2D 로 비교 (3 panel).  sample 파일은 안 건드림.
+    """
+    if len(exact_groups) < 2:
+        print(f"  [{type_label}] (canonicalize preview skip: only {len(exact_groups)} exact variant)")
+        return
+    sig1, group1 = exact_groups[0]
+    sig2, group2 = exact_groups[1]
+    template_sigs = sig1                  # tuple of (role, (L,A,C,SOL))
+    s1 = group1[0]
+    s2 = group2[0]
+    tok1 = np.asarray(s1["tokens"] if "tokens" in s1 else np.load(s1["npy"]).astype(np.int32))
+    tok2 = np.asarray(s2["tokens"] if "tokens" in s2 else np.load(s2["npy"]).astype(np.int32))
+    tok2_canon = canonicalize_sample_to_template(tok2, template_sigs)
+
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4.5), facecolor="white")
+    fig.suptitle(
+        f"[{type_label}] canonicalize preview  —  v2 sample → v1 skeleton "
+        f"(token-only 2D view)",
+        fontsize=10,
+    )
+    render_tokens_2d(axes[0], tok1,
+                     title=f"v1 template  ({sig_to_str(sig1)})\n{len(group1)} samples · L={template_sigs[0][1][0]}")
+    render_tokens_2d(axes[1], tok2,
+                     title=f"v2 original  ({sig_to_str(sig2)})\n{len(group2)} samples · L={sig2[0][1][0]}")
+    n_line_after = sum(int(r[0]) == LINE for r in tok2_canon)
+    render_tokens_2d(axes[2], tok2_canon,
+                     title=f"v2 rewritten → v1 skeleton\nL={n_line_after}  (target {template_sigs[0][1][0]})")
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
+    try:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"  ✓ canonicalize preview → {save_path}")
+    except Exception as e:
+        print(f"  ⚠ failed to save canonicalize preview: {e}")
+    plt.close(fig)
+
+
+# ══════════════════════════════════════════════════════════════
 # Variant 제외 (선택된 variant 의 sample 파일들을 옮기거나 삭제)
 # ══════════════════════════════════════════════════════════════
 def do_exclude_variants(groups_sorted, type_dir_abs,
@@ -588,6 +801,14 @@ def analyze_one_type(type_label, type_dir_abs):
             mode=EXCLUDE_MODE,
             folder_suffix=EXCLUDE_FOLDER_SUFFIX,
         )
+
+    # ── 4.6) Canonicalize preview: v1 template vs v2 original vs v2 rewritten ──
+    if CANONICALIZE_PREVIEW and len(exact_groups) >= 2:
+        preview_path = os.path.join(SAVE_DIR, f"{type_label}_canonicalize_preview.png")
+        try:
+            preview_canonicalize(type_label, exact_groups, preview_path)
+        except Exception as e:
+            print(f"  ⚠ canonicalize preview failed: {type(e).__name__}: {e}")
 
     # ── 5) 시각화: 상위 N 그룹의 대표 sample 3D ──
     if SHOW_FIGURES:
