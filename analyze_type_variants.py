@@ -79,6 +79,19 @@ COUNT_TOLERANCE = 2
 # 결과: {type_variants/}{type_label}_canonicalize_preview.png
 CANONICALIZE_PREVIEW = True
 
+# ── ★ Canonicalize Apply (sample 파일 실제 수정) ★ ──
+# True 면 각 merged group 안의 dominant exact-skeleton 을 template 으로 잡고,
+# 같은 group 안 다른 sample 들의 _tokens.npy 를 template 의 LINE 개수에 맞춰
+# 토큰 수준에서 강제 변환해 저장. 원본 _tokens.npy 는 자동 백업.
+#
+# 주의:
+#   - _deepcad.json / _tokens_float.npy 는 안 건드림 → tokens.npy 와 약간 불일치
+#     하지만 surrogate 학습 입력은 _tokens.npy 라 영향 없음. 분석/시각화는
+#     _deepcad.json 기반이라 그것도 그대로.
+#   - 백업은 {type_dir}{CANONICALIZE_BACKUP_SUFFIX}/ 폴더에 같은 파일명으로 저장.
+APPLY_CANONICALIZE = False
+CANONICALIZE_BACKUP_SUFFIX = "_canon_backup"
+
 # ── ★ Variant 제외 ★ ──
 # type 별로 따로 지정.  키 = TYPE_DIRS 의 label, 값 = 제외할 rank 리스트.
 # 빈 dict {} 또는 키가 없는 type 은 아무 것도 안 함 (기본).
@@ -625,6 +638,78 @@ def preview_canonicalize(type_label, exact_groups, save_path):
 
 
 # ══════════════════════════════════════════════════════════════
+# Canonicalize 실제 적용: 각 merged group 안 sample 의 _tokens.npy 를
+# dominant exact-skeleton 으로 강제 변환해 저장 (원본은 백업)
+# ══════════════════════════════════════════════════════════════
+def apply_canonicalize_to_disk(exact_groups, merged_groups, type_dir_abs,
+                               type_label, backup_suffix):
+    """
+    각 merged group:
+      - dominant = 그 group 안에서 가장 sample 수가 많은 exact-sig
+      - 같은 group 안 sig != dominant 인 sample 들 → tokens 를 dominant 의
+        LINE 개수에 맞춰 canonicalize → _tokens.npy 덮어쓰기 (원본 백업 후).
+    """
+    import shutil
+    backup_dir = type_dir_abs.rstrip(os.sep) + backup_suffix
+    os.makedirs(backup_dir, exist_ok=True)
+
+    # exact sig → sample 수 lookup
+    exact_count = {sig: len(group) for sig, group in exact_groups}
+
+    n_total_rewrite = 0
+    n_total_skip = 0
+    n_failed = 0
+
+    print(f"\n  [{type_label}] applying canonicalize → in-place rewrite")
+    print(f"    backup dir: {backup_dir}")
+
+    for mr, (merged_sig, merged_group) in enumerate(merged_groups):
+        # merged_group 안의 exact sig 별 분포
+        sigs_here = {}
+        for s in merged_group:
+            sigs_here.setdefault(s["sig"], []).append(s)
+        if not sigs_here:
+            continue
+        # dominant = 가장 많은 exact-sig (전체 exact_count 기준)
+        dominant_sig = max(sigs_here.keys(),
+                           key=lambda sg: exact_count.get(sg, len(sigs_here[sg])))
+        n_keep = len(sigs_here.get(dominant_sig, []))
+        targets = [(sg, samples) for sg, samples in sigs_here.items() if sg != dominant_sig]
+        n_to_rw = sum(len(s) for _, s in targets)
+
+        print(f"    merged-rank {mr + 1}: {len(merged_group)} samples → "
+              f"dominant {sig_to_str(dominant_sig)[:50]}  "
+              f"(keep {n_keep}, rewrite {n_to_rw})")
+
+        if not targets:
+            n_total_skip += n_keep
+            continue
+
+        # template_sigs = dominant 의 chunk_sigs (= dominant_sig 그 자체)
+        template_sigs = dominant_sig
+        for sg, samples in targets:
+            for s in samples:
+                npy_path = s["npy"]
+                try:
+                    tokens = np.load(npy_path).astype(np.int32)
+                    new_tokens = canonicalize_sample_to_template(tokens, template_sigs)
+                    # 백업 (이미 있으면 덮어쓰지 않음 — 첫 원본 보존)
+                    bak_path = os.path.join(backup_dir, os.path.basename(npy_path))
+                    if not os.path.exists(bak_path):
+                        shutil.copy2(npy_path, bak_path)
+                    np.save(npy_path, new_tokens.astype(tokens.dtype))
+                    n_total_rewrite += 1
+                except Exception as e:
+                    print(f"      ✗ {os.path.basename(npy_path)}: {e}")
+                    n_failed += 1
+        n_total_skip += n_keep
+
+    print(f"  ✓ rewrote {n_total_rewrite} samples, kept {n_total_skip}"
+          + (f", {n_failed} failed" if n_failed else ""))
+    print(f"    원복: {backup_dir} 의 파일을 다시 {type_dir_abs} 로 복사")
+
+
+# ══════════════════════════════════════════════════════════════
 # Variant 제외 (선택된 variant 의 sample 파일들을 옮기거나 삭제)
 # ══════════════════════════════════════════════════════════════
 def do_exclude_variants(groups_sorted, type_dir_abs,
@@ -809,6 +894,17 @@ def analyze_one_type(type_label, type_dir_abs):
             preview_canonicalize(type_label, exact_groups, preview_path)
         except Exception as e:
             print(f"  ⚠ canonicalize preview failed: {type(e).__name__}: {e}")
+
+    # ── 4.7) Canonicalize APPLY: 실제 _tokens.npy 변환 + 원본 백업 ──
+    if APPLY_CANONICALIZE and len(exact_groups) >= 2:
+        try:
+            apply_canonicalize_to_disk(
+                exact_groups, groups_sorted, type_dir_abs,
+                type_label=type_label,
+                backup_suffix=CANONICALIZE_BACKUP_SUFFIX,
+            )
+        except Exception as e:
+            print(f"  ⚠ apply_canonicalize failed: {type(e).__name__}: {e}")
 
     # ── 5) 시각화: 상위 N 그룹의 대표 sample 3D ──
     if SHOW_FIGURES:
