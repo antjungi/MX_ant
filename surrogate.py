@@ -2708,6 +2708,17 @@ def show_sample_input_sequences(dataset, type_names,
             except Exception as e:
                 print(f"    ⚠ failed to save: {e}")
 
+            try:
+                npy_fp = os.path.join(save_dir, f"example_{tname}.npy")
+                np.save(npy_fp, tokens.astype(np.int64))
+                print(
+                    f"    ✓ example npy saved → {npy_fp}  "
+                    f"(shape={tokens.shape}, dtype=int64) — "
+                    f"이 파일이 .pt 모델의 입력 포맷 그 자체"
+                )
+            except Exception as e:
+                print(f"    ⚠ failed to save example npy: {e}")
+
 
 def visualize_input_sequences_figure(dataset, type_names, n_tokens_show=30):
     """각 type 1 sample 의 입력 토큰 시퀀스를 figure 로 표시.
