@@ -2709,6 +2709,93 @@ def show_sample_input_sequences(dataset, type_names,
                 print(f"    ⚠ failed to save: {e}")
 
 
+def visualize_input_sequences_figure(dataset, type_names, n_tokens_show=30):
+    """각 type 1 sample 의 입력 토큰 시퀀스를 figure 로 표시.
+
+    matplotlib axes 위에 monospaced text 로 첫 n_tokens_show 줄을 그림.
+    type 개수만큼 column 나란히.
+    """
+    type_to_idx = {}
+    for i in range(len(dataset)):
+        try:
+            ti = int(dataset.type_ids[i])
+        except Exception:
+            continue
+        if ti not in type_to_idx:
+            type_to_idx[ti] = i
+
+    n_types = len(type_names)
+    if n_types == 0:
+        return
+
+    fig, axes = plt.subplots(
+        1, n_types,
+        figsize=(5.5 * n_types, 8.5),
+        facecolor="white",
+    )
+    if n_types == 1:
+        axes = [axes]
+
+    fig.suptitle(
+        f"Input token sequences (per type)  —  first {n_tokens_show} rows  "
+        f"[cmd: LINE=0 ARC=1 CIRCLE=2 SOL=3 EXT=4 EOS=5 ROLE=6]",
+        fontsize=10, color="#222",
+    )
+
+    for ti, tname in enumerate(type_names):
+        ax = axes[ti]
+        ax.set_xticks([]); ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        ax.set_facecolor("white")
+
+        if ti not in type_to_idx:
+            ax.text(
+                0.5, 0.5, f"[{tname}]\n(no sample)",
+                ha="center", va="center", color="#888",
+                transform=ax.transAxes, fontsize=11,
+            )
+            continue
+
+        idx = type_to_idx[ti]
+        try:
+            base = os.path.basename(dataset.npy_files[idx])
+        except Exception:
+            base = f"sample_{idx}"
+        tokens = trim_after_eos(np.asarray(dataset.raw[idx], dtype=np.int32))
+        L = int(tokens.shape[0])
+
+        n_show = min(n_tokens_show, L)
+
+        # 첫 n_show 줄을 monospace text 로 그림
+        lines = [f"[{tname}]  idx={idx}  L={L}  file={base}", ""]
+        lines.append(f"{'idx':>4s} | {'cmd':<6s} | params")
+        lines.append("-" * 80)
+        for i in range(n_show):
+            row = tokens[i]
+            c = int(row[0])
+            cname = CMD_NAME.get(c, f"UNK{c}")
+            # 유효 param 만 표시 (PAD=-1 은 '-')
+            params = " ".join(
+                f"{int(p):>4d}" if int(p) >= 0 else "   ."
+                for p in row[1:8]   # 처음 8개 param만 (가독성)
+            )
+            lines.append(f"{i:>4d} | {cname:<6s} | {params}")
+        if L > n_show:
+            lines.append(f" ... +{L - n_show} more tokens (total L={L})")
+
+        ax.text(
+            0.0, 1.0,
+            "\n".join(lines),
+            family="monospace", fontsize=7.0, color="#222",
+            ha="left", va="top",
+            transform=ax.transAxes,
+        )
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    log_detail(f"  ✓ input sequence figure 생성 (n_types={n_types}, head={n_tokens_show})")
+
+
 def print_surrogate_eval_diagnostics(eval_metrics, latent_diag, type_names):
     section("EVALUATION DIAGNOSTICS")
 
@@ -3064,6 +3151,15 @@ def train_surrogate(
                 )
         except Exception as e:
             print(f"  ⚠ visualize_sparam_predictions failed: {type(e).__name__}: {e}")
+
+        # ★ 각 type 별 입력 토큰 시퀀스 figure
+        subsection("Input token sequences (per type)")
+        try:
+            visualize_input_sequences_figure(
+                dataset, type_names, n_tokens_show=30,
+            )
+        except Exception as e:
+            print(f"  ⚠ visualize_input_sequences_figure failed: {type(e).__name__}: {e}")
 
     result = {
         "best_val": best_metric,
