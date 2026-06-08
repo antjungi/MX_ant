@@ -1869,8 +1869,40 @@ def visualize_sparam_predictions(
 
     n_pick = min(int(n_samples), len(val_indices))
     rng = np.random.default_rng(seed)
-    sel = rng.choice(len(val_indices), size=n_pick, replace=False)
-    sel = sorted(val_indices[i] for i in sel)
+
+    # ★ type 별 1개씩 우선 (stratified) — 모든 type 가 한 번씩 등장.
+    #   n_pick > n_types 이면 round-robin 으로 추가 채움.
+    by_type = {}
+    for vi in val_indices:
+        try:
+            t = int(dataset.type_ids[vi])
+        except Exception:
+            t = -1
+        by_type.setdefault(t, []).append(int(vi))
+    # shuffle within each type
+    for t in by_type:
+        rng.shuffle(by_type[t])
+
+    sel = []
+    types_sorted = sorted(by_type.keys())
+    # pass 1: 1 per type (the visible "각 type 1개씩")
+    for t in types_sorted:
+        if by_type[t]:
+            sel.append(by_type[t].pop(0))
+            if len(sel) >= n_pick:
+                break
+    # pass 2+: round-robin to fill up to n_pick
+    while len(sel) < n_pick:
+        added = False
+        for t in types_sorted:
+            if by_type[t]:
+                sel.append(by_type[t].pop(0))
+                added = True
+                if len(sel) >= n_pick:
+                    break
+        if not added:
+            break
+    sel = sorted(sel)
 
     freqs_full = np.asarray(dataset.freqs_full, dtype=np.float32)
     freqs_sel = np.asarray(dataset.freqs, dtype=np.float32)
