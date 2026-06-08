@@ -63,6 +63,14 @@ USE_JSON_NAMES  = True
 # token signature 에 param 의 통계도 포함할지 (True 면 같은 토폴로지여도 param 분포 다르면 분리됨 — 보통 False)
 INCLUDE_PARAM_HISTOGRAM = False
 
+# variant 그룹화 강도
+#   "loose": chunk 안에 LINE/ARC/CIRCLE "있는지/없는지" 만 비교 (개수 무시).
+#            예: L32 와 L30 둘 다 "LINE 있음" 으로 동일 그룹. 수치 차이는 같은 골격으로 봄.
+#   "exact": LINE/ARC/CIRCLE 의 정확한 개수까지 비교 (기존 동작).
+#            예: L32A5 와 L30A5 가 갈림.
+# loop 개수 (SOL) 는 두 모드 모두 비교 — loop 수가 다르면 진짜 다른 골격이라.
+GROUPING_MODE = "loose"
+
 # ── ★ Variant 제외 ★ ──
 # type 별로 따로 지정.  키 = TYPE_DIRS 의 label, 값 = 제외할 rank 리스트.
 # 빈 dict {} 또는 키가 없는 type 은 아무 것도 안 함 (기본).
@@ -131,14 +139,21 @@ def extract_role_sequence(tokens):
 
 
 def chunk_signature(chunk):
-    """chunk → (n_LINE, n_ARC, n_CIRCLE, n_SOL_loops). loop 수는 SOL 개수."""
+    """chunk → grouping key.
+
+    GROUPING_MODE == "exact":   (n_LINE, n_ARC, n_CIRCLE, n_SOL_loops)
+    GROUPING_MODE == "loose":   (has_LINE, has_ARC, has_CIRCLE, n_SOL_loops)
+
+    loop 수 (SOL) 는 두 모드 모두 그대로 비교.
+    """
     cmds = chunk[:, 0]
-    return (
-        int((cmds == LINE).sum()),
-        int((cmds == ARC).sum()),
-        int((cmds == CIRCLE).sum()),
-        int((cmds == SOL).sum()),
-    )
+    n_line = int((cmds == LINE).sum())
+    n_arc  = int((cmds == ARC).sum())
+    n_circ = int((cmds == CIRCLE).sum())
+    n_sol  = int((cmds == SOL).sum())
+    if GROUPING_MODE == "exact":
+        return (n_line, n_arc, n_circ, n_sol)
+    return (int(n_line > 0), int(n_arc > 0), int(n_circ > 0), n_sol)
 
 
 def sample_signature(tokens, role_names):
@@ -156,7 +171,15 @@ def sig_to_str(sig):
     parts = []
     for role, (l, a, c, sol) in sig:
         rname = role if role else "?"
-        parts.append(f"{rname}(L{l}A{a}C{c}S{sol})")
+        if GROUPING_MODE == "exact":
+            parts.append(f"{rname}(L{l}A{a}C{c}S{sol})")
+        else:
+            tags = "".join([
+                "L" if l else "",
+                "A" if a else "",
+                "C" if c else "",
+            ]) or "-"
+            parts.append(f"{rname}({tags}·S{sol})")
     return " | ".join(parts)
 
 
