@@ -2433,6 +2433,107 @@ class SurrogateModel(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════
+# ★ Inference API: JSON (mm 절대값) → S-param 예측
+#    stp2seq 가 하던 정규화/양자화/ROLE 토큰 삽입을 inline 처리.
+#    호출 측은 mm 단위 DeepCAD JSON 만 들고 있으면 됨.
+# ══════════════════════════════════════════════════════════════
+def _insert_role_tokens_inline(tokens, names, role_name_to_id):
+    """JSON 의 solid names → 각 chunk 첫 SOL 앞에 [ROLE, role_id] 삽입."""
+    if not role_name_to_id or not names:
+        return tokens
+    out_rows = []
+    chunk_idx = -1
+    expecting_first_sol = True
+    for i in range(tokens.shape[0]):
+        c = int(tokens[i, 0])
+        if c == EOS or c < 0:
+            out_rows.append(tokens[i])
+            continue
+        if c == SOL:
+            if expecting_first_sol:
+                chunk_idx += 1
+                if 0 <= chunk_idx < len(names):
+                    nm = names[chunk_idx]
+                    rid = role_name_to_id.get(nm)
+                    if rid is not None:
+                        role_row = np.full(17, PAD_V, dtype=tokens.dtype)
+                        role_row[0] = ROLE
+                        role_row[1] = int(rid)
+                        out_rows.append(role_row)
+                expecting_first_sol = False
+            out_rows.append(tokens[i])
+        elif c == EXT:
+            out_rows.append(tokens[i])
+            expecting_first_sol = True
+        else:
+            out_rows.append(tokens[i])
+    return np.stack(out_rows, axis=0).astype(tokens.dtype)
+
+
+def make_tokens_from_json(
+    json_data, role_name_to_id, max_len,
+    merge_same_role_chunks=True,
+):
+    """DeepCAD JSON (mm 절대값) → SurrogateModel 입력 token array (max_len, 17).
+
+    내부 단계 (stp2seq 와 동일):
+      1) (옵션) same-role + coplanar + same-extrude chunk 병합 (multi-loop)
+      2) per-sketch 2D bbox / global 3D bbox / max_ext 기반 정규화
+      3) 10-bit 양자화 (0..1023)
+      4) JSON metadata.solids[].name → role_name_to_id 매핑으로 ROLE 토큰 삽입
+      5) EOS 보장 + max_len 까지 PAD
+    """
+    solids = json_data.get("metadata", {}).get("solids", [])
+    names = [str(s.get("name", "")) for s in solids]
+    names = names if any(names) else None
+
+    jd = json_data
+    if merge_same_role_chunks and names is not None:
+        jd, names, _ = merge_coplanar_same_role_sketches(jd, names)
+
+    tokens = json_to_tokens(jd)
+    if role_name_to_id and names:
+        tokens = _insert_role_tokens_inline(tokens, names, role_name_to_id)
+
+    tokens = ensure_eos_when_truncated(tokens, max_len)
+    L = tokens.shape[0]
+    if L < max_len:
+        pad = np.full((max_len - L, 17), PAD_V, dtype=np.int32)
+        tokens = np.concatenate([tokens, pad], axis=0)
+    return tokens
+
+
+@torch.no_grad()
+def predict_sparam_from_json(
+    model, json_data, role_name_to_id, max_len, device,
+    merge_same_role_chunks=True,
+):
+    """JSON (mm 절대값) → S-param 예측 (n_freq, 3).
+
+    예시:
+        ckpt = torch.load("ckpt/surrogate_last.pt", weights_only=False)
+        model = SurrogateModel(...)        # cfg_dict 로 동일 architecture 재현
+        model.load_state_dict(ckpt["model_state_dict"]); model.eval()
+
+        with open("design.json") as f:
+            jd = json.load(f)              # mm 단위 DeepCAD JSON
+        sparam = predict_sparam_from_json(
+            model, jd,
+            role_name_to_id=ckpt["role_name_to_id"],
+            max_len=ckpt["max_len"],
+            device=device,
+        )                                  # → (81, 3) dB curve
+    """
+    tokens = make_tokens_from_json(
+        json_data, role_name_to_id, max_len,
+        merge_same_role_chunks=merge_same_role_chunks,
+    )
+    x = torch.tensor(tokens, dtype=torch.float32).unsqueeze(0).to(device)
+    pred_sel, _z = model(x)
+    return pred_sel.cpu().numpy()[0]
+
+
+# ══════════════════════════════════════════════════════════════
 # Surrogate training loop (only S-param + VICReg loss)
 # ══════════════════════════════════════════════════════════════
 def run_epoch_surrogate(model, loader, optimizer, device, cfg, interp_w, train_mode=True):
