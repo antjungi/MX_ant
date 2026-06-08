@@ -1764,46 +1764,20 @@ def train_surrogate(cfg, dataset, train_idx, val_idx, common_curve, device):
     return model, best_metric
 
 
-# ═══════════════════════════════════════════════════════════════
-#  ★ RUN CONFIG ★    (수정은 여기에서만)
-# ═══════════════════════════════════════════════════════════════
-
-# ── Preset (모델 크기 / 학습량) ─────────────────────────────────
-#   "tiny"  : d_model=128, latent=128, n_enc=2, epochs= 80, n_samples=300/type
-#   "small" : d_model=256, latent=256, n_enc=3, epochs=160, n_samples=800/type
-#   "full"  : d_model=384, latent=384, n_enc=4, epochs=250, n_samples=전체
-PRESET            = "small"
-
-# ── Ckpt 저장 ──────────────────────────────────────────────────
-CKPT_SAVE_PATH    = "ckpt/surrogate_last.pt"   # 빈 문자열 = 저장 안 함
-SAVE_CKPT_AFTER   = True
-
-# ── Loss weight ────────────────────────────────────────────────
-W_SPARAM          = 1.0
-USE_VICREG        = True
-
-# ── 기타 ───────────────────────────────────────────────────────
-SEED              = 7
-
-# ═══════════════════════════════════════════════════════════════
-#  Main
-# ═══════════════════════════════════════════════════════════════
 def main():
     import time
     t_overall_start = time.time()
 
     cfg = CFG()
     cfg.run_name = "surrogate_only"
-    cfg.preset = PRESET                # ★ 위 RUN CONFIG 에서 결정
+    cfg.preset = PRESET                # ★ 파일 맨 아래에서 결정
     apply_preset(cfg)
-    cfg.ckpt_save_path = CKPT_SAVE_PATH
-    cfg.save_ckpt_after_train = SAVE_CKPT_AFTER
-    cfg.w_sparam = W_SPARAM
+    cfg.ckpt_save_path = "ckpt/surrogate_last.pt"
+    cfg.save_ckpt_after_train = True
+    cfg.w_sparam = 1.0
     cfg.w_cmd = 0.0
     cfg.w_prm = 0.0
     cfg.w_aux = 0.0
-    cfg.use_vicreg = USE_VICREG
-    cfg.seed = SEED
 
     set_seed(cfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1845,6 +1819,12 @@ def main():
     print(f"  training time    : {t_train_elapsed:>8.1f} s  ({t_train_elapsed/60:.1f} min)")
     print(f"  total elapsed    : {t_total_elapsed:>8.1f} s  ({t_total_elapsed/60:.1f} min)")
     print(f"  best val RMSE dB : {best:.4f}")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ★ 여기서 선택 ★    "tiny"  /  "small"  /  "full"
+# ═══════════════════════════════════════════════════════════════
+PRESET = "small"
 
 
 if __name__ == "__main__":
