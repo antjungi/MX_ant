@@ -27,20 +27,10 @@ import os
 import sys
 import json
 import glob
+import math
 import numpy as np
 import matplotlib.pyplot as plt
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-# ★ surrogate.py 의 검증된 렌더링 함수 그대로 사용 (inline 시 arc/extrude 가 깨졌었음)
-try:
-    import surrogate as srg
-    _HAS_SURROGATE = True
-except Exception as _e:
-    _HAS_SURROGATE = False
-    print(f"  ⚠ surrogate.py import 실패: {_e}")
-    print("    같은 폴더에 surrogate.py 가 있어야 합니다.")
-    sys.exit(1)
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -146,6 +136,181 @@ def sig_to_str(sig):
     return " | ".join(parts)
 
 
+# ══════════════════════════════════════════════════════════════
+# 3D rendering helpers (surrogate.py 의 검증된 구현 그대로 복사)
+# ══════════════════════════════════════════════════════════════
+_PAL = [
+    "#2E4172",   # deep slate blue
+    "#8B5A3C",   # sienna brown
+    "#3F6E5C",   # deep teal-green
+    "#6B5B7A",   # muted mauve
+    "#555555",   # charcoal grey
+    "#8B7E3D",   # dark gold
+]
+
+
+def _v3(d):
+    return np.array([d["x"], d["y"], d["z"]], dtype=float)
+
+
+def _arc_pts(sx, sy, mx, my, ex, ey, n=32):
+    D = 2 * (sx * (my - ey) + mx * (ey - sy) + ex * (sy - my))
+    if abs(D) < 1e-9:
+        t = np.linspace(0, 1, n)
+        return list(zip(sx + (ex - sx) * t, sy + (ey - sy) * t))
+    ux = ((sx ** 2 + sy ** 2) * (my - ey) + (mx ** 2 + my ** 2) * (ey - sy) + (ex ** 2 + ey ** 2) * (sy - my)) / D
+    uy = ((sx ** 2 + sy ** 2) * (ex - mx) + (mx ** 2 + my ** 2) * (sx - ex) + (ex ** 2 + ey ** 2) * (mx - sx)) / D
+    r = math.sqrt((sx - ux) ** 2 + (sy - uy) ** 2)
+    a1 = math.atan2(sy - uy, sx - ux)
+    am = math.atan2(my - uy, mx - ux)
+    a2 = math.atan2(ey - uy, ex - ux)
+
+    def fix(a, ref):
+        while a - ref > math.pi:
+            a -= 2 * math.pi
+        while a - ref < -math.pi:
+            a += 2 * math.pi
+        return a
+
+    am = fix(am, a1)
+    a2 = fix(a2, a1)
+    if not (min(a1, a2) <= am <= max(a1, a2)):
+        a2 = a2 - 2 * math.pi if a2 > a1 else a2 + 2 * math.pi
+    return [(ux + r * math.cos(a), uy + r * math.sin(a)) for a in np.linspace(a1, a2, n)]
+
+
+def _circle_pts(cx, cy, r, n=48):
+    a = np.linspace(0, 2 * math.pi, n, endpoint=False)
+    return [(cx + r * math.cos(t), cy + r * math.sin(t)) for t in a]
+
+
+def json_to_real_sketches(json_data):
+    seq = json_data["sequence"]
+    sketches = []
+    i = 0
+    while i < len(seq):
+        if seq[i]["type"] == "Sketch" and i + 1 < len(seq) and seq[i + 1]["type"] == "Extrude":
+            sk = seq[i]
+            ex = seq[i + 1]
+            plane = sk["plane"]
+            origin = _v3(plane["origin"])
+            xa = _v3(plane["x_axis"])
+            ya = _v3(plane["y_axis"])
+            za = _v3(plane["z_axis"])
+            extent_one = float(ex.get("extent_one", {}).get("distance", 0.0))
+            extent_two = float(ex.get("extent_two", {}).get("distance", 0.0))
+            normal = za / (np.linalg.norm(za) + 1e-12)
+
+            loops_3d = []
+            for loop in sk.get("profile", {}).get("children", []):
+                pts = []
+                for ei, e in enumerate(loop.get("children", [])):
+                    et = e["type"]
+                    if et == "Line":
+                        sp = e["start_point"]
+                        ep = e["end_point"]
+                        if ei == 0:
+                            pts.append(origin + sp["x"] * xa + sp["y"] * ya)
+                        pts.append(origin + ep["x"] * xa + ep["y"] * ya)
+                    elif et == "Arc":
+                        sp = e["start_point"]
+                        mp = e["mid_point"]
+                        ep = e["end_point"]
+                        a2d = _arc_pts(sp["x"], sp["y"], mp["x"], mp["y"], ep["x"], ep["y"])
+                        si = 0 if ei == 0 else 1
+                        for ax2, ay2 in a2d[si:]:
+                            pts.append(origin + ax2 * xa + ay2 * ya)
+                    elif et == "Circle":
+                        cp = e["center_point"]
+                        r = e["radius"]
+                        for cx2, cy2 in _circle_pts(cp["x"], cp["y"], r):
+                            pts.append(origin + cx2 * xa + cy2 * ya)
+                if len(pts) >= 2:
+                    loops_3d.append(pts)
+            if loops_3d:
+                sketches.append({
+                    "loops_3d": loops_3d,
+                    "normal": normal,
+                    "extent": extent_one,
+                    "z_axis_raw": za,
+                    "origin_z": float(origin[2]),
+                    "extent_one": extent_one,
+                    "extent_two": extent_two,
+                })
+            i += 2
+        else:
+            i += 1
+    return sketches
+
+
+def _render_3d_real_simple(ax, sketches):
+    all_pts = []
+    for idx, sk in enumerate(sketches):
+        color = _PAL[idx % len(_PAL)]
+        normal = np.array(sk["normal"])
+        extent = sk["extent"]
+        for loop_pts in sk["loops_3d"]:
+            if len(loop_pts) < 2:
+                continue
+            bot = [np.array(p) for p in loop_pts]
+            top = [p + normal * extent for p in bot]
+            all_pts.extend([p.tolist() for p in bot])
+            all_pts.extend([p.tolist() for p in top])
+            xs_b = [p[0] for p in bot]; ys_b = [p[1] for p in bot]; zs_b = [p[2] for p in bot]
+            xs_t = [p[0] for p in top]; ys_t = [p[1] for p in top]; zs_t = [p[2] for p in top]
+            ax.plot(xs_b + [xs_b[0]], ys_b + [ys_b[0]], zs_b + [zs_b[0]],
+                    color=color, lw=1.4, alpha=0.95)
+            ax.plot(xs_t + [xs_t[0]], ys_t + [ys_t[0]], zs_t + [zs_t[0]],
+                    color=color, lw=1.0, alpha=0.7)
+            if len(bot) >= 3:
+                pf_b = Poly3DCollection([[p.tolist() for p in bot]], alpha=0.30)
+                pf_b.set_facecolor(color); pf_b.set_edgecolor("none")
+                ax.add_collection3d(pf_b)
+                pf_t = Poly3DCollection([[p.tolist() for p in top]], alpha=0.35)
+                pf_t.set_facecolor(color); pf_t.set_edgecolor("none")
+                ax.add_collection3d(pf_t)
+    return all_pts
+
+
+def _style_struct_ax(ax, title):
+    try:
+        ax.set_proj_type("ortho")
+    except Exception:
+        pass
+    ax.set_facecolor("white")
+    for pane in (ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane):
+        pane.fill = False
+        pane.set_edgecolor((1, 1, 1, 0))
+    ax.grid(False)
+    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+        axis.line.set_color((1, 1, 1, 0))
+    ax.set_xticks([]); ax.set_yticks([]); ax.set_zticks([])
+    ax.set_xlabel(""); ax.set_ylabel(""); ax.set_zlabel("")
+    ax.set_title(title, color="#222", fontsize=9, fontweight="normal", pad=4)
+
+
+def _set_axes_struct(ax, pts):
+    if not pts:
+        return
+    arr = np.array(pts)
+    ext = arr.max(axis=0) - arr.min(axis=0)
+    pad = max(float(ext.max()) * 0.12, 0.1)
+    ax.set_xlim(arr[:, 0].min() - pad, arr[:, 0].max() + pad)
+    ax.set_ylim(arr[:, 1].min() - pad, arr[:, 1].max() + pad)
+    ax.set_zlim(arr[:, 2].min() - pad, arr[:, 2].max() + pad)
+    extents = np.array([
+        ax.get_xlim3d()[1] - ax.get_xlim3d()[0],
+        ax.get_ylim3d()[1] - ax.get_ylim3d()[0],
+        ax.get_zlim3d()[1] - ax.get_zlim3d()[0],
+    ])
+    floor = max(float(extents.max()) * 0.02, 1e-3)
+    extents = np.maximum(extents, floor)
+    try:
+        ax.set_box_aspect(tuple(extents))
+    except Exception:
+        pass
+
+
 def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     type_dir_abs = TYPE_DIR if os.path.isabs(TYPE_DIR) else os.path.join(script_dir, TYPE_DIR)
@@ -248,15 +413,15 @@ def main():
                     try:
                         with open(jp, "r", encoding="utf-8") as f:
                             jd = json.load(f)
-                        sketches = srg.json_to_real_sketches(jd)
+                        sketches = json_to_real_sketches(jd)
                     except Exception:
                         sketches = []
                 else:
                     sketches = []
 
                 if sketches:
-                    pts = srg._render_3d_real_simple(ax, sketches)
-                    srg._set_axes_struct(ax, pts)
+                    pts = _render_3d_real_simple(ax, sketches)
+                    _set_axes_struct(ax, pts)
                     ax.view_init(elev=25, azim=-55)
                 else:
                     ax.text2D(0.5, 0.5, "(no JSON)",
@@ -267,7 +432,7 @@ def main():
                 sig_short = sig_to_str(sig)
                 if len(sig_short) > 70:
                     sig_short = sig_short[:67] + "..."
-                srg._style_struct_ax(
+                _style_struct_ax(
                     ax,
                     f"Variant {k + 1}  ·  {len(group)} samples\n{sig_short}",
                 )
