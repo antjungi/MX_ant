@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Analyze structural variants within a single type
-=================================================
+Analyze structural variants per type (1개 이상의 type 폴더)
+============================================================
 
-한 type 폴더 (예: type1 = hfss_results/step_test) 안의 모든 sample 을 읽어,
+TYPE_DIRS 의 각 type 폴더를 순회하며, 폴더 안의 모든 sample 을 읽어
 구조적으로 어떤 변형들이 섞여 있는지 자동 그룹화 + 리포트 + 시각화.
+마지막에 모든 type 의 골격 개수를 한 표로 요약.
 
 변형 식별 방법:
   각 sample 을 "chunk signature 의 튜플" 로 표현:
@@ -15,10 +16,13 @@ Analyze structural variants within a single type
   → 같은 signature 끼리 묶으면 한 그룹 = 같은 토폴로지의 변형 (수치만 다름)
      다른 signature = 토폴로지 자체가 다른 변형 (loop 수, edge 수 등)
 
-출력:
+출력 (type 별):
   - 콘솔: rank | count | signature
-  - txt: type1_variants.txt — 모든 그룹 + sample 파일명
-  - png: type1_variants.png — top N 그룹의 대표 3D 구조
+  - txt : {type_label}_variants.txt — 모든 그룹 + sample 파일명
+  - png : {type_label}_variants.png — top N 그룹의 대표 3D 구조
+출력 (전체):
+  - 콘솔: SUMMARY 표 — 각 type 의 골격 개수 / single skeleton 여부
+  - png : all_types_top1.png — 각 type 의 가장 흔한 variant 1개 비교
 
 CONFIG 는 파일 맨 위. 실행:  python analyze_type_variants.py
 """
@@ -37,8 +41,13 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 #  ★ CONFIG  ★    (수정은 여기에서만)
 # ═══════════════════════════════════════════════════════════════
 
-# 분석할 type 폴더 (token npy + deepcad json 들이 있는 곳)
-TYPE_DIR        = "hfss_results/step_test"     # type1
+# 분석할 type 폴더들.  (type_label, dir).  dir 은 상대경로면 이 스크립트 기준.
+# 1개만 넣으면 단일 type 분석, 여러 개면 비교 + 요약 표.
+TYPE_DIRS = [
+    ("type1", "hfss_results/step_test"),
+    ("type2", "hfss_results/step_test1"),
+    ("type3", "hfss_results/step_test2"),
+]
 
 # 결과 저장 폴더
 SAVE_DIR        = "type_variants"
@@ -46,6 +55,7 @@ SAVE_DIR        = "type_variants"
 # 시각화
 SHOW_FIGURES    = True
 TOP_N_GROUPS    = 6        # figure 에 보여줄 가장 흔한 변형 개수
+TOP_N_CONSOLE   = 5        # 콘솔에 type 별 표시할 상위 variant 개수
 
 # JSON 의 role name 사용 (None 으로 두면 token 만 보고 분류 — 더 거친 그룹화)
 USE_JSON_NAMES  = True
@@ -54,14 +64,15 @@ USE_JSON_NAMES  = True
 INCLUDE_PARAM_HISTOGRAM = False
 
 # ── ★ Variant 제외 ★ ──
-# 분석 결과의 rank 가 여기 들어있는 variant 들의 sample 파일을 옮기거나 지움.
-# 빈 list [] → 아무 것도 안 함 (기본).
-# 예시:  EXCLUDE_VARIANTS = [3]      → variant 3 sample 들 제외
-#        EXCLUDE_VARIANTS = [3, 5]   → variant 3 과 5 제외
-EXCLUDE_VARIANTS = []
+# type 별로 따로 지정.  키 = TYPE_DIRS 의 label, 값 = 제외할 rank 리스트.
+# 빈 dict {} 또는 키가 없는 type 은 아무 것도 안 함 (기본).
+# 예시:
+#   EXCLUDE_VARIANTS_PER_TYPE = {"type1": [3]}            → type1 의 variant 3
+#   EXCLUDE_VARIANTS_PER_TYPE = {"type1": [3], "type2": [2, 5]}
+EXCLUDE_VARIANTS_PER_TYPE = {}
 
 # 어떻게 제외할지:  "move" (안전, 되돌릴 수 있음)  /  "delete" (영구)
-#   "move" → {TYPE_DIR}_excluded/ 폴더로 이동.
+#   "move" → {type_dir}_excluded/ 폴더로 이동.
 #            나중에 다시 쓰려면 그 폴더에서 원래 자리로 복사하면 됨.
 EXCLUDE_MODE = "move"
 EXCLUDE_FOLDER_SUFFIX = "_excluded"   # 이동될 폴더 이름의 suffix
@@ -399,21 +410,21 @@ def do_exclude_variants(groups_sorted, type_dir_abs,
         print(f"    되돌리려면: {excluded_dir} 의 파일들을 다시 {type_dir_abs} 로 복사.")
 
 
-def main():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    type_dir_abs = TYPE_DIR if os.path.isabs(TYPE_DIR) else os.path.join(script_dir, TYPE_DIR)
-
+def analyze_one_type(type_label, type_dir_abs):
+    """한 type 폴더 전체 분석: 로딩 → grouping → txt/png 저장 → 제외 처리.
+    Returns:
+        (samples, groups_sorted)  또는 (None, []) 데이터 없을 때.
+    """
     if not os.path.isdir(type_dir_abs):
-        print(f"  ✗ type dir not found: {type_dir_abs}")
-        sys.exit(1)
+        print(f"  ✗ [{type_label}] type dir not found: {type_dir_abs}")
+        return None, []
 
     npy_files = sorted(glob.glob(os.path.join(type_dir_abs, "*_tokens.npy")))
     if not npy_files:
-        print(f"  ✗ no *_tokens.npy in {type_dir_abs}")
-        sys.exit(1)
+        print(f"  ✗ [{type_label}] no *_tokens.npy in {type_dir_abs}")
+        return None, []
 
-    type_name = os.path.basename(type_dir_abs.rstrip(os.sep))
-    print(f"\n  Analyzing type folder: {type_dir_abs}")
+    print(f"\n  Analyzing [{type_label}]: {type_dir_abs}")
     print(f"  found {len(npy_files)} samples\n")
 
     # ── 1) 모든 sample 읽고 signature 계산 ──
@@ -457,7 +468,7 @@ def main():
 
     # ── 4) 리포트 txt 저장 ──
     os.makedirs(SAVE_DIR, exist_ok=True)
-    report_path = os.path.join(SAVE_DIR, f"{type_name}_variants.txt")
+    report_path = os.path.join(SAVE_DIR, f"{type_label}_variants.txt")
     try:
         with open(report_path, "w", encoding="utf-8") as f:
             f.write(f"# Variant analysis of {type_dir_abs}\n")
@@ -479,10 +490,11 @@ def main():
         print(f"  ⚠ failed to save report: {e}")
 
     # ── 4.5) EXCLUDE_VARIANTS 처리: 선택한 variant 들의 sample 옮기기/삭제 ──
-    if EXCLUDE_VARIANTS:
+    excl = EXCLUDE_VARIANTS_PER_TYPE.get(type_label, [])
+    if excl:
         do_exclude_variants(
             groups_sorted, type_dir_abs,
-            ranks_to_exclude=EXCLUDE_VARIANTS,
+            ranks_to_exclude=excl,
             mode=EXCLUDE_MODE,
             folder_suffix=EXCLUDE_FOLDER_SUFFIX,
         )
@@ -495,7 +507,7 @@ def main():
             nrow = (n_show + ncol - 1) // ncol
             fig = plt.figure(figsize=(5 * ncol, 5 * nrow), facecolor="white")
             fig.suptitle(
-                f"Structural variants in [{type_name}]  "
+                f"Structural variants in [{type_label}]  "
                 f"— {len(groups_sorted)} unique, top {n_show} shown  "
                 f"({len(samples)} total samples)",
                 fontsize=11, color="#222",
@@ -536,14 +548,116 @@ def main():
 
             plt.tight_layout(rect=[0, 0, 1, 0.95])
 
-            fig_path = os.path.join(SAVE_DIR, f"{type_name}_variants.png")
+            fig_path = os.path.join(SAVE_DIR, f"{type_label}_variants.png")
             try:
                 plt.savefig(fig_path, dpi=150, bbox_inches="tight")
                 print(f"  ✓ figure saved → {fig_path}")
             except Exception as e:
                 print(f"  ⚠ failed to save figure: {e}")
 
-            plt.show()
+    return samples, groups_sorted
+
+
+# ══════════════════════════════════════════════════════════════
+# Cross-type summary + figure
+# ══════════════════════════════════════════════════════════════
+def print_summary_table(per_type_results):
+    print("\n" + "═" * 78)
+    print("  SUMMARY — 각 type 의 골격 개수 (옵티마이저 search 용 single-skeleton 체크)")
+    print("═" * 78)
+    print(f"  {'type':<10s} | {'samples':>7s} | {'variants':>8s} | "
+          f"{'top1 share':>10s} | single skeleton?")
+    print("  " + "-" * 76)
+    for type_label, _, samples, groups in per_type_results:
+        if not samples:
+            print(f"  {type_label:<10s} | {'-':>7s} | {'-':>8s} | "
+                  f"{'-':>10s} | (no data)")
+            continue
+        n_sam = len(samples)
+        n_var = len(groups)
+        top1 = len(groups[0][1]) if groups else 0
+        top1_pct = 100.0 * top1 / max(1, n_sam)
+        if n_var == 1:
+            tag = "✓  YES — 단일 골격"
+        elif top1_pct >= 95.0:
+            tag = f"~  거의 단일 (top1 {top1_pct:.1f}%)"
+        else:
+            tag = f"⚠  NO — {n_var} variants 섞임"
+        print(f"  {type_label:<10s} | {n_sam:>7d} | {n_var:>8d} | "
+              f"{top1_pct:>9.1f}% | {tag}")
+    print("═" * 78)
+
+
+def make_all_types_top1_figure(per_type_results, save_path):
+    valid = [(lbl, grps[0][0], grps[0][1])
+             for lbl, _, sam, grps in per_type_results
+             if sam and grps]
+    if not valid:
+        return
+    ncol = len(valid)
+    fig = plt.figure(figsize=(5 * ncol, 5), facecolor="white")
+    fig.suptitle(
+        "Most common variant of each type (Variant 1)",
+        fontsize=11, color="#222",
+    )
+    for k, (type_label, sig, group) in enumerate(valid):
+        ax = fig.add_subplot(1, ncol, k + 1, projection="3d")
+        rep = group[0]
+        jp = rep["npy"].replace("_tokens.npy", "_deepcad.json")
+        sketches = []
+        if os.path.exists(jp):
+            try:
+                with open(jp, "r", encoding="utf-8") as f:
+                    jd = json.load(f)
+                sketches = json_to_real_sketches(jd)
+            except Exception:
+                sketches = []
+        if sketches:
+            pts = _render_3d_real_simple(ax, sketches)
+            _set_axes_struct(ax, pts)
+            ax.view_init(elev=25, azim=-55)
+        else:
+            ax.text2D(0.5, 0.5, "(no JSON)",
+                      ha="center", va="center", color="#888",
+                      fontsize=11, transform=ax.transAxes)
+        sig_short = sig_to_str(sig)
+        if len(sig_short) > 60:
+            sig_short = sig_short[:57] + "..."
+        _style_struct_ax(
+            ax,
+            f"{type_label}  ·  {len(group)} samples\n{sig_short}",
+        )
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
+    try:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"  ✓ all-types figure saved → {save_path}")
+    except Exception as e:
+        print(f"  ⚠ failed to save all-types figure: {e}")
+
+
+def main():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    os.makedirs(os.path.join(script_dir, SAVE_DIR), exist_ok=True)
+
+    if not TYPE_DIRS:
+        print("  ✗ TYPE_DIRS is empty.")
+        sys.exit(1)
+
+    per_type_results = []
+    for type_label, type_dir in TYPE_DIRS:
+        type_dir_abs = (type_dir if os.path.isabs(type_dir)
+                        else os.path.join(script_dir, type_dir))
+        samples, groups = analyze_one_type(type_label, type_dir_abs)
+        per_type_results.append((type_label, type_dir_abs, samples, groups))
+
+    print_summary_table(per_type_results)
+
+    if SHOW_FIGURES:
+        make_all_types_top1_figure(
+            per_type_results,
+            os.path.join(script_dir, SAVE_DIR, "all_types_top1.png"),
+        )
+        plt.show()
 
 
 if __name__ == "__main__":
