@@ -2608,6 +2608,107 @@ def run_epoch_surrogate(model, loader, optimizer, device, cfg, interp_w, train_m
     return out
 
 
+def show_sample_input_sequences(dataset, type_names,
+                                 head=20, tail=5, save_dir=None):
+    """각 type 마다 1개 sample 의 토큰 시퀀스를 가독성 좋게 출력.
+
+    Args:
+        dataset: JointDataset
+        type_names: tuple of type names
+        head: 앞쪽 몇 줄 보여줄지
+        tail: 끝쪽 몇 줄 보여줄지
+        save_dir: None 이 아니면 type 별 full 시퀀스를 txt 로 저장
+    """
+    section("SAMPLE INPUT SEQUENCES (per type)")
+    print(
+        f"  모델 입력 형식: (max_len={dataset.max_len}, 17)  "
+        f"int  cmd∈{{0..6}}, param∈{{0..1023}} or PAD=-1"
+    )
+    print(
+        f"  cmd 코드: LINE=0  ARC=1  CIRCLE=2  SOL=3  EXT=4  EOS=5  ROLE=6"
+    )
+
+    type_to_idx = {}
+    for i in range(len(dataset)):
+        try:
+            ti = int(dataset.type_ids[i])
+        except Exception:
+            continue
+        if ti not in type_to_idx:
+            type_to_idx[ti] = i
+
+    if save_dir:
+        try:
+            os.makedirs(save_dir, exist_ok=True)
+        except Exception:
+            save_dir = None
+
+    for ti, tname in enumerate(type_names):
+        if ti not in type_to_idx:
+            print(f"\n  [{tname}] (no sample)")
+            continue
+        idx = type_to_idx[ti]
+        try:
+            base = os.path.basename(dataset.npy_files[idx])
+        except Exception:
+            base = f"sample_{idx}"
+        tokens = trim_after_eos(np.asarray(dataset.raw[idx], dtype=np.int32))
+        L = int(tokens.shape[0])
+        n_role = int((tokens[:, 0] == ROLE).sum())
+        n_sol = int((tokens[:, 0] == SOL).sum())
+        n_ext = int((tokens[:, 0] == EXT).sum())
+        n_line = int((tokens[:, 0] == LINE).sum())
+        n_arc = int((tokens[:, 0] == ARC).sum())
+        n_circ = int((tokens[:, 0] == CIRCLE).sum())
+
+        print(f"\n  [{tname}]  idx={idx}  file={base}")
+        print(
+            f"    tokens={L}  | ROLE={n_role} SOL={n_sol} EXT={n_ext} "
+            f"LINE={n_line} ARC={n_arc} CIRCLE={n_circ}"
+        )
+        print(f"    {'idx':>4s} | {'cmd':<6s} | params (PAD shown as '-')")
+
+        def _fmt_row(i, row):
+            c = int(row[0])
+            cname = CMD_NAME.get(c, f"UNK{c}")
+            params = " ".join(
+                f"{int(p):>4d}" if int(p) >= 0 else "   -"
+                for p in row[1:]
+            )
+            return f"    [{i:>3d}] | {cname:<6s} | {params}"
+
+        if L <= head + tail + 2:
+            for i, row in enumerate(tokens):
+                print(_fmt_row(i, row))
+        else:
+            for i in range(head):
+                print(_fmt_row(i, tokens[i]))
+            print(f"    ...   skipped {L - head - tail} tokens ...")
+            for i in range(L - tail, L):
+                print(_fmt_row(i, tokens[i]))
+
+        if save_dir:
+            try:
+                fp = os.path.join(save_dir, f"sample_input_{tname}_idx{idx}.txt")
+                with open(fp, "w", encoding="utf-8") as f:
+                    f.write(f"# [{tname}] sample idx={idx}  file={base}\n")
+                    f.write(
+                        f"# tokens={L}, ROLE={n_role}, SOL={n_sol}, "
+                        f"EXT={n_ext}, LINE={n_line}, ARC={n_arc}, CIRCLE={n_circ}\n"
+                    )
+                    f.write(
+                        f"# format: idx | cmd | p0..p15 (PAD=-1)\n"
+                    )
+                    for i, row in enumerate(tokens):
+                        c = int(row[0])
+                        cname = CMD_NAME.get(c, f"UNK{c}")
+                        params = " ".join(f"{int(p):>5d}" for p in row[1:])
+                        f.write(f"[{i:>4d}] | {cname:<6s} | {params}\n")
+                print(f"    ✓ full token saved → {fp}")
+            except Exception as e:
+                print(f"    ⚠ failed to save: {e}")
+
+
 def print_surrogate_eval_diagnostics(eval_metrics, latent_diag, type_names):
     section("EVALUATION DIAGNOSTICS")
 
@@ -2923,6 +3024,19 @@ def train_surrogate(
     )
 
     print_surrogate_eval_diagnostics(eval_metrics, latent_diag, type_names)
+
+    # ★ 각 type 별 입력 시퀀스 예시 출력 (모델이 실제로 보는 데이터 형태)
+    try:
+        save_dir = None
+        if ckpt_save_path:
+            save_dir = os.path.dirname(ckpt_save_path) or "."
+        show_sample_input_sequences(
+            dataset, type_names,
+            head=20, tail=5,
+            save_dir=save_dir,
+        )
+    except Exception as e:
+        print(f"  ⚠ show_sample_input_sequences failed: {type(e).__name__}: {e}")
 
     if cfg.show_figures:
         subsection("Training curves")
