@@ -110,11 +110,57 @@ def build_model_from_ckpt(ckpt, mod, device):
     return model
 
 
-def prep_tokens(npy_path, max_len, mod):
-    """npy → (1, max_len, 17) float32 tensor. EOS 보장 + PAD(-1) 패딩."""
-    t = np.load(npy_path).astype(np.int32)
+def parse_tokens_txt(path, mod):
+    """surrogate.py 의 show_sample_input_sequences 가 저장한 txt 형식 파서.
+
+    한 줄 예: "[   0] | ROLE   |     0    -1    -1 ..." (param 16개)
+    '#' 로 시작하는 줄은 주석. 빈 줄도 무시.
+    """
+    name_to_cmd = {v: k for k, v in mod.CMD_NAME.items()}
+    rows = []
+    with open(path, "r", encoding="utf-8") as f:
+        for ln_no, raw in enumerate(f, 1):
+            ln = raw.strip()
+            if not ln or ln.startswith("#"):
+                continue
+            parts = [p.strip() for p in ln.split("|")]
+            if len(parts) != 3:
+                raise ValueError(f"{path}:{ln_no}: '|' 3분할 안 됨: {raw!r}")
+            cname = parts[1].upper()
+            if cname not in name_to_cmd:
+                raise ValueError(f"{path}:{ln_no}: 알 수 없는 cmd '{cname}'")
+            params = parts[2].split()
+            if len(params) != 16:
+                raise ValueError(
+                    f"{path}:{ln_no}: param 개수 {len(params)} != 16")
+            row = [name_to_cmd[cname]] + [int(p) for p in params]
+            rows.append(row)
+    if not rows:
+        raise ValueError(f"{path}: 토큰 행이 하나도 없음")
+    return np.array(rows, dtype=np.int32)
+
+
+def load_tokens_any(path, mod):
+    """확장자 보고 npy 또는 txt 로 로드. 둘 다 (L, 17) int 반환."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".npy":
+        if path.endswith("_tokens_float.npy"):
+            raise ValueError(
+                "_tokens_float.npy 는 정규화된 float 데이터라 모델 입력으로 안 됨. "
+                "_tokens.npy 를 골라.")
+        t = np.load(path).astype(np.int32)
+    elif ext == ".txt":
+        t = parse_tokens_txt(path, mod)
+    else:
+        raise ValueError(f"지원 안 함: {ext} (.npy 또는 .txt 만)")
     if t.ndim != 2 or t.shape[1] != 17:
         raise ValueError(f"shape 이상: {t.shape} (기대: (L, 17))")
+    return t
+
+
+def prep_tokens(npy_path, max_len, mod):
+    """입력 → (1, max_len, 17) float32 tensor. EOS 보장 + PAD(-1) 패딩."""
+    t = load_tokens_any(npy_path, mod)
     t = mod.ensure_eos_when_truncated(t, max_len)
     L = t.shape[0]
     if L < max_len:
@@ -123,8 +169,8 @@ def prep_tokens(npy_path, max_len, mod):
     return torch.tensor(t, dtype=torch.float32).unsqueeze(0), L
 
 
-def token_summary(npy_path, mod):
-    t = np.load(npy_path).astype(np.int32)
+def token_summary(path, mod):
+    t = load_tokens_any(path, mod)
     cmds = t[:, 0]
     n = {name: int((cmds == code).sum()) for code, name in mod.CMD_NAME.items()}
     return (f"L={t.shape[0]}  ROLE={n['ROLE']} SOL={n['SOL']} EXT={n['EXT']} "
@@ -175,8 +221,10 @@ def main():
 
     # ── 2) npy 선택 (여러 개 가능) ──
     npy_paths = pick_file(
-        "입력 토큰 npy 선택 (여러 개 가능)",
-        [("Token npy", "*.npy"), ("All files", "*.*")],
+        "입력 토큰 npy / txt 선택 (여러 개 가능)",
+        [("Token npy/txt", ("*.npy", "*.txt")),
+         ("Token npy", "*.npy"), ("Token txt", "*.txt"),
+         ("All files", "*.*")],
         initialdir=script_dir, multiple=True)
     if not npy_paths:
         print("  ✗ npy 미선택 — 종료")
