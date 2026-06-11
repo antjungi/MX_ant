@@ -110,41 +110,87 @@ def build_model_from_ckpt(ckpt, mod, device):
     return model
 
 
-def parse_tokens_txt(path, mod):
-    """surrogate.py 의 show_sample_input_sequences 가 저장한 txt 형식 파서.
+def _parse_token_line(ln, name_to_cmd):
+    """한 줄을 토큰 행 (cmd_int + param 16개) 으로 시도. 실패하면 None.
 
-    한 줄 예: "[   0] | ROLE   |     0    -1    -1 ..." (param 16개)
-    '#' 주석, 빈 줄, 구분선, 헤더 줄 등은 자동 skip.
-    parse 실패 줄은 조용히 건너뛰어 다양한 포맷에 관대하게 대응.
+    지원 포맷:
+      A) "[ idx] | CMD | p0 p1 ... p15"   ('|' 구분, cmd 이름)
+      B) "CMD p0 p1 ... p15"                (공백, cmd 이름)
+      C) "cmd_int p0 p1 ... p15"            (공백, cmd 정수)
+      쉼표 (,) 도 공백처럼 처리.
+    """
+    # A) '|' 형식
+    if "|" in ln:
+        parts = [p.strip() for p in ln.split("|")]
+        if len(parts) == 3 and parts[1].upper() in name_to_cmd:
+            try:
+                params = [int(p) for p in parts[2].replace(",", " ").split()]
+            except ValueError:
+                return None
+            return name_to_cmd[parts[1].upper()], params
+
+    # B/C) 공백/쉼표 구분
+    toks = ln.replace(",", " ").split()
+    if not toks:
+        return None
+    # 맨 앞 토큰이 cmd 이름?
+    head = toks[0].upper()
+    if head in name_to_cmd:
+        cmd = name_to_cmd[head]
+        rest = toks[1:]
+    else:
+        # 맨 앞이 정수면 cmd 정수 포맷
+        try:
+            cmd = int(toks[0])
+        except ValueError:
+            return None
+        if cmd not in mod_cmd_range:
+            return None
+        rest = toks[1:]
+    try:
+        params = [int(p) for p in rest]
+    except ValueError:
+        return None
+    return cmd, params
+
+
+# valid cmd 정수 0..6
+mod_cmd_range = set(range(7))
+
+
+def parse_tokens_txt(path, mod):
+    """다양한 토큰 txt 포맷 자동 감지 파서.
+
+    한 줄당 한 토큰 행. 16개 미만 param 은 -1 로 패딩, 초과는 자름.
+    '#' 주석, 빈 줄, 구분선, 헤더 등 토큰 행이 아닌 줄은 자동 skip.
     """
     name_to_cmd = {v: k for k, v in mod.CMD_NAME.items()}
     rows = []
     n_skipped = 0
+    sample_skipped = []
     with open(path, "r", encoding="utf-8") as f:
         for raw in f:
             ln = raw.strip()
             if not ln or ln.startswith("#"):
                 continue
-            parts = [p.strip() for p in ln.split("|")]
-            if len(parts) != 3:                          # 구분선, 헤더 등
+            parsed = _parse_token_line(ln, name_to_cmd)
+            if parsed is None:
                 n_skipped += 1
+                if len(sample_skipped) < 3:
+                    sample_skipped.append(raw.rstrip()[:80])
                 continue
-            cname = parts[1].upper()
-            if cname not in name_to_cmd:                 # "cmd" 같은 헤더 행
-                n_skipped += 1
-                continue
-            try:
-                params = [int(p) for p in parts[2].split()]
-            except ValueError:
-                n_skipped += 1
-                continue
+            cmd, params = parsed
             if len(params) > 16:
                 params = params[:16]
             elif len(params) < 16:
                 params = params + [-1] * (16 - len(params))
-            rows.append([name_to_cmd[cname]] + params)
+            rows.append([cmd] + params)
     if not rows:
-        raise ValueError(f"{path}: 토큰 행을 못 찾음 (skipped {n_skipped} non-data lines)")
+        msg = (f"{path}: 토큰 행을 못 찾음 "
+               f"(skipped {n_skipped} non-data lines).")
+        if sample_skipped:
+            msg += "\n    예시 skipped 줄:\n      " + "\n      ".join(sample_skipped)
+        raise ValueError(msg)
     return np.array(rows, dtype=np.int32)
 
 
