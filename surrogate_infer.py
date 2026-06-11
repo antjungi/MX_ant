@@ -114,29 +114,37 @@ def parse_tokens_txt(path, mod):
     """surrogate.py 의 show_sample_input_sequences 가 저장한 txt 형식 파서.
 
     한 줄 예: "[   0] | ROLE   |     0    -1    -1 ..." (param 16개)
-    '#' 로 시작하는 줄은 주석. 빈 줄도 무시.
+    '#' 주석, 빈 줄, 구분선, 헤더 줄 등은 자동 skip.
+    parse 실패 줄은 조용히 건너뛰어 다양한 포맷에 관대하게 대응.
     """
     name_to_cmd = {v: k for k, v in mod.CMD_NAME.items()}
     rows = []
+    n_skipped = 0
     with open(path, "r", encoding="utf-8") as f:
-        for ln_no, raw in enumerate(f, 1):
+        for raw in f:
             ln = raw.strip()
             if not ln or ln.startswith("#"):
                 continue
             parts = [p.strip() for p in ln.split("|")]
-            if len(parts) != 3:
-                raise ValueError(f"{path}:{ln_no}: '|' 3분할 안 됨: {raw!r}")
+            if len(parts) != 3:                          # 구분선, 헤더 등
+                n_skipped += 1
+                continue
             cname = parts[1].upper()
-            if cname not in name_to_cmd:
-                raise ValueError(f"{path}:{ln_no}: 알 수 없는 cmd '{cname}'")
-            params = parts[2].split()
-            if len(params) != 16:
-                raise ValueError(
-                    f"{path}:{ln_no}: param 개수 {len(params)} != 16")
-            row = [name_to_cmd[cname]] + [int(p) for p in params]
-            rows.append(row)
+            if cname not in name_to_cmd:                 # "cmd" 같은 헤더 행
+                n_skipped += 1
+                continue
+            try:
+                params = [int(p) for p in parts[2].split()]
+            except ValueError:
+                n_skipped += 1
+                continue
+            if len(params) > 16:
+                params = params[:16]
+            elif len(params) < 16:
+                params = params + [-1] * (16 - len(params))
+            rows.append([name_to_cmd[cname]] + params)
     if not rows:
-        raise ValueError(f"{path}: 토큰 행이 하나도 없음")
+        raise ValueError(f"{path}: 토큰 행을 못 찾음 (skipped {n_skipped} non-data lines)")
     return np.array(rows, dtype=np.int32)
 
 
