@@ -16,7 +16,8 @@ surrogate.py 가 없어도 ckpt 만으로 동작. 우선순위:
 출력: S11/S22/S33 dB 곡선 (figure + 콘솔 요약)
 
 실행:  python surrogate_infer.py
-       (창 1: ckpt 선택 → 창 2: npy 선택 (여러 개 가능) → figure)
+       (ckpt 자동/선택 창 → npy 선택 창 (여러 개 가능) → figure)
+       python surrogate_infer.py path/to/other.pt   ← ckpt 직접 지정
 """
 
 import os
@@ -35,6 +36,9 @@ import matplotlib.pyplot as plt
 
 # ckpt 기본 경로. 존재하면 파일 선택 창 없이 바로 사용. 없으면 창 띄움.
 DEFAULT_CKPT = "ckpt/surrogate_last.pt"
+
+# True 면 DEFAULT_CKPT 존재 여부와 무관하게 항상 ckpt 선택 창을 띄움
+ALWAYS_PICK_CKPT = False
 
 # 한 figure 에 곡선 겹쳐 그릴지 (True), npy 마다 행 분리할지 (False)
 OVERLAY = False
@@ -241,8 +245,15 @@ def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
     # ── 1) ckpt 선택 ──
+    # 우선순위: 커맨드라인 인자 > DEFAULT_CKPT (존재 시) > 파일 선택 창
     default_ckpt = os.path.join(script_dir, DEFAULT_CKPT)
-    if os.path.exists(default_ckpt):
+    if len(sys.argv) > 1:
+        ckpt_path = sys.argv[1]
+        if not os.path.exists(ckpt_path):
+            print(f"  ✗ ckpt 없음: {ckpt_path}")
+            sys.exit(1)
+        print(f"  ckpt: {ckpt_path} (커맨드라인 인자)")
+    elif not ALWAYS_PICK_CKPT and os.path.exists(default_ckpt):
         ckpt_path = default_ckpt
         print(f"  ckpt: {ckpt_path} (기본 경로 자동 사용)")
     else:
