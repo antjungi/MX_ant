@@ -79,6 +79,53 @@ def rect_minus(r, h):
     return out
 
 
+def _subtract_intervals(intervals, to_subtract):
+    """Subtract list of (lo,hi) intervals from list of intervals."""
+    result = list(intervals)
+    for s_lo, s_hi in to_subtract:
+        if s_hi <= s_lo:
+            continue
+        new = []
+        for lo, hi in result:
+            if s_hi <= lo or s_lo >= hi:
+                new.append((lo, hi))
+            else:
+                if lo < s_lo:
+                    new.append((lo, s_lo))
+                if s_hi < hi:
+                    new.append((s_hi, hi))
+        result = new
+    return result
+
+
+def _boundary_segments(rects, eps=1e-9):
+    """Boundary segments of the UNION of axis-aligned rectangles.
+    Returns ('V', x, y_lo, y_hi)  or  ('H', y, x_lo, x_hi)."""
+    segs = []
+    for i, (x0, x1, y0, y1) in enumerate(rects):
+        # left edge x=x0 : probe just to the left
+        others = [(b0, b1) for j, (a0, a1, b0, b1) in enumerate(rects)
+                  if j != i and a0 < x0 - eps < a1]
+        for a, b in _subtract_intervals([(y0, y1)], others):
+            if b - a > eps: segs.append(('V', x0, a, b))
+        # right edge x=x1 : probe just to the right
+        others = [(b0, b1) for j, (a0, a1, b0, b1) in enumerate(rects)
+                  if j != i and a0 < x1 + eps < a1]
+        for a, b in _subtract_intervals([(y0, y1)], others):
+            if b - a > eps: segs.append(('V', x1, a, b))
+        # bottom edge y=y0 : probe below
+        others = [(a0, a1) for j, (a0, a1, b0, b1) in enumerate(rects)
+                  if j != i and b0 < y0 - eps < b1]
+        for a, b in _subtract_intervals([(x0, x1)], others):
+            if b - a > eps: segs.append(('H', y0, a, b))
+        # top edge y=y1 : probe above
+        others = [(a0, a1) for j, (a0, a1, b0, b1) in enumerate(rects)
+                  if j != i and b0 < y1 + eps < b1]
+        for a, b in _subtract_intervals([(x0, x1)], others):
+            if b - a > eps: segs.append(('H', y1, a, b))
+    return segs
+
+
 class Design:
     def __init__(self, faces, folds, root=0):
         self.faces = faces
@@ -152,7 +199,15 @@ class Design:
                                 ((x0, y1), (x0, y0))]:
                     out.append(([top(*p), top(*qq), bot(*qq), bot(*p)], rgb, alpha))
 
-            walls(*rect)
+            # outer perimeter: use face['perim'] polygon if provided (non-rect shapes),
+            # otherwise the 4 corners of rect.
+            perim = f.get('perim', None)
+            if perim is None:
+                walls(*rect)
+            else:
+                for k in range(len(perim)):
+                    p0 = perim[k]; p1 = perim[(k+1) % len(perim)]
+                    out.append(([top(*p0), top(*p1), bot(*p1), bot(*p0)], rgb, alpha))
 
             for h in hole_walls:
                 walls(*h)
@@ -189,16 +244,23 @@ def plus_perim(a, hw, L):
 
 
 def draw_crease(ax, design, sym_axes=True, pad=4.0):
-    """Draw the 2D flat pattern (crease pattern) for a design with .meta."""
+    """Draw the 2D flat pattern (crease pattern) for a design with .meta.
+
+    Slots / kerf strips are filled WITHOUT per-rect outlines; the union
+    boundary of all cuts is drawn as a single set of black line segments so a
+    '+' slot reads as a single '+' shape rather than overlapping rectangles."""
     from matplotlib.patches import Rectangle, Polygon
 
     m = design.meta
+    # Face fills: prefer face['perim'] polygon (non-square) over rect bbox
     for f in design.faces:
-        x0, x1, y0, y1 = f['rect']
         green = np.allclose(f.get('col', STEEL), TABC)
-        ax.add_patch(Rectangle((x0, y0), x1-x0, y1-y0,
-                               fc=("#d7efd7" if green else "#dfe6f2"),
-                               ec='none', zorder=1))
+        fc = "#d7efd7" if green else "#dfe6f2"
+        if 'perim' in f:
+            ax.add_patch(Polygon(f['perim'], closed=True, fc=fc, ec='none', zorder=1))
+        else:
+            x0, x1, y0, y1 = f['rect']
+            ax.add_patch(Rectangle((x0, y0), x1-x0, y1-y0, fc=fc, ec='none', zorder=1))
 
     xs = [p[0] for p in m['perim']]
     ys = [p[1] for p in m['perim']]
@@ -209,9 +271,17 @@ def draw_crease(ax, design, sym_axes=True, pad=4.0):
 
     ax.add_patch(Polygon(m['perim'], closed=True, fill=False, ec='k', lw=2.4, zorder=4))
 
-    for (x0, x1, y0, y1) in m.get('cuts', []):
-        ax.add_patch(Rectangle((x0, y0), x1-x0, y1-y0,
-                               fc='white', ec='k', lw=1.0, zorder=5))
+    # Cuts: fill (no per-rect edge) then draw the UNION boundary so adjacent /
+    # overlapping rectangles read as a single shape.
+    cuts = list(m.get('cuts', []))
+    for (x0, x1, y0, y1) in cuts:
+        ax.add_patch(Rectangle((x0, y0), x1-x0, y1-y0, fc='white', ec='none', zorder=5))
+    for seg in _boundary_segments(cuts):
+        kind, c, a, b = seg
+        if kind == 'V':
+            ax.plot([c, c], [a, b], color='k', lw=1.0, zorder=6)
+        else:
+            ax.plot([a, b], [c, c], color='k', lw=1.0, zorder=6)
 
     for (Ax, Ay, Bx, By), mv in m['folds2d']:
         col = MTN if mv == 'M' else VAL
