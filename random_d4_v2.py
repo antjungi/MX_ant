@@ -369,8 +369,16 @@ def _face0_shapely_quads(d, thick=THICK):
     # to choke on coincident boundaries.
     P = d.meta['plate'] / 2.0
     EPS = 0.1
+    # Folded arms have to be removed from the radiator metal even though
+    # their rects touch the plate edge -- the arm metal is rendered by the
+    # arm's own child face (after the 90 deg fold), so leaving it in face[0]
+    # would double-render the unfolded arm.
+    folded_arms = set(tuple(r) for r in d.meta.get('folded_arm_rects', []))
     all_cuts = []
     for h in f.get('holes', []):
+        if tuple(h) in folded_arms:
+            all_cuts.append(_sh_box(h[0], h[2], h[1], h[3]))
+            continue
         if (h[0] <= -P + EPS or h[1] >= P - EPS or
             h[2] <= -P + EPS or h[3] >= P - EPS):
             continue
@@ -409,12 +417,18 @@ def _face0_shapely_quads(d, thick=THICK):
     if perim is None:
         x0, x1, y0, y1 = f['rect']
         perim = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
-    for k in range(len(perim)):
-        p0 = perim[k]; p1 = perim[(k+1) % len(perim)]
-        out.append(([(p0[0], p0[1],  thick/2.0),
-                     (p1[0], p1[1],  thick/2.0),
-                     (p1[0], p1[1], -thick/2.0),
-                     (p0[0], p0[1], -thick/2.0)], rgb, alpha))
+    # If the arms are folded, the perim of face[0] is the unfolded plus
+    # outline -- drawing those walls would put vertical strips floating in
+    # mid-air where the arms USED to be (they're now bent down).  The arm
+    # child faces draw their own walls instead, and the fold-line edges of
+    # the central square are covered by the bend fillets.
+    if 'arm_central_hw' not in d.meta:
+        for k in range(len(perim)):
+            p0 = perim[k]; p1 = perim[(k+1) % len(perim)]
+            out.append(([(p0[0], p0[1],  thick/2.0),
+                         (p1[0], p1[1],  thick/2.0),
+                         (p1[0], p1[1], -thick/2.0),
+                         (p0[0], p0[1], -thick/2.0)], rgb, alpha))
 
     # ---- slot walls = boundary of union(EVERY interior cut) ------------
     # Include lance openings + slots (rects) + polygon cuts together so
@@ -428,6 +442,8 @@ def _face0_shapely_quads(d, thick=THICK):
     bend_set = set(tuple(r) for r in d.meta.get('bend_exts', []))
     wall_shapes = []
     for h in f.get('holes', []):
+        if tuple(h) in folded_arms:
+            continue                         # arm child face draws its own walls
         if (h[0] <= -P + EPS or h[1] >= P - EPS or
             h[2] <= -P + EPS or h[3] >= P - EPS):
             continue                         # corner cut -> shape goes to perim
@@ -611,6 +627,76 @@ def base(leg_inner=14.0):
     return d
 
 
+def planar_no_legs(plate=PLATE, leg_drop=8.0):
+    """Like planar_on_pcb but with NO cardinal lance legs.  Used when the
+    folded-arm structure (fold_plus_arms below) provides the vertical
+    support: the arms themselves drop down to the PCB."""
+    P = plate / 2.0
+    faces = [dict(rect=(-P, P, -P, P), holes=[], hole_walls=[])]
+    d = Design(faces, folds=[])
+    d.meta = dict(perim=[(-P, -P), (P, -P), (P, P), (-P, P)],
+                  cuts=[], folds2d=[], leg_drop=leg_drop, bend_r=BEND_R,
+                  plate=plate, bend_exts=[])
+    return d
+
+
+def fold_plus_arms(d, arm_hw, fold_dir='down', bend_r=BEND_R):
+    """Convert a plus-shape radiator into central square + 4 foldable arms.
+    Each arm bends 90 deg about the arm-base edge of the central square.
+    The folded footprint is just the central square (2*arm_hw on a side),
+    and the bounding-box volume drops to (2*a)^2 * max(leg_drop, arm_len).
+
+    Pre-conditions:
+      - d.faces[0]['perim'] is already the plus polygon (call plus_radiator
+        first, or set it manually)
+      - d has no leg lances that overlap the arm regions (use planar_no_legs)
+    """
+    plate = d.meta['plate']
+    h = plate / 2.0
+    a = arm_hw
+
+    # Per-direction lance-style parameters:
+    #   (arm_rect, fold_line, tab2_post-bend, bend_ext, th_up)
+    table = {
+        '+x': ((a, h, -a, a),
+               (a, -a, a, a),
+               (a + bend_r, h, -a, a),
+               (a,           a + bend_r, -a, a),
+               -90),
+        '-x': ((-h, -a, -a, a),
+               (-a, -a, -a, a),
+               (-h, -a - bend_r, -a, a),
+               (-a - bend_r, -a, -a, a),
+               +90),
+        '+y': ((-a, a, a, h),
+               (-a, a, a, a),
+               (-a, a, a + bend_r, h),
+               (-a, a, a, a + bend_r),
+               +90),
+        '-y': ((-a, a, -h, -a),
+               (-a, -a, a, -a),
+               (-a, a, -h, -a - bend_r),
+               (-a, a, -a - bend_r, -a),
+               -90),
+    }
+    d.meta.setdefault('folded_arm_rects', [])
+    for dirn, (arm, line, tab2, bend_ext, th_up) in table.items():
+        theta = th_up if fold_dir == 'up' else -th_up
+        mv = 'M' if fold_dir == 'up' else 'V'
+        d.faces[0]['holes'].append(arm)
+        d.faces[0]['holes'].append(bend_ext)
+        d.meta['folded_arm_rects'].append(arm)
+        d.meta.setdefault('bend_exts', []).append(bend_ext)
+        new_idx = len(d.faces)
+        d.faces.append(dict(rect=tab2))
+        d.folds.append((0, new_idx, line, theta))
+        d.kids.setdefault(0, []).append((new_idx, line, theta))
+        d.meta['folds2d'].append((line, mv))
+    d.meta['arm_central_hw'] = a
+    d.meta['arm_length']     = h - a
+    return finalize(d)
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # Radiator-outline modifiers (D4-symmetric)
 # ════════════════════════════════════════════════════════════════════════════
@@ -737,7 +823,14 @@ def _design_metrics(d):
     L = sum(((perim[i][0] - perim[(i+1) % n][0])**2 +
              (perim[i][1] - perim[(i+1) % n][1])**2) ** 0.5
             for i in range(n))
-    V = d.meta['plate'] ** 2 * d.meta.get('leg_drop', 0.0)
+    # If the plus arms are folded down, the footprint shrinks to the central
+    # square (2*arm_hw on a side) and the height is max(leg_drop, arm_length).
+    if 'arm_central_hw' in d.meta:
+        a  = d.meta['arm_central_hw']
+        al = d.meta['arm_length']
+        V  = (2.0 * a) ** 2 * max(d.meta.get('leg_drop', 0.0), al)
+    else:
+        V  = d.meta['plate'] ** 2 * d.meta.get('leg_drop', 0.0)
     return L, V
 
 
@@ -880,8 +973,11 @@ def _metal_polygon(d):
         rad = _ShPoly([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
     P = d.meta['plate'] / 2.0
     EPS = 0.1
+    folded_arms = set(tuple(r) for r in d.meta.get('folded_arm_rects', []))
     cuts = []
     for h in f.get('holes', []):
+        if tuple(h) in folded_arms:
+            cuts.append(_sh_box(h[0], h[2], h[1], h[3])); continue
         if (h[0] <= -P + EPS or h[1] >= P - EPS or
             h[2] <= -P + EPS or h[3] >= P - EPS):
             continue                                # outline cut -> in perim
@@ -1096,8 +1192,9 @@ PLATES   = [40.0, 45.0, 50.0, 55.0, 60.0]
 LEG_W    = [3.0, 4.0, 5.0, 6.0]
 LEG_LENS = [5.0, 7.0, 9.0, 11.0, 13.0]
 ALPHAS   = [0.75, 0.85, 0.95]
-SHAPE_WEIGHTS = [('square',  35), ('octagonal', 10), ('notched',  8),
-                 ('plus',     7), ('star',       5), ('tooth',  35)]
+SHAPE_WEIGHTS = [('square',     30), ('octagonal',   8), ('notched',  7),
+                 ('plus',        6), ('star',        4), ('tooth',   30),
+                 ('plus_fold',  15)]
 
 
 def _weighted_pick(rng, weighted):
@@ -1278,6 +1375,30 @@ def _build_random_design(rng):
         lm = max(leg_w/2.0 + 2.5, rng.choice([4.0, 5.0, 6.0]))
         tooth_radiator(d, n_per_half=nh, tooth_w=tw, tooth_d=td, leg_margin=lm)
         desc.append(f"tooth(n{nh},w{tw:g},d{td:g})")
+    elif shape == 'plus_fold':
+        # "Crumpled" plus: 4 arms fold 90 deg down to form a small box.
+        # Bounding volume drops to (2a)^2 * arm_length -- much smaller than
+        # plate^2 * leg_drop. Arms are the structural support; no leg lances.
+        a_opts = [v for v in [8.0, 10.0, 12.0, 14.0]
+                  if v >= leg_w/2.0 + 3.0 and (P - v) >= 5.0]
+        if a_opts:
+            a = rng.choice(a_opts)
+            arm_length = P - a
+            d = planar_no_legs(plate=plate, leg_drop=arm_length)
+            d.faces[0]['alpha'] = alpha
+            plus_radiator(d, arm_hw=a)
+            fold_plus_arms(d, arm_hw=a, fold_dir='down')
+            desc = [f"P{int(plate)}", f"plusfold(a{a:g},Larm{arm_length:g})",
+                    f"a{alpha}"]
+            feats = []
+            L, V = _design_metrics(d)
+            fom = L / (V ** (1.0/3.0)) if V > 0 else 0.0
+            title = (f"L={L:.0f}mm V={V:.0f}mm³ FoM={fom:.2f} | "
+                     + " | ".join(desc) + " | minimal | tabs:-")
+            return d, title
+        else:
+            shape = 'square'
+
 
     # ---------- 3. independent slot features ---------------------------
     feats     = []
