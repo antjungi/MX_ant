@@ -836,7 +836,13 @@ def _slot_shapes_for_valid(d):
     out = []
     seen = set()
     for r in d.meta.get('cuts', []):
-        out.append(_sh_box(r[0], r[2], r[1], r[3])); seen.add(tuple(r))
+        seen.add(tuple(r))
+        # Kerf strips that touch the plate edge belong to a perim-tab lance --
+        # the 'edge' they sit on IS the cut, not patch metal, so the plate
+        # edge distance check would always trip on them. Skip those.
+        if r[0] <= -P + EPS or r[1] >= P - EPS or r[2] <= -P + EPS or r[3] >= P - EPS:
+            continue
+        out.append(_sh_box(r[0], r[2], r[1], r[3]))
     for r in d.faces[0].get('holes', []):
         if tuple(r) in seen: continue
         if r[0] <= -P + EPS or r[1] >= P - EPS or r[2] <= -P + EPS or r[3] >= P - EPS:
@@ -985,6 +991,80 @@ def four_taps(d, inner, length, width, fold_dir):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Perimeter bend-tabs (volume-reduction: bend the outline metal down instead
+# of carving it off; outer face of each tab is the plate edge -- no kerf).
+# ════════════════════════════════════════════════════════════════════════════
+def perim_lance(side, cx, length, width, plate, kerf=KERF):
+    """Lance a bend-down tab on the OUTER plate edge.  Differs from `lance`
+    in that the outer side of the tab IS the plate edge: the hole adds kerf
+    only on the two side-edges, never on the outer (plate-edge) side.
+    Returns (tab, hole, line, th_up) compatible with the existing fold engine."""
+    h = plate / 2.0
+    hw = width / 2.0
+    if side == '-y':
+        return ((cx-hw, cx+hw, -h, -h+length),
+                (cx-hw-kerf, cx+hw+kerf, -h, -h+length),
+                (cx-hw, -h+length, cx+hw, -h+length), -90)
+    if side == '+y':
+        return ((cx-hw, cx+hw, h-length, h),
+                (cx-hw-kerf, cx+hw+kerf, h-length, h),
+                (cx-hw, h-length, cx+hw, h-length), +90)
+    if side == '-x':
+        return ((-h, -h+length, cx-hw, cx+hw),
+                (-h, -h+length, cx-hw-kerf, cx+hw+kerf),
+                (-h+length, cx-hw, -h+length, cx+hw), +90)
+    if side == '+x':
+        return ((h-length, h, cx-hw, cx+hw),
+                (h-length, h, cx-hw-kerf, cx+hw+kerf),
+                (h-length, cx-hw, h-length, cx+hw), -90)
+    raise ValueError(side)
+
+
+def add_perim_tab(d, side, cx, length, width, fold_dir='down', bend_r=BEND_R):
+    """Lance one edge tab and register it as a child face that bends about
+    the inner edge of the tab.  This is the perim-tab version of
+    add_extra_lance -- intended for the 'bend the teeth down' compactness
+    feature."""
+    plate = d.meta['plate']
+    tab, hole, line, th_up = perim_lance(side, cx, length, width, plate)
+    kerf_strips = rect_minus(hole, tab)
+    if side == '-y':
+        tab2     = (tab[0], tab[1], tab[2],         tab[3]-bend_r)
+        bend_ext = (tab[0], tab[1], tab[3],         tab[3]+bend_r)
+    elif side == '+y':
+        tab2     = (tab[0], tab[1], tab[2]+bend_r,  tab[3])
+        bend_ext = (tab[0], tab[1], tab[2]-bend_r,  tab[2])
+    elif side == '-x':
+        tab2     = (tab[0],         tab[1]-bend_r,  tab[2], tab[3])
+        bend_ext = (tab[1],         tab[1]+bend_r,  tab[2], tab[3])
+    else:  # '+x'
+        tab2     = (tab[0]+bend_r,  tab[1],         tab[2], tab[3])
+        bend_ext = (tab[0]-bend_r,  tab[0],         tab[2], tab[3])
+    theta = th_up if fold_dir == 'up' else -th_up
+    mv = 'M' if fold_dir == 'up' else 'V'
+    d.faces[0]['holes']      += [hole, bend_ext]
+    d.faces[0]['hole_walls'] += kerf_strips
+    d.meta.setdefault('bend_exts', []).append(bend_ext)
+    new_idx = len(d.faces)
+    d.faces.append(dict(rect=tab2))
+    d.folds.append((0, new_idx, line, theta))
+    d.kids.setdefault(0, []).append((new_idx, line, theta))
+    d.meta['cuts']    += kerf_strips
+    d.meta['folds2d'].append((line, mv))
+    return d
+
+
+def eight_perim_tabs(d, cx_off, length, width, fold_dir='down'):
+    """8 D4-symmetric bend-down tabs on the outer perimeter: each plate
+    side has 2 tabs at +-cx_off from its midpoint, mirror-symmetric.  All
+    four sides identical -> full D4 symmetry."""
+    for side in ['-y', '+y', '-x', '+x']:
+        for cx in [-cx_off, +cx_off]:
+            add_perim_tab(d, side, cx, length, width, fold_dir=fold_dir)
+    return finalize(d)
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # RANDOM D4-symmetric design generator  (diverse mode)
 # ════════════════════════════════════════════════════════════════════════════
 # Everything below is randomly sampled and (mostly) independent:
@@ -1129,11 +1209,19 @@ def random_design(rng, max_retries=25):
 
 
 def _build_random_design(rng):
+    # ---------- 0. compactness mode (perim bend-tabs) ------------------
+    # When this is on, the radiator's outline metal is BENT down at 8
+    # D4-symmetric positions instead of being carved off.  This adds
+    # vertical edges to the 3D structure at the perimeter (more 'box-
+    # like' antenna shape, smaller leg_drop is enough to keep it stable),
+    # so we also bias the leg-length shorter to actually reduce the
+    # bounding-volume plate^2 * leg_drop.
+    want_perim_tabs = (rng.random() < 0.35)
     # ---------- 1. plate + legs ----------------------------------------
     plate   = rng.choice(PLATES)
     P       = plate / 2.0
     leg_w   = rng.choice(LEG_W)
-    leg_len = rng.choice(LEG_LENS)
+    leg_len = rng.choice([5.0, 6.0, 7.0]) if want_perim_tabs else rng.choice(LEG_LENS)
 
     inner_max = P - leg_len - KERF - 1.5
     inner_min = max(7.0, leg_w + 2.5)
@@ -1302,6 +1390,33 @@ def _build_random_design(rng):
         if not has_ring or s/2.0 < ring_min - 1.5:
             add_slots(d, [(-s/2.0, s/2.0, -s/2.0, s/2.0)])
             feats.append(f"cH({s:g})")
+
+    # ---------- 3b. perim bend-tabs (compactness mode) -----------------
+    # 8 D4-symmetric edge tabs lanced into the plate edge and folded DOWN.
+    # Compatible only with non-castellated outlines (tooth shape already
+    # carves its own notches into the perim; mixing would collide).
+    ptab_desc = ""
+    if want_perim_tabs and shape in ('square', 'octagonal', 'notched'):
+        # cx_off measured from each side's midpoint.  Must clear leg_w/2 +
+        # kerf on the inside and stay 1mm away from the corner on the outside.
+        cx_max = P - 1.5 - 1.0                                  # corner clearance
+        cx_min = leg_w / 2.0 + 2.0                              # leg clearance
+        cx_opts = [v for v in [7.0, 9.0, 11.0, 13.0, 15.0] if cx_min <= v <= cx_max]
+        if cx_opts:
+            cx_off = rng.choice(cx_opts)
+            t_len  = rng.choice([2.0, 3.0, 4.0])
+            t_w    = rng.choice([1.5, 2.0, 2.5])
+            # Tab must fit inside the patch on the inner side (not crash into
+            # the slot region near the centre).
+            inner_clear = leg_inner - t_len - 1.0
+            if inner_clear > 0:
+                try:
+                    eight_perim_tabs(d, cx_off=cx_off, length=t_len,
+                                     width=t_w, fold_dir='down')
+                    ptab_desc = f"ptab(off{cx_off:g},L{t_len:g},w{t_w:g})"
+                    feats.append(ptab_desc)
+                except Exception:
+                    pass
 
     # ---------- 4. extra inner lanced tabs -----------------------------
     extras = "-"
