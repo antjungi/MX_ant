@@ -683,13 +683,25 @@ def make_poly_slot_extras(d, thick=THICK):
     return extras
 
 
-def _slot_shapes(d):
-    """All slot shapes (rects + polygons + interior face['holes']) as shapely
-    geometries. Corner cuts (rects touching the plate edge) and bend_exts
-    (the per-leg fillet relief zones recorded in meta['bend_exts']) are
-    filtered out: the former shape the radiator outline, the latter belong
-    to the bend region which the user explicitly exempts from the 1 mm
-    minimum-metal rule."""
+def _slot_shapes_drawn(d):
+    """Cuts shown in the 2D crease pattern: kerf strips + added slot rects +
+    polygon cuts. We DON'T include the lance-opening rects from face['holes']
+    -- those would white-out the whole tab area; instead just the kerf
+    around the tab is drawn, leaving the lance tab visible as part of the
+    patch metal. bend_exts and corner cuts are also implicitly skipped."""
+    if not HAS_SHAPELY: return []
+    out = []
+    for r in d.meta.get('cuts', []):
+        out.append(_sh_box(r[0], r[2], r[1], r[3]))
+    for p in d.meta.get('poly_cuts', ()):
+        out.append(_ShPoly(p))
+    return out
+
+
+def _slot_shapes_for_valid(d):
+    """Features used by is_valid's pairwise distance check.
+    Includes lance openings (so slots can't be placed inside them) but
+    skips bend_exts (user-exempted) and corner cuts (radiator outline)."""
     if not HAS_SHAPELY: return []
     P = d.meta['plate'] / 2.0
     EPS = 0.1
@@ -699,12 +711,10 @@ def _slot_shapes(d):
     for r in d.meta.get('cuts', []):
         out.append(_sh_box(r[0], r[2], r[1], r[3])); seen.add(tuple(r))
     for r in d.faces[0].get('holes', []):
-        if tuple(r) in seen:
-            continue
+        if tuple(r) in seen: continue
         if r[0] <= -P + EPS or r[1] >= P - EPS or r[2] <= -P + EPS or r[3] >= P - EPS:
             continue
-        if tuple(r) in bend_set:
-            continue                 # bend regions exempt from min-metal check
+        if tuple(r) in bend_set: continue
         out.append(_sh_box(r[0], r[2], r[1], r[3]))
     for p in d.meta.get('poly_cuts', ()):
         out.append(_ShPoly(p))
@@ -712,8 +722,8 @@ def _slot_shapes(d):
 
 
 def _design_cuts_union(d):
-    """shapely union of all slot shapes in d (or None)."""
-    shapes = _slot_shapes(d)
+    """shapely union of all DRAWN slot shapes (used for the 2D crease)."""
+    shapes = _slot_shapes_drawn(d)
     if not shapes: return None
     try:
         return _sh_union(shapes)
@@ -721,26 +731,69 @@ def _design_cuts_union(d):
         return None
 
 
+def _metal_polygon(d):
+    """The radiator's actual metal region (rad MINUS every hole, including
+    bend_exts which physically have no metal even though the bend rule
+    exempts them for the min-width check)."""
+    if not HAS_SHAPELY: return None
+    f = d.faces[0]
+    if 'perim' in f:
+        rad = _ShPoly(f['perim'])
+    else:
+        x0, x1, y0, y1 = f['rect']
+        rad = _ShPoly([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+    cuts = []
+    for h in f.get('holes', []):
+        cuts.append(_sh_box(h[0], h[2], h[1], h[3]))
+    for p in d.meta.get('poly_cuts', ()):
+        cuts.append(_ShPoly(p))
+    if not cuts: return rad
+    return rad.difference(_sh_union(cuts))
+
+
+def _metal_has_min_width(metal, min_w=MIN_METAL, eps=0.05, lost_tol=0.5):
+    """Morphological erosion check: the metal must keep at least `min_w` mm
+    of width everywhere. We erode by ~(min_w/2 - eps) and then dilate back;
+    if any area is lost, some part of the metal was thinner than min_w."""
+    if metal is None or metal.is_empty: return True
+    d = min_w / 2.0 - eps
+    try:
+        eroded = metal.buffer(-d, join_style=2)
+    except Exception:
+        return True
+    if eroded.is_empty:
+        return False
+    try:
+        recovered = eroded.buffer(d, join_style=2)
+        lost = metal.difference(recovered).area
+    except Exception:
+        return True
+    return lost < lost_tol
+
+
 def is_valid(d, min_metal=MIN_METAL):
-    """Returns True iff every pair of non-overlapping slot features is at
-    least `min_metal` apart AND every slot is at least `min_metal` from the
-    plate edge. Pairwise distance is a good proxy for 'metal width' when the
-    features are simple primitives (rects and parallelograms)."""
+    """Two conditions must hold:
+       (a) every pair of non-overlapping slot features is >= min_metal apart
+           and every slot is >= min_metal from the plate edge (pairwise check)
+       (b) the radiator metal polygon has width >= min_metal everywhere
+           (morphological erosion check -- catches thin necks pairwise misses)."""
     if not HAS_SHAPELY: return True
-    feats = _slot_shapes(d)
-    if not feats: return True
-    n = len(feats)
-    for i in range(n):
-        for j in range(i+1, n):
-            if feats[i].intersects(feats[j]):
-                continue
-            if feats[i].distance(feats[j]) < min_metal:
+    feats = _slot_shapes_for_valid(d)
+    if feats:
+        n = len(feats)
+        for i in range(n):
+            for j in range(i+1, n):
+                if feats[i].intersects(feats[j]):
+                    continue
+                if feats[i].distance(feats[j]) < min_metal:
+                    return False
+        P = d.meta['plate'] / 2.0
+        plate_b = _sh_box(-P, -P, P, P).exterior
+        for f in feats:
+            if plate_b.distance(f) < min_metal:
                 return False
-    P = d.meta['plate'] / 2.0
-    plate_b = _sh_box(-P, -P, P, P).exterior
-    for f in feats:
-        if plate_b.distance(f) < min_metal:
-            return False
+    if not _metal_has_min_width(_metal_polygon(d), min_metal):
+        return False
     return True
 
 
