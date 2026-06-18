@@ -27,19 +27,32 @@ import os, sys, random
 import numpy as np
 import matplotlib.pyplot as plt           # interactive backend left to the user
 from matplotlib.lines import Line2D
-from matplotlib.patches import Rectangle, Polygon
+from matplotlib.patches import Rectangle, Polygon, PathPatch
+from matplotlib.path import Path
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+# shapely is used to (a) merge overlapping/adjacent slots into single shapes for
+# 2D drawing and (b) verify that every random design leaves at least MIN_METAL
+# mm of metal between any two slot features. Falls back to non-merged drawing
+# and skips validation if shapely is not installed.
+try:
+    from shapely.geometry import box as _sh_box, Polygon as _ShPoly
+    from shapely.ops import unary_union as _sh_union
+    HAS_SHAPELY = True
+except ImportError:
+    HAS_SHAPELY = False
 
 
 # ════════════════════════════════════════════════════════════════════════════
 # Locked physical / DFM constants
 # ════════════════════════════════════════════════════════════════════════════
-PLATE   = 50.0    # plate side (mm)
-GRID    = 0.5     # grid pitch (mm)
-THICK   = 1.0     # sheet thickness (mm)
-KERF    = 0.5     # cut kerf (mm)
-BEND_R  = 1.0     # min bend radius (mm)
-VIS_EPS = 0.05    # visualisation-only z gap so PCB top doesn't z-fight legs
+PLATE     = 50.0    # plate side (mm)
+GRID      = 0.5     # grid pitch (mm)
+THICK     = 1.0     # sheet thickness (mm)
+KERF      = 0.5     # cut kerf (mm)
+BEND_R    = 1.0     # min bend radius (mm)
+VIS_EPS   = 0.05    # visualisation-only z gap so PCB top doesn't z-fight legs
+MIN_METAL = 1.0     # minimum metal feature width / slot-to-slot gap / slot-to-edge gap (mm)
 
 STEEL = np.array([0.66, 0.70, 0.78])
 TABC  = np.array([0.55, 0.78, 0.55])
@@ -215,17 +228,36 @@ def draw_crease(ax, design, sym_axes=True, pad=4.0):
         ax.plot([0, 0], [-mx, mx], color="#9a9a9a", lw=0.9, ls=(0, (5, 3, 1, 3)), zorder=0)
     ax.add_patch(Polygon(m['perim'], closed=True, fill=False, ec='k', lw=2.4, zorder=4))
 
-    cuts = list(m.get('cuts', []))
-    for (x0, x1, y0, y1) in cuts:
-        ax.add_patch(Rectangle((x0, y0), x1-x0, y1-y0, fc='white', ec='none', zorder=5))
-    for seg in _boundary_segments(cuts):
-        kind, c, a, b = seg
-        if kind == 'V': ax.plot([c, c], [a, b], color='k', lw=1.0, zorder=6)
-        else:           ax.plot([a, b], [c, c], color='k', lw=1.0, zorder=6)
-
-    # true polygon cuts (e.g. diagonal X-slot) -- drawn as actual parallelograms
-    for poly in m.get('poly_cuts', ()):
-        ax.add_patch(Polygon(poly, closed=True, fc='white', ec='k', lw=1.0, zorder=5))
+    # Merge ALL slot features into a single shape so overlapping slots read
+    # as one blob (not multiple overlapping rectangles + parallelograms).
+    union = _design_cuts_union(design)
+    if union is not None and not union.is_empty:
+        geoms = [union] if union.geom_type == 'Polygon' else list(union.geoms)
+        for poly in geoms:
+            verts, codes = [], []
+            ext = list(poly.exterior.coords)
+            verts.extend(ext)
+            codes.append(Path.MOVETO)
+            codes.extend([Path.LINETO] * (len(ext) - 2))
+            codes.append(Path.CLOSEPOLY)
+            for hole in poly.interiors:
+                inn = list(hole.coords)
+                verts.extend(inn)
+                codes.append(Path.MOVETO)
+                codes.extend([Path.LINETO] * (len(inn) - 2))
+                codes.append(Path.CLOSEPOLY)
+            ax.add_patch(PathPatch(Path(verts, codes), fc='white', ec='k', lw=1.0, zorder=5))
+    else:
+        # shapely missing -> fallback: render cuts + polygons separately
+        cuts = list(m.get('cuts', []))
+        for (x0, x1, y0, y1) in cuts:
+            ax.add_patch(Rectangle((x0, y0), x1-x0, y1-y0, fc='white', ec='none', zorder=5))
+        for seg in _boundary_segments(cuts):
+            kind, c, a, b = seg
+            if kind == 'V': ax.plot([c, c], [a, b], color='k', lw=1.0, zorder=6)
+            else:           ax.plot([a, b], [c, c], color='k', lw=1.0, zorder=6)
+        for poly in m.get('poly_cuts', ()):
+            ax.add_patch(Polygon(poly, closed=True, fc='white', ec='k', lw=1.0, zorder=5))
 
     for (Ax, Ay, Bx, By), mv in m['folds2d']:
         col = MTN if mv == 'M' else VAL
@@ -521,6 +553,62 @@ def make_poly_slot_extras(d, thick=THICK):
     return extras
 
 
+def _slot_shapes(d):
+    """All slot shapes (rects + polygons + interior face['holes']) as shapely
+    geometries. Corner cuts (rects that touch the plate edge) are filtered
+    out because they belong to the radiator outline, not the slot pattern."""
+    if not HAS_SHAPELY: return []
+    P = d.meta['plate'] / 2.0
+    EPS = 0.1
+    out = []
+    seen = set()
+    for r in d.meta.get('cuts', []):
+        out.append(_sh_box(r[0], r[2], r[1], r[3])); seen.add(tuple(r))
+    for r in d.faces[0].get('holes', []):
+        if tuple(r) in seen:
+            continue
+        # skip cuts that touch the plate edge (radiator-outline shapers)
+        if r[0] <= -P + EPS or r[1] >= P - EPS or r[2] <= -P + EPS or r[3] >= P - EPS:
+            continue
+        out.append(_sh_box(r[0], r[2], r[1], r[3]))
+    for p in d.meta.get('poly_cuts', ()):
+        out.append(_ShPoly(p))
+    return out
+
+
+def _design_cuts_union(d):
+    """shapely union of all slot shapes in d (or None)."""
+    shapes = _slot_shapes(d)
+    if not shapes: return None
+    try:
+        return _sh_union(shapes)
+    except Exception:
+        return None
+
+
+def is_valid(d, min_metal=MIN_METAL):
+    """Returns True iff every pair of non-overlapping slot features is at
+    least `min_metal` apart AND every slot is at least `min_metal` from the
+    plate edge. Pairwise distance is a good proxy for 'metal width' when the
+    features are simple primitives (rects and parallelograms)."""
+    if not HAS_SHAPELY: return True
+    feats = _slot_shapes(d)
+    if not feats: return True
+    n = len(feats)
+    for i in range(n):
+        for j in range(i+1, n):
+            if feats[i].intersects(feats[j]):
+                continue
+            if feats[i].distance(feats[j]) < min_metal:
+                return False
+    P = d.meta['plate'] / 2.0
+    plate_b = _sh_box(-P, -P, P, P).exterior
+    for f in feats:
+        if plate_b.distance(f) < min_metal:
+            return False
+    return True
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # Adding slots / extra lances to an already-built design
 # ════════════════════════════════════════════════════════════════════════════
@@ -654,7 +742,21 @@ def four_edge_slits(plate, edge_inset, slit_len, slit_w):
     ]
 
 
-def random_design(rng):
+def random_design(rng, max_retries=25):
+    """Reject-resample wrapper: keep drawing until is_valid passes, so every
+    returned design has >= MIN_METAL mm of metal between any two slot features
+    and to the plate edge. Falls back to the last attempt with a [!] tag if
+    no valid sample is found within `max_retries`."""
+    last = None
+    for _ in range(max_retries):
+        d, title = _build_random_design(rng)
+        last = (d, title)
+        if is_valid(d):
+            return d, title
+    return last[0], last[1] + "  [!min-metal]"
+
+
+def _build_random_design(rng):
     # ---------- 1. plate + legs ----------------------------------------
     plate   = rng.choice(PLATES)
     P       = plate / 2.0
