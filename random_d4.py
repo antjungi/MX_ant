@@ -946,6 +946,54 @@ def four_edge_slits(plate, edge_inset, slit_len, slit_w):
     ]
 
 
+def corner_brackets(d, length, width):
+    """4 corner '⌐' brackets on the diagonals -- each bracket has a horizontal
+    arm and a vertical arm meeting at (sx*d, sy*d), pointing back toward the
+    centre.  The two arms of one bracket are mirror images across the
+    diagonal, and the 4 brackets form a full D4-symmetric set."""
+    w = width / 2.0
+    rects = []
+    for sx, sy in [(1, 1), (1, -1), (-1, 1), (-1, -1)]:
+        cx, cy = sx * d, sy * d
+        if sx > 0:
+            rh = (cx - length, cx,        cy - w,      cy + w)
+        else:
+            rh = (cx,          cx + length, cy - w,    cy + w)
+        if sy > 0:
+            rv = (cx - w,      cx + w,    cy - length, cy)
+        else:
+            rv = (cx - w,      cx + w,    cy,          cy + length)
+        rects.append(rh); rects.append(rv)
+    return rects
+
+
+def diagonal_slits(plate_half, length, width, inset):
+    """4 short slits parallel to each diagonal (45 deg), placed symmetrically
+    near the corners. Returns a list of polygon vertex lists."""
+    d = width / (2.0 * 1.4142135623730951)
+    L = length / (2.0 * 1.4142135623730951)
+    polys = []
+    P = plate_half - inset
+    # centres on the diagonals at +-(P, P), +-(P, -P) etc.
+    for sx, sy in [(1, 1), (-1, -1)]:           # parallel to y=x diagonal
+        cx, cy = sx * (P - L), sy * (P - L)
+        polys.append([
+            (cx - L + d, cy - L - d),
+            (cx + L + d, cy + L - d),
+            (cx + L - d, cy + L + d),
+            (cx - L - d, cy - L + d),
+        ])
+    for sx, sy in [(1, -1), (-1, 1)]:           # parallel to y=-x diagonal
+        cx, cy = sx * (P - L), sy * (P - L)
+        polys.append([
+            (cx - L - d, cy + L - d),
+            (cx + L - d, cy - L - d),
+            (cx + L + d, cy - L + d),
+            (cx - L + d, cy + L + d),
+        ])
+    return polys
+
+
 def random_design(rng, max_retries=25):
     """Reject-resample wrapper: keep drawing until is_valid passes, so every
     returned design has >= MIN_METAL mm of metal between any two slot features
@@ -1016,66 +1064,101 @@ def _build_random_design(rng):
             shape = 'square'
 
     # ---------- 3. independent slot features ---------------------------
-    feats   = []
-    has_ring = False
-    ring_r   = None
+    feats     = []
+    ring_rs   = []                                  # all ring radii placed (sorted)
+    used_radii = []                                 # radii of corner/cardinal holes etc.
 
-    # ring slot
-    if rng.random() < 0.35:
+    def _clear_of_rings(r, m=1.5):
+        return all(abs(r - rr) > m for rr in ring_rs)
+
+    # ---- broken rings (1 to 3 concentric) -----------------------------
+    if rng.random() < 0.55:
+        n_rings = rng.choices([1, 2, 3], weights=[60, 30, 10])[0]
         r_max = leg_inner - 2.5
-        opts  = [r for r in [6.0, 7.0, 8.0, 9.0, 10.0] if r <= r_max]
-        if opts:
-            ring_r = rng.choice(opts)
+        candidates = [r for r in [4.0, 5.5, 7.0, 8.5, 10.0] if r <= r_max]
+        rng.shuffle(candidates)
+        for r in candidates[:n_rings]:
+            if any(abs(r - rr) < 2.5 for rr in ring_rs): continue
             w = rng.choice([0.5, 1.0, 1.5])
-            add_slots(d, broken_ring(ring_r, w, gap=2.0))
-            has_ring = True
-            feats.append(f"ring(r{ring_r:g},w{w})")
+            add_slots(d, broken_ring(r, w, gap=2.0))
+            ring_rs.append(r)
+            feats.append(f"ring(r{r:g},w{w})")
+        ring_rs.sort()
 
-    # cross slot
-    if rng.random() < 0.40:
-        w = rng.choice([0.5, 1.0, 1.5, 2.0, 2.5])
-        L_max = ring_r - 2.0 if has_ring else leg_inner - 1.5
-        L_opts = [L for L in [4.0, 6.0, 8.0, 10.0, 12.0] if 3.0 <= L <= L_max]
-        if L_opts:
-            L = rng.choice(L_opts)
-            add_slots(d, cross_slot(w, length=L))
-            feats.append(f"+(w{w},L{L:g})")
+    has_ring  = bool(ring_rs)
+    ring_min  = min(ring_rs) if has_ring else None
+    ring_max  = max(ring_rs) if has_ring else None
 
-    # diagonal X-slot (TRUE 45-deg parallelogram slots, D4-symmetric -- no grid)
-    if rng.random() < 0.30:
+    # ---- cross slot (twice -- big + small are allowed to stack) -------
+    for trial, p in enumerate([0.60, 0.30]):
+        if rng.random() < p:
+            w = rng.choice([0.5, 1.0, 1.5, 2.0, 2.5])
+            L_max = (ring_min - 2.0) if has_ring else (leg_inner - 1.5)
+            L_opts = [L for L in [3.0, 4.0, 6.0, 8.0, 10.0, 12.0] if 2.5 <= L <= L_max]
+            if trial == 1: L_opts = [L for L in L_opts if L <= 5.0]   # 2nd cross is small
+            if L_opts:
+                L = rng.choice(L_opts)
+                add_slots(d, cross_slot(w, length=L))
+                feats.append(f"+(w{w},L{L:g})")
+
+    # ---- diagonal X-slot (true 45-deg parallelogram) ------------------
+    if rng.random() < 0.45:
         w = rng.choice([0.5, 1.0, 1.5, 2.0])
-        if has_ring:
-            he_max = ring_r / 1.4142 - w/2.0 - 0.5
-        else:
-            he_max = leg_inner - 2.0 - w/2.0
+        he_max = (ring_min/1.4142 - w/2.0 - 0.5) if has_ring else (leg_inner - 2.0 - w/2.0)
         he_opts = [h for h in [3.0, 4.0, 5.0, 6.0, 7.0, 8.0] if h <= he_max]
         if he_opts:
             he = rng.choice(he_opts)
             d.meta.setdefault('poly_cuts', []).extend(x_slot_polygons(he, w))
             feats.append(f"X(he{he:g},w{w})")
 
-    # 4 corner holes
+    # ---- 4 corner-bracket '⌐' slots -----------------------------------
+    if rng.random() < 0.35:
+        w_br  = rng.choice([0.5, 1.0])
+        max_d = (leg_inner - 1.5) / 1.4142
+        d_opts = [v for v in [4.0, 5.0, 6.0, 7.0] if v <= max_d and _clear_of_rings(v*1.4142, 1.0)]
+        if d_opts:
+            db = rng.choice(d_opts)
+            L_max = db - 1.0
+            L_opts = [L for L in [2.0, 3.0, 4.0, 5.0] if L <= L_max]
+            if L_opts:
+                Lb = rng.choice(L_opts)
+                add_slots(d, corner_brackets(db, Lb, w_br))
+                feats.append(f"brk(d{db:g},L{Lb:g})")
+
+    # ---- diagonal slits (parallel to the 4 diagonals, in corners) -----
     if rng.random() < 0.25:
+        sl_w = rng.choice([0.5, 1.0])
+        sl_L = rng.choice([3.0, 4.0, 5.0])
+        inset = rng.choice([3.0, 4.0, 5.0])
+        if P - inset - sl_L/2.0 > leg_inner + leg_len + KERF + 1.0:
+            d.meta.setdefault('poly_cuts', []).extend(
+                diagonal_slits(P, sl_L, sl_w, inset))
+            feats.append(f"dslit(L{sl_L:g})")
+
+    # ---- 4 corner holes -----------------------------------------------
+    if rng.random() < 0.40:
         r_max = leg_inner - 3.0
         opts  = [r for r in [3.0, 4.0, 5.0, 6.0, 7.0]
-                 if r <= r_max and (not has_ring or abs(r - ring_r) > 1.5)]
+                 if r <= r_max and _clear_of_rings(r) and r not in used_radii]
         if opts:
             r = rng.choice(opts); s = rng.choice([1.0, 1.5, 2.0])
             add_slots(d, four_corner_holes(r, s))
+            used_radii.append(r)
             feats.append(f"4cor(r{r:g},s{s})")
 
-    # 4 cardinal small holes
-    if rng.random() < 0.20:
+    # ---- 4 cardinal small holes ---------------------------------------
+    if rng.random() < 0.35:
         r_max = leg_inner - 2.5
         opts  = [r for r in [3.0, 4.0, 5.0, 6.0]
-                 if r <= r_max and (not has_ring or abs(r - ring_r) > 1.5)]
+                 if r <= r_max and _clear_of_rings(r) and r not in used_radii]
         if opts:
             r = rng.choice(opts); s = rng.choice([1.0, 1.5])
             add_slots(d, four_cardinal_holes(r, s))
+            used_radii.append(r)
             feats.append(f"4card(r{r:g})")
 
-    # 4 edge slits (only on plain square radiator -- the cleanest fit)
-    if rng.random() < 0.18 and shape == 'square':
+    # ---- 4 edge slits (only on plain square radiator) -----------------
+    if rng.random() < 0.30 and shape == 'square':
         inset = rng.choice([1.5, 2.0, 2.5])
         e_pos = P - inset
         if e_pos > leg_inner + leg_len + KERF + 1.5:
@@ -1085,18 +1168,18 @@ def _build_random_design(rng):
             add_slots(d, four_edge_slits(plate, inset, slit_L, slit_w))
             feats.append(f"edges(L{slit_L:g})")
 
-    # center square hole
-    if rng.random() < 0.10 and not any('X(' in f for f in feats):
+    # ---- center square hole -------------------------------------------
+    if rng.random() < 0.15 and not any('X(' in f for f in feats):
         s = rng.choice([2.0, 3.0, 4.0])
-        if not has_ring or s/2.0 < ring_r - 1.5:
+        if not has_ring or s/2.0 < ring_min - 1.5:
             add_slots(d, [(-s/2.0, s/2.0, -s/2.0, s/2.0)])
             feats.append(f"cH({s:g})")
 
     # ---------- 4. extra inner lanced tabs -----------------------------
     extras = "-"
-    if rng.random() < 0.35:
+    if rng.random() < 0.50:
         if has_ring:
-            inner_max = ring_r - 2.0
+            inner_max = ring_min - 2.0
             t_in  = rng.choice([2.0, 2.5])
             t_len = rng.choice([2.5, 3.0])
             t_w   = rng.choice([1.5, 2.0])
