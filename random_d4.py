@@ -523,90 +523,229 @@ def four_taps(d, inner, length, width, fold_dir):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# RANDOM D4-symmetric design generator
+# RANDOM D4-symmetric design generator  (diverse mode)
 # ════════════════════════════════════════════════════════════════════════════
-# Parameter ranges are chosen so that *any combination* the sampler picks
-# satisfies 4-connectivity and the 0.5 mm grid.  Notable safety rules:
-#   - tab radii are pulled inward when a ring slot is present, so the tab
-#     opening never reaches the ring (which would destroy all 4 bridges
-#     and cause the inner patch to float)
-#   - cross arm length is shorter when a ring is present, so the cross
-#     never cuts through a ring bridge
-#   - 'concentric' rings skip extra tabs (the inner ring's bridges sit
-#      exactly where small extra tabs would lance from)
+# Everything below is randomly sampled and (mostly) independent:
+#   * plate size              40 / 45 / 50 / 55 / 60 mm
+#   * leg geometry            leg_inner, leg_len, leg_w  (chosen so 4 outer
+#                              legs fit inside the plate with margin)
+#   * radiator transparency   alpha in 0.3..0.7
+#   * radiator outline        square / octagonal / notched / plus / star
+#   * slot features (INDEPENDENT rolls -- a design can have several stacked):
+#       - center cross         widths 0.5..2.5 mm
+#       - broken ring          widths 0.5..1.5 mm, radius respects legs/ring/tab
+#       - 4 corner-diagonal holes
+#       - 4 cardinal small holes
+#       - 4 edge slits         (square radiator only)
+#       - center square hole
+#   * extra inner lanced tabs  4 cardinal UP or DOWN tabs, optional
+#   * view angle               random elev/azim per design (visual variety)
+#
+# Per-feature safety rules avoid the failure modes we hit before:
+#   - cross length is limited to (leg_inner - 1.5) so it never crosses a leg
+#   - when a ring is present, cross/tab/hole radii are kept clear of the
+#     ring's 4 cardinal bridges
+#   - tab inner radius respects ring radius -2 so tab openings never
+#     destroy ring bridges
+#   - notched radiator depth must leave room for the legs
 # ────────────────────────────────────────────────────────────────────────────
-SHAPES = ['square', 'octagonal', 'notched', 'plus', 'star']
-SLOTS  = ['none', 'cross', 'ring', 'concentric', 'cross+ring']
-EXTRAS = ['none', 'up', 'down']
+
+PLATES   = [40.0, 45.0, 50.0, 55.0, 60.0]
+LEG_W    = [3.0, 4.0, 5.0, 6.0]
+LEG_LENS = [5.0, 7.0, 9.0, 11.0, 13.0]
+ALPHAS   = [0.3, 0.4, 0.5, 0.6, 0.7]
+SHAPE_WEIGHTS = [('square', 30), ('octagonal', 15), ('notched', 15),
+                 ('plus', 20), ('star', 20)]
+
+
+def _weighted_pick(rng, weighted):
+    total = sum(w for _, w in weighted)
+    pick = rng.uniform(0, total)
+    s = 0
+    for v, w in weighted:
+        s += w
+        if pick <= s: return v
+    return weighted[-1][0]
+
+
+def four_corner_holes(r, size):
+    """4 small square holes at the 4 diagonal corner positions (D4-sym)."""
+    h = size / 2.0
+    return [
+        ( r-h,  r+h,  r-h,  r+h),
+        (-r-h, -r+h,  r-h,  r+h),
+        ( r-h,  r+h, -r-h, -r+h),
+        (-r-h, -r+h, -r-h, -r+h),
+    ]
+
+
+def four_cardinal_holes(r, size):
+    """4 small square holes on the cardinal axes (D4-sym)."""
+    h = size / 2.0
+    return [
+        ( r-h,  r+h, -h,    h),
+        (-r-h, -r+h, -h,    h),
+        (-h,    h,    r-h,  r+h),
+        (-h,    h,   -r-h, -r+h),
+    ]
+
+
+def four_edge_slits(plate, edge_inset, slit_len, slit_w):
+    """4 slits parallel to and inset from each plate edge (D4-sym)."""
+    P = plate / 2.0
+    e = P - edge_inset
+    sh = slit_len / 2.0
+    sw = slit_w / 2.0
+    return [
+        (-sh, sh,  e-sw,  e+sw),       # top
+        (-sh, sh, -e-sw, -e+sw),       # bottom
+        (-e-sw, -e+sw, -sh, sh),       # left
+        ( e-sw,  e+sw, -sh, sh),       # right
+    ]
+
 
 def random_design(rng):
-    # ---- pick radiator outline ----------------------------------------
-    shape = rng.choice(SHAPES)
-    if shape == 'square':
-        d = base()
-        shape_desc = "square"
-    elif shape == 'octagonal':
+    # ---------- 1. plate + legs ----------------------------------------
+    plate   = rng.choice(PLATES)
+    P       = plate / 2.0
+    leg_w   = rng.choice(LEG_W)
+    leg_len = rng.choice(LEG_LENS)
+
+    inner_max = P - leg_len - KERF - 1.5
+    inner_min = max(7.0, leg_w + 2.5)
+    # if the chosen leg_len is too long for this plate, shorten it
+    while inner_min > inner_max and leg_len > 4.0:
+        leg_len -= 1.0
+        inner_max = P - leg_len - KERF - 1.5
+    inner_choices = [round(inner_min + 0.5*i, 1)
+                     for i in range(int((inner_max - inner_min) * 2) + 1)]
+    inner_choices = [v for v in inner_choices if v <= inner_max]
+    leg_inner = rng.choice(inner_choices) if inner_choices else inner_min
+
+    alpha = rng.choice(ALPHAS)
+    d = planar_on_pcb(plate=plate, leg_inner=leg_inner,
+                      leg_len=leg_len, leg_w=leg_w)
+    d.faces[0]['alpha'] = alpha
+
+    desc = [f"P{int(plate)}", f"leg({leg_inner:g},L{leg_len:g},w{leg_w:g})", f"a{alpha}"]
+
+    # ---------- 2. radiator outline ------------------------------------
+    shape = _weighted_pick(rng, SHAPE_WEIGHTS)
+    if shape == 'octagonal':
         c = rng.choice([2.0, 3.0, 4.0, 5.0])
-        d = chamfer_radiator(base(), chamfer=c)
-        shape_desc = f"octagonal(c={c:.0f})"
+        chamfer_radiator(d, chamfer=c)
+        desc.append(f"oct(c{c:g})")
     elif shape == 'notched':
         nw = rng.choice([3.0, 4.0, 5.0])
         nd = rng.choice([2.0, 3.0, 4.0])
-        d = notched_radiator(base(leg_inner=11.0), notch_hw=nw, notch_d=nd)
-        shape_desc = f"notched(nw={nw:.0f},nd={nd:.0f})"
+        # notch must not eat into leg-opening region
+        if P - nd > leg_inner + leg_len + KERF + 1.0:
+            notched_radiator(d, notch_hw=nw, notch_d=nd)
+            desc.append(f"ntc({nw:g},{nd:g})")
+        else:
+            shape = 'square'
     elif shape == 'plus':
-        a = rng.choice([8.0, 10.0, 12.0])
-        d = plus_radiator(base(), arm_hw=a)
-        shape_desc = f"plus(arm_hw={a:.0f})"
-    else:                                   # star = narrow plus
-        a = rng.choice([5.0, 6.0, 7.0])
-        d = plus_radiator(base(), arm_hw=a)
-        shape_desc = f"star(arm_hw={a:.0f})"
+        opts = [a for a in [8.0, 10.0, 12.0] if a >= leg_w/2.0 + 3.0]
+        if opts:
+            a = rng.choice(opts); plus_radiator(d, arm_hw=a)
+            desc.append(f"plus(a{a:g})")
+        else:
+            shape = 'square'
+    elif shape == 'star':
+        opts = [a for a in [5.0, 6.0, 7.0] if a >= leg_w/2.0 + 2.0]
+        if opts:
+            a = rng.choice(opts); plus_radiator(d, arm_hw=a)
+            desc.append(f"star(a{a:g})")
+        else:
+            shape = 'square'
 
-    # ---- pick slot pattern --------------------------------------------
-    slot = rng.choice(SLOTS)
-    slot_desc = slot
-    if slot == 'cross':
-        w = rng.choice([0.5, 1.5])
-        L = rng.choice([6.0, 8.0, 10.0])
-        add_slots(d, cross_slot(w, length=L))
-        slot_desc = f"cross(w={w}, L={L:.0f})"
-    elif slot == 'ring':
-        r = rng.choice([8.0, 9.0])           # >= 8 so extra tabs (inner<=2.5,L=3) cannot reach it
-        w = rng.choice([0.5, 1.5])
-        add_slots(d, broken_ring(r, w, gap=2.0))
-        slot_desc = f"ring(r={r:.0f}, w={w})"
-    elif slot == 'concentric':
-        r1 = rng.choice([3.5, 4.0])
-        r2 = rng.choice([8.5, 9.0])
-        add_slots(d, broken_ring(r1, 0.5, gap=1.5) + broken_ring(r2, 0.5, gap=1.5))
-        slot_desc = f"concentric(r={r1},{r2})"
-    elif slot == 'cross+ring':
-        r  = rng.choice([8.0, 9.0])
-        wc = rng.choice([0.5, 1.0])
-        L  = 6.0                              # short cross so it stays inside the ring
-        add_slots(d, cross_slot(wc, length=L) + broken_ring(r, 0.5, gap=1.5))
-        slot_desc = f"cross+ring(L={L:.0f},r={r:.0f})"
+    # ---------- 3. independent slot features ---------------------------
+    feats   = []
+    has_ring = False
+    ring_r   = None
 
-    # ---- pick extra fold tabs -----------------------------------------
-    # concentric rings + extra inner tabs would destroy the inner ring's
-    # bridges, so we skip extras whenever the slot is 'concentric'.
-    options = EXTRAS if slot != 'concentric' else ['none']
-    extra = rng.choice(options)
-    extra_desc = extra
-    if extra in ('up', 'down'):
-        if slot in ('none', 'cross'):
-            inner = rng.choice([3.0, 4.0, 5.0])
-            length = rng.choice([3.0, 4.0])
-            width  = rng.choice([2.0, 2.5])
-        else:                                 # ring / cross+ring -- keep tabs near centre
-            inner = rng.choice([2.0, 2.5])
-            length = 3.0
-            width  = 2.0
-        four_taps(d, inner=inner, length=length, width=width, fold_dir=extra)
-        extra_desc = f"{extra}(in={inner},L={length:.0f},w={width})"
+    # ring slot
+    if rng.random() < 0.35:
+        r_max = leg_inner - 2.5
+        opts  = [r for r in [6.0, 7.0, 8.0, 9.0, 10.0] if r <= r_max]
+        if opts:
+            ring_r = rng.choice(opts)
+            w = rng.choice([0.5, 1.0, 1.5])
+            add_slots(d, broken_ring(ring_r, w, gap=2.0))
+            has_ring = True
+            feats.append(f"ring(r{ring_r:g},w{w})")
 
-    title = f"{shape_desc}  |  slots: {slot_desc}  |  extra: {extra_desc}"
+    # cross slot
+    if rng.random() < 0.45:
+        w = rng.choice([0.5, 1.0, 1.5, 2.0, 2.5])
+        L_max = ring_r - 2.0 if has_ring else leg_inner - 1.5
+        L_opts = [L for L in [4.0, 6.0, 8.0, 10.0, 12.0] if 3.0 <= L <= L_max]
+        if L_opts:
+            L = rng.choice(L_opts)
+            add_slots(d, cross_slot(w, length=L))
+            feats.append(f"X(w{w},L{L:g})")
+
+    # 4 corner holes
+    if rng.random() < 0.25:
+        r_max = leg_inner - 3.0
+        opts  = [r for r in [3.0, 4.0, 5.0, 6.0, 7.0]
+                 if r <= r_max and (not has_ring or abs(r - ring_r) > 1.5)]
+        if opts:
+            r = rng.choice(opts); s = rng.choice([1.0, 1.5, 2.0])
+            add_slots(d, four_corner_holes(r, s))
+            feats.append(f"4cor(r{r:g},s{s})")
+
+    # 4 cardinal small holes
+    if rng.random() < 0.20:
+        r_max = leg_inner - 2.5
+        opts  = [r for r in [3.0, 4.0, 5.0, 6.0]
+                 if r <= r_max and (not has_ring or abs(r - ring_r) > 1.5)]
+        if opts:
+            r = rng.choice(opts); s = rng.choice([1.0, 1.5])
+            add_slots(d, four_cardinal_holes(r, s))
+            feats.append(f"4card(r{r:g})")
+
+    # 4 edge slits (only on plain square radiator -- the cleanest fit)
+    if rng.random() < 0.18 and shape == 'square':
+        inset = rng.choice([1.5, 2.0, 2.5])
+        e_pos = P - inset
+        if e_pos > leg_inner + leg_len + KERF + 1.5:
+            slit_w = rng.choice([0.5, 1.0])
+            slit_L = rng.choice([6.0, 8.0, 10.0, 12.0])
+            slit_L = min(slit_L, plate - 8.0)
+            add_slots(d, four_edge_slits(plate, inset, slit_L, slit_w))
+            feats.append(f"edges(L{slit_L:g})")
+
+    # center square hole
+    if rng.random() < 0.10 and not any('X(' in f for f in feats):
+        s = rng.choice([2.0, 3.0, 4.0])
+        if not has_ring or s/2.0 < ring_r - 1.5:
+            add_slots(d, [(-s/2.0, s/2.0, -s/2.0, s/2.0)])
+            feats.append(f"cH({s:g})")
+
+    # ---------- 4. extra inner lanced tabs -----------------------------
+    extras = "-"
+    if rng.random() < 0.35:
+        if has_ring:
+            inner_max = ring_r - 2.0
+            t_in  = rng.choice([2.0, 2.5])
+            t_len = rng.choice([2.5, 3.0])
+            t_w   = rng.choice([1.5, 2.0])
+            ok    = t_in < inner_max
+        else:
+            inner_max = leg_inner - 5.0
+            ok = inner_max >= 3.0
+            if ok:
+                t_in  = rng.choice([v for v in [3.0, 4.0, 5.0, 6.0] if v <= inner_max])
+                t_len = rng.choice([3.0, 4.0, 5.0])
+                t_w   = rng.choice([2.0, 2.5, 3.0])
+        if ok:
+            fold_dir = rng.choice(['up', 'down'])
+            four_taps(d, inner=t_in, length=t_len, width=t_w, fold_dir=fold_dir)
+            extras = f"4{fold_dir}({t_in:g},L{t_len:g})"
+
+    feat_str = " + ".join(feats) if feats else "plain"
+    title = " | ".join(desc) + f" | {feat_str} | tabs:{extras}"
     return d, title
 
 
@@ -628,15 +767,17 @@ if __name__ == "__main__":
         pcb     = pcb_box(plate_size=d.meta['plate'],
                           top_z=-d.meta['leg_drop'] - VIS_EPS)
         fillets = bend_fillet_extras(d)
+        view = (rng.uniform(14.0, 34.0), rng.uniform(-65.0, -30.0))
         fig = plt.figure(num=f"{i:02d}  {title}", figsize=(14, 7))
         axc = fig.add_subplot(1, 2, 1)
         draw_crease(axc, d)
         axc.set_title(f"({i:02d}) Flat pattern (D4-sym)", fontsize=12, fontweight="bold")
         ax3 = fig.add_subplot(1, 2, 2, projection="3d")
-        render_assembly(ax3, d, extras=list(pcb), fillets=list(fillets), view=(22, -48))
-        ax3.set_title("Folded 3D  (alpha=0.45 radiator)", fontsize=12, fontweight="bold")
+        render_assembly(ax3, d, extras=list(pcb), fillets=list(fillets), view=view)
+        ax3.set_title(f"Folded 3D  (view {view[0]:.0f},{view[1]:.0f})",
+                      fontsize=12, fontweight="bold")
         fig.legend(handles=legend, loc="lower center", ncol=3, fontsize=10,
                    frameon=True, bbox_to_anchor=(0.5, 0.01))
-        fig.suptitle(title, fontsize=12)
+        fig.suptitle(title, fontsize=11)
         fig.tight_layout(rect=[0, 0.06, 1, 0.95])
     plt.show()
