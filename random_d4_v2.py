@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-random_d4.py  —  single-file (no external project modules).
+random_d4_v2.py  —  single-file (no external project modules).
+
+v2 vs v1 (random_d4.py):
+  * NEW radiator outline 'tooth' (castellated D4-sym): a long-perimeter
+    outline carved with N inward teeth per side -- mirror-symmetric within
+    each side, leg-attach region preserved
+  * NEW _design_metrics(d) -> (outline_length_mm, plate^2 * leg_drop_mm^3),
+    used to bias the random sampler toward long edge / small fold volume
+  * Each title now leads with 'L=... V=... FoM=L/V^(1/3) | ...' so the
+    perimeter-vs-volume figure of merit is visible per design
+  * Robustness: outline-shaping holes (any hole touching the plate edge)
+    are skipped from the metal-difference and walls -- they're already in
+    the perim and re-subtracting them broke GEOS for tooth designs
 
 Randomly generates N D4-symmetric press-type planar antenna designs and
 opens N interactive Matplotlib windows.  Set SEED below to reproduce a
@@ -9,15 +21,17 @@ run; leave it None for fresh random samples each time.
 
 What is randomly drawn for each design:
   * radiator outline  : square | octagonal | side-notched | plus | star
+                        | tooth (castellated)
                         (with random sub-parameters within safe ranges)
   * slot pattern      : none | cross | ring | concentric rings | cross+ring
-                        (slot widths are either 0.5 mm or 1.5 mm)
+                        | corner brackets | diagonal slits | X-slot
   * extra fold tabs   : none | 4 inner UP-tabs | 4 inner DOWN-tabs
 
 All designs satisfy the locked physical / DFM spec:
-  plate    50 x 50 mm    thickness 1 mm    grid 0.5 mm
-  kerf     0.5 mm        bend radius 1 mm
-  metal/gap min width    0.5 mm (both polarities)
+  plate    40-60 mm side  thickness 1 mm    grid 0.5 mm
+  kerf     0.5 mm         bend radius 1 mm
+  metal/gap min width    1.0 mm everywhere on the patch (morphological
+                         erosion check + pairwise feature distance)
   4-connectivity         no floating pieces (ring slots use 4 cardinal
                          bridges; combination constraints below keep the
                          bridges intact)
@@ -349,9 +363,17 @@ def _face0_shapely_quads(d, thick=THICK):
         x0, x1, y0, y1 = f['rect']
         rad = _ShPoly([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
 
-    # ---- metal = radiator MINUS union(all holes + polygon cuts) -------
+    # ---- metal = radiator MINUS union(all interior holes + polygon cuts) -
+    # Outline-shaping cuts (those touching the plate edge) are skipped --
+    # they're already part of the perim, and re-subtracting can cause GEOS
+    # to choke on coincident boundaries.
+    P = d.meta['plate'] / 2.0
+    EPS = 0.1
     all_cuts = []
     for h in f.get('holes', []):
+        if (h[0] <= -P + EPS or h[1] >= P - EPS or
+            h[2] <= -P + EPS or h[3] >= P - EPS):
+            continue
         all_cuts.append(_sh_box(h[0], h[2], h[1], h[3]))
     for p in d.meta.get('poly_cuts', ()):
         all_cuts.append(_ShPoly(p))
@@ -647,6 +669,78 @@ def notched_radiator(d, notch_hw=4.0, notch_d=3.0):
     return d
 
 
+def tooth_radiator(d, n_per_half=2, tooth_w=2.0, tooth_d=2.0,
+                   leg_margin=4.0, corner_margin=2.0):
+    """Castellated D4-symmetric outline: n_per_half teeth per half-side
+    (so 2*n_per_half teeth per side, 8*n_per_half total). Teeth dip inward
+    by `tooth_d` and are `tooth_w` wide along the edge. They are mirror-
+    symmetric about each side's midpoint and stay `leg_margin` away from it
+    so the lance-tab attachment region is untouched.
+
+    This is the 'long-outline' generator: increases the radiator's outer
+    perimeter length without changing the bounding plate dimensions, which
+    is useful when the design objective is 'long electrical edge, small
+    folded volume'."""
+    h = d.meta['plate'] / 2.0
+    # Corner margin must be at least tooth_d + tooth_w/2 + 1 so the outermost
+    # tooth on one edge and the first tooth on the perpendicular edge can't
+    # carve into each other's space at the corner (which would create a
+    # self-intersecting perim).
+    corner_margin = max(corner_margin, tooth_d + tooth_w / 2.0 + 1.0)
+    span = (h - corner_margin) - leg_margin
+    if n_per_half < 1 or span <= 0: return d
+    step = span / n_per_half
+    if step < tooth_w + 1.0: return d                # teeth would touch / overlap
+    offs = [leg_margin + step * (i + 0.5) for i in range(n_per_half)]
+    tw = tooth_w / 2.0; td = tooth_d
+    centers = sorted([-o for o in offs] + offs)
+
+    perim, notches = [], []
+    perim.append((-h, -h))
+    for cx in centers:
+        perim.extend([(cx - tw, -h),     (cx - tw, -h + td),
+                      (cx + tw, -h + td),(cx + tw, -h)])
+        notches.append((cx - tw, cx + tw, -h, -h + td))
+    perim.append(( h, -h))
+    for cy in centers:
+        perim.extend([( h,      cy - tw),( h - td, cy - tw),
+                      ( h - td, cy + tw),( h,      cy + tw)])
+        notches.append(( h - td, h, cy - tw, cy + tw))
+    perim.append(( h,  h))
+    for cx in reversed(centers):
+        perim.extend([(cx + tw,  h),     (cx + tw,  h - td),
+                      (cx - tw,  h - td),(cx - tw,  h)])
+        notches.append((cx - tw, cx + tw, h - td, h))
+    perim.append((-h,  h))
+    for cy in reversed(centers):
+        perim.extend([(-h,      cy + tw),(-h + td, cy + tw),
+                      (-h + td, cy - tw),(-h,      cy - tw)])
+        notches.append((-h, -h + td, cy - tw, cy + tw))
+
+    d.faces[0]['perim'] = perim
+    d.faces[0]['holes'] = list(d.faces[0]['holes']) + notches
+    d.meta['perim'] = perim
+    return d
+
+
+def _design_metrics(d):
+    """(outline_length_mm, bounding_volume_mm3).
+    outline_length : length of the radiator outer perimeter (the thick
+                     black line in the 2D crease). Higher = longer
+                     electrically-active edge.
+    bounding_vol   : plate * plate * leg_drop, the volume of the 6-face
+                     hexahedron that the folded design fits inside
+                     (top radiator + 4 side legs + open bottom).
+                     Lower = more compact."""
+    perim = d.meta['perim']
+    n = len(perim)
+    L = sum(((perim[i][0] - perim[(i+1) % n][0])**2 +
+             (perim[i][1] - perim[(i+1) % n][1])**2) ** 0.5
+            for i in range(n))
+    V = d.meta['plate'] ** 2 * d.meta.get('leg_drop', 0.0)
+    return L, V
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # Slot patterns (D4-symmetric)
 # ════════════════════════════════════════════════════════════════════════════
@@ -765,9 +859,12 @@ def _design_cuts_union(d):
 
 
 def _metal_polygon(d):
-    """The radiator's actual metal region (rad MINUS every hole, including
-    bend_exts which physically have no metal even though the bend rule
-    exempts them for the min-width check)."""
+    """The radiator's actual metal region (rad MINUS every interior hole,
+    including bend_exts which physically have no metal even though the
+    bend rule exempts them for the min-width check). Corner / outline-shaping
+    cuts (rects that TOUCH the plate edge) are skipped -- those are already
+    absorbed into the perim polygon, and subtracting them again would create
+    a GEOS topology conflict on exact boundary edges."""
     if not HAS_SHAPELY: return None
     f = d.faces[0]
     if 'perim' in f:
@@ -775,8 +872,13 @@ def _metal_polygon(d):
     else:
         x0, x1, y0, y1 = f['rect']
         rad = _ShPoly([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+    P = d.meta['plate'] / 2.0
+    EPS = 0.1
     cuts = []
     for h in f.get('holes', []):
+        if (h[0] <= -P + EPS or h[1] >= P - EPS or
+            h[2] <= -P + EPS or h[3] >= P - EPS):
+            continue                                # outline cut -> in perim
         cuts.append(_sh_box(h[0], h[2], h[1], h[3]))
     for p in d.meta.get('poly_cuts', ()):
         cuts.append(_ShPoly(p))
@@ -914,8 +1016,8 @@ PLATES   = [40.0, 45.0, 50.0, 55.0, 60.0]
 LEG_W    = [3.0, 4.0, 5.0, 6.0]
 LEG_LENS = [5.0, 7.0, 9.0, 11.0, 13.0]
 ALPHAS   = [0.75, 0.85, 0.95]
-SHAPE_WEIGHTS = [('square', 55), ('octagonal', 15), ('notched', 12),
-                 ('plus',   10), ('star',       8)]
+SHAPE_WEIGHTS = [('square',  35), ('octagonal', 10), ('notched',  8),
+                 ('plus',     7), ('star',       5), ('tooth',  35)]
 
 
 def _weighted_pick(rng, weighted):
@@ -1080,6 +1182,14 @@ def _build_random_design(rng):
             desc.append(f"star(a{a:g})")
         else:
             shape = 'square'
+    elif shape == 'tooth':
+        # Castellated outline -- long perimeter, small bounding volume.
+        nh = rng.choice([1, 2, 3, 4])
+        tw = rng.choice([1.5, 2.0, 2.5])
+        td = rng.choice([1.5, 2.0, 2.5, 3.0])
+        lm = max(leg_w/2.0 + 2.5, rng.choice([4.0, 5.0, 6.0]))
+        tooth_radiator(d, n_per_half=nh, tooth_w=tw, tooth_d=td, leg_margin=lm)
+        desc.append(f"tooth(n{nh},w{tw:g},d{td:g})")
 
     # ---------- 3. independent slot features ---------------------------
     feats     = []
@@ -1215,7 +1325,13 @@ def _build_random_design(rng):
             extras = f"4{fold_dir}({t_in:g},L{t_len:g})"
 
     feat_str = " + ".join(feats) if feats else "plain"
-    title = " | ".join(desc) + f" | {feat_str} | tabs:{extras}"
+    L, V = _design_metrics(d)
+    # L  = outer-perimeter length (longer ⇒ longer electrical edge)
+    # V  = plate^2 * leg_drop (smaller ⇒ more compact 6-face fold)
+    # L/V^(1/3) is the dimensionless 'edge-per-compactness' figure of merit.
+    fom = L / (V ** (1.0/3.0)) if V > 0 else 0.0
+    title = (f"L={L:.0f}mm V={V:.0f}mm³ FoM={fom:.2f} | "
+             + " | ".join(desc) + f" | {feat_str} | tabs:{extras}")
     return d, title
 
 
