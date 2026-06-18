@@ -471,6 +471,26 @@ def broken_ring(radius, width, gap=1.5):
     ]
 
 
+def diagonal_strip(half_extent, cell_size=1.0, sign=+1, step=None):
+    """Stair-stepped axis-aligned approximation of a 45-degree diagonal slot.
+    sign=+1 -> along y=x.  sign=-1 -> along y=-x.  The default step (cell/2)
+    makes the cells overlap so the union reads as a continuous diagonal stripe."""
+    if step is None: step = cell_size / 2.0
+    rects = []; n = int(half_extent / step)
+    for i in range(-n, n + 1):
+        c = i * step
+        cy = sign * c
+        rects.append((c - cell_size/2.0, c + cell_size/2.0,
+                      cy - cell_size/2.0, cy + cell_size/2.0))
+    return rects
+
+
+def x_slot(half_extent, cell_size=1.0):
+    """Diagonal 'X' slot (both diagonals together). D4-symmetric."""
+    return (diagonal_strip(half_extent, cell_size, +1)
+          + diagonal_strip(half_extent, cell_size, -1))
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # Adding slots / extra lances to an already-built design
 # ════════════════════════════════════════════════════════════════════════════
@@ -676,14 +696,27 @@ def random_design(rng):
             feats.append(f"ring(r{ring_r:g},w{w})")
 
     # cross slot
-    if rng.random() < 0.45:
+    if rng.random() < 0.40:
         w = rng.choice([0.5, 1.0, 1.5, 2.0, 2.5])
         L_max = ring_r - 2.0 if has_ring else leg_inner - 1.5
         L_opts = [L for L in [4.0, 6.0, 8.0, 10.0, 12.0] if 3.0 <= L <= L_max]
         if L_opts:
             L = rng.choice(L_opts)
             add_slots(d, cross_slot(w, length=L))
-            feats.append(f"X(w{w},L{L:g})")
+            feats.append(f"+(w{w},L{L:g})")
+
+    # diagonal X-slot (stair-stepped 45-deg slot, D4-symmetric)
+    if rng.random() < 0.30:
+        cs = rng.choice([1.0, 1.5, 2.0])
+        if has_ring:
+            he_max = ring_r / 1.4142 - cs/2.0 - 0.5
+        else:
+            he_max = leg_inner - 2.0 - cs/2.0
+        he_opts = [h for h in [3.0, 4.0, 5.0, 6.0, 7.0, 8.0] if h <= he_max]
+        if he_opts:
+            he = rng.choice(he_opts)
+            add_slots(d, x_slot(he, cell_size=cs))
+            feats.append(f"X(he{he:g},c{cs})")
 
     # 4 corner holes
     if rng.random() < 0.25:
@@ -762,22 +795,34 @@ if __name__ == "__main__":
         Line2D([0], [0], color=MTN, lw=1.8, ls=(0,(6,4)),     label="MOUNTAIN +90 (UP)"),
         Line2D([0], [0], color=VAL, lw=2.4, ls=(0,(1,2.5)),   label="VALLEY -90 (DOWN)"),
     ]
-    for i in range(1, N+1):
-        d, title = random_design(rng)
-        pcb     = pcb_box(plate_size=d.meta['plate'],
-                          top_z=-d.meta['leg_drop'] - VIS_EPS)
-        fillets = bend_fillet_extras(d)
-        view = (rng.uniform(14.0, 34.0), rng.uniform(-65.0, -30.0))
-        fig = plt.figure(num=f"{i:02d}  {title}", figsize=(14, 7))
-        axc = fig.add_subplot(1, 2, 1)
-        draw_crease(axc, d)
-        axc.set_title(f"({i:02d}) Flat pattern (D4-sym)", fontsize=12, fontweight="bold")
-        ax3 = fig.add_subplot(1, 2, 2, projection="3d")
-        render_assembly(ax3, d, extras=list(pcb), fillets=list(fillets), view=view)
-        ax3.set_title(f"Folded 3D  (view {view[0]:.0f},{view[1]:.0f})",
-                      fontsize=12, fontweight="bold")
-        fig.legend(handles=legend, loc="lower center", ncol=3, fontsize=10,
-                   frameon=True, bbox_to_anchor=(0.5, 0.01))
-        fig.suptitle(title, fontsize=11)
-        fig.tight_layout(rect=[0, 0.06, 1, 0.95])
+    # pre-generate all N designs first so we can pair them across figures
+    drawn = [random_design(rng) for _ in range(N)]
+
+    # 2 designs per figure : top row = case A, bottom row = case B
+    for fig_idx in range(0, N, 2):
+        fig = plt.figure(num=f"page {fig_idx//2 + 1}", figsize=(15, 11))
+        for sub in range(2):
+            idx = fig_idx + sub
+            if idx >= N: break
+            d, title = drawn[idx]
+            pcb     = pcb_box(plate_size=d.meta['plate'],
+                              top_z=-d.meta['leg_drop'] - VIS_EPS)
+            fillets = bend_fillet_extras(d)
+            view = (rng.uniform(14.0, 34.0), rng.uniform(-65.0, -30.0))
+
+            axc = fig.add_subplot(2, 2, sub*2 + 1)
+            draw_crease(axc, d)
+            axc.set_title(f"#{idx+1}  {title}", fontsize=9, fontweight="bold")
+
+            ax3 = fig.add_subplot(2, 2, sub*2 + 2, projection="3d")
+            render_assembly(ax3, d, extras=list(pcb), fillets=list(fillets), view=view)
+            ax3.set_title(f"Folded 3D  (view {view[0]:.0f},{view[1]:.0f})",
+                          fontsize=10, fontweight="bold")
+
+        fig.legend(handles=legend, loc="lower center", ncol=3, fontsize=9,
+                   frameon=True, bbox_to_anchor=(0.5, 0.005))
+        fig.suptitle(f"Random D4 designs — page {fig_idx//2 + 1} "
+                     f"(cases {fig_idx+1} & {min(fig_idx+2, N)})",
+                     fontsize=12, fontweight="bold")
+        fig.tight_layout(rect=[0, 0.03, 1, 0.96])
     plt.show()
