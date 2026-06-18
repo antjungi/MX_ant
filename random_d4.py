@@ -29,7 +29,7 @@ import matplotlib.pyplot as plt           # interactive backend left to the user
 from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle, Polygon, PathPatch
 from matplotlib.path import Path
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection, Line3DCollection
 
 # shapely is used to (a) merge overlapping/adjacent slots into single shapes for
 # 2D drawing and (b) verify that every random design leaves at least MIN_METAL
@@ -393,13 +393,19 @@ def _face0_shapely_quads(d, thick=THICK):
     return out
 
 
-def render_assembly(ax, design, extras=(), fillets=(), view=(26, -52), thick=THICK):
+def render_assembly(ax, design, extras=(), fillets=(), view=(26, -52), thick=THICK,
+                    pcb_frame=None):
     """Render the whole assembly into ONE Poly3DCollection so depth-sorting is
-    consistent across PCB / radiator / legs / fillets. Polygon slots in face 0
-    are TRUE subtractions (shapely) rather than dark overlay patches."""
+    consistent across radiator, legs, fillets, and extras. Polygon slots in
+    face 0 are TRUE subtractions (shapely Polygon.difference + constrained
+    Delaunay triangulation) -- the same operation HFSS does when you select
+    two shapes and subtract one from the other.
+
+    pcb_frame: optional (plate_size, top_z, pcb_thick) -> draws the PCB as a
+    plain wireframe of its bounding box (no fill, no colour); the corners are
+    fed into the bbox so the camera still includes the PCB volume."""
     face0 = _face0_shapely_quads(design, thick)
     if face0 is not None:
-        # use shapely-aware face 0; engine handles faces 1+
         main_quads = list(face0)
         for i in range(1, len(design.faces)):
             main_quads.extend(design._face_quads(i, thick))
@@ -408,6 +414,17 @@ def render_assembly(ax, design, extras=(), fillets=(), view=(26, -52), thick=THI
 
     all_quads = list(extras) + main_quads + list(fillets)
     polys, cols, pts = _shade_quads(all_quads)
+
+    if pcb_frame is not None:
+        plate, top_z, pcb_thick = pcb_frame
+        P = plate / 2.0
+        z0, z1 = top_z - pcb_thick, top_z
+        corners = [(-P,-P,z0),(P,-P,z0),(P,P,z0),(-P,P,z0),
+                   (-P,-P,z1),(P,-P,z1),(P,P,z1),(-P,P,z1)]
+        edges = [(0,1),(1,2),(2,3),(3,0),(4,5),(5,6),(6,7),(7,4),(0,4),(1,5),(2,6),(3,7)]
+        segs = [(corners[a], corners[b]) for a, b in edges]
+        ax.add_collection3d(Line3DCollection(segs, colors='#888888', linewidths=0.9))
+        pts += corners
 
     pc = Poly3DCollection(polys, facecolors=cols, edgecolor='none')
     pc.set_zsort('average')
@@ -1031,8 +1048,6 @@ if __name__ == "__main__":
             idx = fig_idx + sub
             if idx >= N: break
             d, title = drawn[idx]
-            pcb     = pcb_box(plate_size=d.meta['plate'],
-                              top_z=-d.meta['leg_drop'] - VIS_EPS)
             fillets = bend_fillet_extras(d)
             # if shapely is unavailable, fall back to the dark-overlay extras
             # for polygon slots; otherwise render_assembly subtracts them itself
@@ -1044,8 +1059,10 @@ if __name__ == "__main__":
             axc.set_title(f"#{idx+1}  {title}", fontsize=9, fontweight="bold")
 
             ax3 = fig.add_subplot(2, 2, sub*2 + 2, projection="3d")
-            render_assembly(ax3, d, extras=list(pcb) + slot_extras,
-                            fillets=list(fillets), view=view)
+            render_assembly(ax3, d, extras=slot_extras,
+                            fillets=list(fillets), view=view,
+                            pcb_frame=(d.meta['plate'],
+                                       -d.meta['leg_drop'] - VIS_EPS, 1.6))
             ax3.set_title(f"Folded 3D  (view {view[0]:.0f},{view[1]:.0f})",
                           fontsize=10, fontweight="bold")
 
