@@ -314,42 +314,44 @@ def _set_axes_equal_from_pts(ax, pts, view):
 
 
 def _face0_shapely_quads(d, thick=THICK):
-    """Replacement face-0 (radiator) quads with TRUE polygon-slot subtraction.
-    Returns None if shapely isn't available or face 0 has no polygon cuts -- in
-    that case render_assembly falls back to the rect-only engine path."""
-    if (not HAS_SHAPELY) or (not d.meta.get('poly_cuts')):
+    """Face-0 (radiator) quads with TRUE Boolean subtraction. The radiator
+    polygon has the union of all slot shapes (rects + polygons) carved out
+    of it (rad.difference(union(slots))), then the metal region is
+    triangulated to feed Poly3DCollection. The slot WALLS are drawn along
+    the union's BOUNDARY -- so overlapping or adjacent slot edges that sit
+    *inside* the merged shape are not rendered. Only the outer + inner
+    silhouette of the combined slot is left, like an HFSS subtract."""
+    if not HAS_SHAPELY:
         return None
-
     f = d.faces[0]
+    if not f.get('holes') and not d.meta.get('poly_cuts'):
+        return None       # no cuts -> defer to the rect-only engine
+
     rgb   = f.get('col',  STEEL)
     alpha = f.get('alpha', 1.0)
 
-    # Radiator outline as a shapely polygon
+    # ---- radiator outline ---------------------------------------------
     if 'perim' in f:
         rad = _ShPoly(f['perim'])
     else:
         x0, x1, y0, y1 = f['rect']
         rad = _ShPoly([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
 
-    # Subtract ALL holes (rect + polygon) -> metal region
-    cuts = []
+    # ---- metal = radiator MINUS union(all holes + polygon cuts) -------
+    all_cuts = []
     for h in f.get('holes', []):
-        cuts.append(_sh_box(h[0], h[2], h[1], h[3]))
+        all_cuts.append(_sh_box(h[0], h[2], h[1], h[3]))
     for p in d.meta.get('poly_cuts', ()):
-        cuts.append(_ShPoly(p))
-
-    if cuts:
-        metal = rad.difference(_sh_union(cuts))
-    else:
-        metal = rad
+        all_cuts.append(_ShPoly(p))
+    metal = rad.difference(_sh_union(all_cuts)) if all_cuts else rad
     if metal.is_empty:
         return []
 
+    out = []
     parts = [metal] if metal.geom_type == 'Polygon' else list(metal.geoms)
 
-    out = []
+    # triangulated top + bottom faces of the metal
     for part in parts:
-        # constrained Delaunay: triangulate vertices, keep tris whose centre lies inside
         for tri in _sh_triangulate(part):
             if not part.contains(tri.centroid):
                 continue
@@ -359,7 +361,7 @@ def _face0_shapely_quads(d, thick=THICK):
             out.append((top, rgb, alpha))
             out.append((bot, rgb, alpha))
 
-    # Outer perim walls (use face['perim'] if given, else rect corners)
+    # outer-perimeter walls (always drawn -- the radiator's outline)
     perim = f.get('perim', None)
     if perim is None:
         x0, x1, y0, y1 = f['rect']
@@ -371,25 +373,31 @@ def _face0_shapely_quads(d, thick=THICK):
                      (p1[0], p1[1], -thick/2.0),
                      (p0[0], p0[1], -thick/2.0)], rgb, alpha))
 
-    # Walls along rectangular hole_walls (skips bend-relief like before)
+    # ---- slot walls = boundary of union(hole_walls + poly_cuts) -------
+    # Critical change: walls are emitted ONLY along the outer / inner
+    # silhouette of the MERGED slot shape, so adjacent slot rects and the
+    # diagonal parallelograms don't leave internal walls visible after
+    # they're combined.
+    wall_shapes = []
     for h in f.get('hole_walls', f.get('holes', [])):
-        x0, x1, y0, y1 = h
-        for (p0, p1) in [((x0, y0), (x1, y0)), ((x1, y0), (x1, y1)),
-                         ((x1, y1), (x0, y1)), ((x0, y1), (x0, y0))]:
-            out.append(([(p0[0], p0[1],  thick/2.0),
-                         (p1[0], p1[1],  thick/2.0),
-                         (p1[0], p1[1], -thick/2.0),
-                         (p0[0], p0[1], -thick/2.0)], rgb, alpha))
-
-    # Walls along polygon-slot edges (the new diagonal cuts)
+        wall_shapes.append(_sh_box(h[0], h[2], h[1], h[3]))
     for p in d.meta.get('poly_cuts', ()):
-        n = len(p)
-        for k in range(n):
-            x0, y0 = p[k]; x1, y1 = p[(k+1) % n]
-            out.append(([(x0, y0,  thick/2.0),
-                         (x1, y1,  thick/2.0),
-                         (x1, y1, -thick/2.0),
-                         (x0, y0, -thick/2.0)], rgb, alpha))
+        wall_shapes.append(_ShPoly(p))
+
+    if wall_shapes:
+        wall_union = _sh_union(wall_shapes)
+        wparts = [wall_union] if wall_union.geom_type == 'Polygon' else list(wall_union.geoms)
+        for wp in wparts:
+            boundaries = [list(wp.exterior.coords)]
+            for inter in wp.interiors:
+                boundaries.append(list(inter.coords))
+            for coords in boundaries:
+                for k in range(len(coords) - 1):
+                    x0, y0 = coords[k]; x1, y1 = coords[k+1]
+                    out.append(([(x0, y0,  thick/2.0),
+                                 (x1, y1,  thick/2.0),
+                                 (x1, y1, -thick/2.0),
+                                 (x0, y0, -thick/2.0)], rgb, alpha))
     return out
 
 
@@ -521,7 +529,7 @@ def planar_on_pcb(plate=PLATE, leg_inner=14.0, leg_len=8.0, leg_w=5.0, bend_r=BE
             tab2 = (tab[0], tab[1], tab[2], tab[3]-bend_r)
             bend_ext = (-hw, hw, -leg_inner, -leg_inner+bend_r)
         holes.append(hole); holes.append(bend_ext)
-        legfaces.append(dict(rect=tab2, col=TABC))
+        legfaces.append(dict(rect=tab2))
         folds.append((0, 1+k, line, -th_up))                # NEGATE -> fold DOWN
         folds2d.append((line, 'V'))                          # valley = down to PCB
     faces = [dict(rect=(-P,P,-P,P), holes=holes, hole_walls=cuts)] + legfaces
@@ -751,7 +759,7 @@ def add_extra_lance(d, direction, inner, length, width, fold_dir, bend_r=BEND_R)
     d.faces[0]['holes']      += [hole, bend_ext]
     d.faces[0]['hole_walls'] += kerf_strips
     new_idx = len(d.faces)
-    d.faces.append(dict(rect=tab2, col=TABC))
+    d.faces.append(dict(rect=tab2))
     d.folds.append((0, new_idx, line, theta))
     d.kids.setdefault(0, []).append((new_idx, line, theta))
     d.meta['cuts']    += kerf_strips
