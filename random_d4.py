@@ -56,10 +56,12 @@ MIN_METAL = 1.0     # minimum metal feature width / slot-to-slot gap / slot-to-e
 
 STEEL = np.array([0.66, 0.70, 0.78])
 TABC  = np.array([0.55, 0.78, 0.55])
-FR4   = np.array([0.14, 0.45, 0.22])
+FR4   = np.array([0.62, 0.83, 0.58])    # PCB substrate (lighter green)
 LIGHT = np.array([0.4, 0.5, 0.78]); LIGHT = LIGHT / np.linalg.norm(LIGHT)
 AMB, DIF = 0.42, 0.58
 MTN, VAL = "#d62728", "#1f77b4"
+FOLD_LS = (0, (1, 1.2))                 # dense dotted (used for BOTH M and V)
+FOLD_LW = 2.2
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -261,9 +263,7 @@ def draw_crease(ax, design, sym_axes=True, pad=4.0):
 
     for (Ax, Ay, Bx, By), mv in m['folds2d']:
         col = MTN if mv == 'M' else VAL
-        ls  = (0, (6, 4)) if mv == 'M' else (0, (1, 2.5))
-        lw  = 1.8 if mv == 'M' else 2.4
-        ax.plot([Ax, Bx], [Ay, By], color=col, lw=lw, ls=ls, zorder=6)
+        ax.plot([Ax, Bx], [Ay, By], color=col, lw=FOLD_LW, ls=FOLD_LS, zorder=6)
 
     ax.set_xlim(min(xs)-pad, max(xs)+pad)
     ax.set_ylim(min(ys)-pad, max(ys)+pad)
@@ -691,7 +691,7 @@ def four_taps(d, inner, length, width, fold_dir):
 PLATES   = [40.0, 45.0, 50.0, 55.0, 60.0]
 LEG_W    = [3.0, 4.0, 5.0, 6.0]
 LEG_LENS = [5.0, 7.0, 9.0, 11.0, 13.0]
-ALPHAS   = [0.3, 0.4, 0.5, 0.6, 0.7]
+ALPHAS   = [0.6, 0.7, 0.8, 0.9]
 SHAPE_WEIGHTS = [('square', 30), ('octagonal', 15), ('notched', 15),
                  ('plus', 20), ('star', 20)]
 
@@ -923,9 +923,9 @@ SEED = None          # set to an int (e.g. 0) for reproducible runs
 if __name__ == "__main__":
     rng = random.Random(SEED)
     legend = [
-        Line2D([0], [0], color='k',  lw=2.4,                   label="CUT (slot / lance)"),
-        Line2D([0], [0], color=MTN, lw=1.8, ls=(0,(6,4)),     label="MOUNTAIN +90 (UP)"),
-        Line2D([0], [0], color=VAL, lw=2.4, ls=(0,(1,2.5)),   label="VALLEY -90 (DOWN)"),
+        Line2D([0], [0], color='k',  lw=2.4,                            label="CUT (slot / lance)"),
+        Line2D([0], [0], color=MTN, lw=FOLD_LW, ls=FOLD_LS,             label="MOUNTAIN +90 (UP)"),
+        Line2D([0], [0], color=VAL, lw=FOLD_LW, ls=FOLD_LS,             label="VALLEY -90 (DOWN)"),
     ]
     # pre-generate all N designs first so we can pair them across figures
     drawn = [random_design(rng) for _ in range(N)]
