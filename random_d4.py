@@ -36,7 +36,7 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection, Line3DCollection
 # mm of metal between any two slot features. Falls back to non-merged drawing
 # and skips validation if shapely is not installed.
 try:
-    from shapely.geometry import box as _sh_box, Polygon as _ShPoly
+    from shapely.geometry import box as _sh_box, Polygon as _ShPoly, Point as _ShPoint
     from shapely.ops import unary_union as _sh_union, triangulate as _sh_triangulate
     HAS_SHAPELY = True
     try:
@@ -244,9 +244,15 @@ def draw_crease(ax, design, sym_axes=True, pad=4.0):
 
     # Merge ALL slot features into a single shape so overlapping slots read
     # as one blob (not multiple overlapping rectangles + parallelograms).
+    # Clip the union to the radiator perimeter so a slot whose tip pokes
+    # past the patch (e.g. long cross on plus-shape) does NOT draw a
+    # black-outlined 'frame' segment out in empty space.
     union = _design_cuts_union(design)
+    if union is not None and not union.is_empty and HAS_SHAPELY:
+        union = union.intersection(_ShPoly(m['perim']))
     if union is not None and not union.is_empty:
-        geoms = [union] if union.geom_type == 'Polygon' else list(union.geoms)
+        geoms = ([union] if union.geom_type == 'Polygon'
+                 else [g for g in getattr(union, 'geoms', []) if g.geom_type == 'Polygon'])
         for poly in geoms:
             verts, codes = [], []
             ext = list(poly.exterior.coords)
@@ -411,18 +417,30 @@ def _face0_shapely_quads(d, thick=THICK):
 
     if wall_shapes:
         wall_union = _sh_union(wall_shapes)
-        wparts = [wall_union] if wall_union.geom_type == 'Polygon' else list(wall_union.geoms)
-        for wp in wparts:
-            boundaries = [list(wp.exterior.coords)]
-            for inter in wp.interiors:
-                boundaries.append(list(inter.coords))
-            for coords in boundaries:
-                for k in range(len(coords) - 1):
-                    x0, y0 = coords[k]; x1, y1 = coords[k+1]
-                    out.append(([(x0, y0,  thick/2.0),
-                                 (x1, y1,  thick/2.0),
-                                 (x1, y1, -thick/2.0),
-                                 (x0, y0, -thick/2.0)], rgb, alpha))
+        # Clip slot walls to the radiator outline. Otherwise a slot whose tip
+        # sticks out past the radiator (e.g. a long cross on a plus-shape
+        # patch) would draw 'frame' walls floating in empty space.
+        wall_union = wall_union.intersection(rad)
+        if not wall_union.is_empty:
+            wparts = ([wall_union] if wall_union.geom_type == 'Polygon'
+                      else [g for g in getattr(wall_union, 'geoms', []) if g.geom_type == 'Polygon'])
+            rad_b = rad.exterior
+            for wp in wparts:
+                boundaries = [list(wp.exterior.coords)]
+                for inter in wp.interiors:
+                    boundaries.append(list(inter.coords))
+                for coords in boundaries:
+                    for k in range(len(coords) - 1):
+                        x0, y0 = coords[k]; x1, y1 = coords[k+1]
+                        # Skip segments that coincide with the radiator's own
+                        # outline -- those walls are already drawn by the
+                        # perim-wall loop above.
+                        if rad_b.distance(_ShPoint((x0+x1)/2.0, (y0+y1)/2.0)) < 1e-4:
+                            continue
+                        out.append(([(x0, y0,  thick/2.0),
+                                     (x1, y1,  thick/2.0),
+                                     (x1, y1, -thick/2.0),
+                                     (x0, y0, -thick/2.0)], rgb, alpha))
     return out
 
 
