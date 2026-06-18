@@ -223,6 +223,10 @@ def draw_crease(ax, design, sym_axes=True, pad=4.0):
         if kind == 'V': ax.plot([c, c], [a, b], color='k', lw=1.0, zorder=6)
         else:           ax.plot([a, b], [c, c], color='k', lw=1.0, zorder=6)
 
+    # true polygon cuts (e.g. diagonal X-slot) -- drawn as actual parallelograms
+    for poly in m.get('poly_cuts', ()):
+        ax.add_patch(Polygon(poly, closed=True, fc='white', ec='k', lw=1.0, zorder=5))
+
     for (Ax, Ay, Bx, By), mv in m['folds2d']:
         col = MTN if mv == 'M' else VAL
         ls  = (0, (6, 4)) if mv == 'M' else (0, (1, 2.5))
@@ -471,24 +475,50 @@ def broken_ring(radius, width, gap=1.5):
     ]
 
 
-def diagonal_strip(half_extent, cell_size=1.0, sign=+1, step=None):
-    """Stair-stepped axis-aligned approximation of a 45-degree diagonal slot.
-    sign=+1 -> along y=x.  sign=-1 -> along y=-x.  The default step (cell/2)
-    makes the cells overlap so the union reads as a continuous diagonal stripe."""
-    if step is None: step = cell_size / 2.0
-    rects = []; n = int(half_extent / step)
-    for i in range(-n, n + 1):
-        c = i * step
-        cy = sign * c
-        rects.append((c - cell_size/2.0, c + cell_size/2.0,
-                      cy - cell_size/2.0, cy + cell_size/2.0))
-    return rects
+def x_slot_polygons(half_extent, width):
+    """Two TRUE 45-degree parallelogram slots forming a D4-symmetric 'X' shape.
+       half_extent  : distance from centre to corner of the slot centreline
+       width        : perpendicular slot width  (>= 0.5 mm by DFM)
+    Returns a list of two polygons (one per diagonal) as lists of (x,y) verts."""
+    d = width / (2.0 * 1.4142135623730951)
+    # y = x diagonal slot
+    poly1 = [
+        (-half_extent + d, -half_extent - d),
+        ( half_extent + d,  half_extent - d),
+        ( half_extent - d,  half_extent + d),
+        (-half_extent - d, -half_extent + d),
+    ]
+    # y = -x diagonal slot
+    poly2 = [
+        (-half_extent - d,  half_extent - d),
+        ( half_extent - d, -half_extent - d),
+        ( half_extent + d, -half_extent + d),
+        (-half_extent + d,  half_extent + d),
+    ]
+    return [poly1, poly2]
 
 
-def x_slot(half_extent, cell_size=1.0):
-    """Diagonal 'X' slot (both diagonals together). D4-symmetric."""
-    return (diagonal_strip(half_extent, cell_size, +1)
-          + diagonal_strip(half_extent, cell_size, -1))
+def make_poly_slot_extras(d, thick=THICK):
+    """Visualise polygon slots in 3D: a dark top/bottom patch slightly outside
+    the radiator thickness plus 4 walls along the polygon edges. The polygon
+    cuts themselves live in d.meta['poly_cuts']."""
+    polys = d.meta.get('poly_cuts', ())
+    extras = []
+    alpha_radiator = d.faces[0].get('alpha', 1.0)
+    dark = STEEL * 0.35                          # darker shade -> reads as 'cut'
+    for poly in polys:
+        top = [(x, y,  thick/2.0 + VIS_EPS) for x, y in poly]
+        bot = [(x, y, -thick/2.0 - VIS_EPS) for x, y in poly]
+        extras.append((top, dark, alpha_radiator))
+        extras.append((bot, dark, alpha_radiator))
+        for i in range(len(poly)):
+            (x0, y0) = poly[i]; (x1, y1) = poly[(i+1) % len(poly)]
+            verts = [(x0, y0,  thick/2.0),
+                     (x1, y1,  thick/2.0),
+                     (x1, y1, -thick/2.0),
+                     (x0, y0, -thick/2.0)]
+            extras.append((verts, STEEL, alpha_radiator))
+    return extras
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -705,18 +735,18 @@ def random_design(rng):
             add_slots(d, cross_slot(w, length=L))
             feats.append(f"+(w{w},L{L:g})")
 
-    # diagonal X-slot (stair-stepped 45-deg slot, D4-symmetric)
+    # diagonal X-slot (TRUE 45-deg parallelogram slots, D4-symmetric -- no grid)
     if rng.random() < 0.30:
-        cs = rng.choice([1.0, 1.5, 2.0])
+        w = rng.choice([0.5, 1.0, 1.5, 2.0])
         if has_ring:
-            he_max = ring_r / 1.4142 - cs/2.0 - 0.5
+            he_max = ring_r / 1.4142 - w/2.0 - 0.5
         else:
-            he_max = leg_inner - 2.0 - cs/2.0
+            he_max = leg_inner - 2.0 - w/2.0
         he_opts = [h for h in [3.0, 4.0, 5.0, 6.0, 7.0, 8.0] if h <= he_max]
         if he_opts:
             he = rng.choice(he_opts)
-            add_slots(d, x_slot(he, cell_size=cs))
-            feats.append(f"X(he{he:g},c{cs})")
+            d.meta.setdefault('poly_cuts', []).extend(x_slot_polygons(he, w))
+            feats.append(f"X(he{he:g},w{w})")
 
     # 4 corner holes
     if rng.random() < 0.25:
@@ -808,6 +838,7 @@ if __name__ == "__main__":
             pcb     = pcb_box(plate_size=d.meta['plate'],
                               top_z=-d.meta['leg_drop'] - VIS_EPS)
             fillets = bend_fillet_extras(d)
+            poly_x  = make_poly_slot_extras(d)
             view = (rng.uniform(14.0, 34.0), rng.uniform(-65.0, -30.0))
 
             axc = fig.add_subplot(2, 2, sub*2 + 1)
@@ -815,7 +846,8 @@ if __name__ == "__main__":
             axc.set_title(f"#{idx+1}  {title}", fontsize=9, fontweight="bold")
 
             ax3 = fig.add_subplot(2, 2, sub*2 + 2, projection="3d")
-            render_assembly(ax3, d, extras=list(pcb), fillets=list(fillets), view=view)
+            render_assembly(ax3, d, extras=list(pcb) + poly_x,
+                            fillets=list(fillets), view=view)
             ax3.set_title(f"Folded 3D  (view {view[0]:.0f},{view[1]:.0f})",
                           fontsize=10, fontweight="bold")
 
