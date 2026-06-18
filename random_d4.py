@@ -39,8 +39,14 @@ try:
     from shapely.geometry import box as _sh_box, Polygon as _ShPoly
     from shapely.ops import unary_union as _sh_union, triangulate as _sh_triangulate
     HAS_SHAPELY = True
+    try:
+        from shapely import constrained_delaunay_triangles as _sh_cdt
+        HAS_SH_CDT = True
+    except ImportError:
+        HAS_SH_CDT = False
 except ImportError:
     HAS_SHAPELY = False
+    HAS_SH_CDT  = False
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -350,10 +356,19 @@ def _face0_shapely_quads(d, thick=THICK):
     out = []
     parts = [metal] if metal.geom_type == 'Polygon' else list(metal.geoms)
 
-    # triangulated top + bottom faces of the metal
+    # Triangulate the metal (square minus union(slots)). We need a CONSTRAINED
+    # Delaunay -- the slot edges have to be in the triangle edges so no
+    # triangle crosses a hole boundary. Shapely 2.1+ does this natively.
+    # Fall back to unconstrained Delaunay + centroid-inside filter (which is
+    # what we used before but visibly misses triangles for non-trivial holes).
     for part in parts:
-        for tri in _sh_triangulate(part):
-            if not part.contains(tri.centroid):
+        if HAS_SH_CDT:
+            tris = _sh_cdt(part)
+            tri_iter = list(tris.geoms) if hasattr(tris, 'geoms') else [tris]
+        else:
+            tri_iter = [t for t in _sh_triangulate(part) if part.contains(t.centroid)]
+        for tri in tri_iter:
+            if tri.is_empty or tri.geom_type != 'Polygon':
                 continue
             xy = list(tri.exterior.coords)[:3]
             top = [(x, y,  thick/2.0) for x, y in xy]
