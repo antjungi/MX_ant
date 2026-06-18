@@ -373,13 +373,23 @@ def _face0_shapely_quads(d, thick=THICK):
                      (p1[0], p1[1], -thick/2.0),
                      (p0[0], p0[1], -thick/2.0)], rgb, alpha))
 
-    # ---- slot walls = boundary of union(hole_walls + poly_cuts) -------
-    # Critical change: walls are emitted ONLY along the outer / inner
-    # silhouette of the MERGED slot shape, so adjacent slot rects and the
-    # diagonal parallelograms don't leave internal walls visible after
-    # they're combined.
+    # ---- slot walls = boundary of union(EVERY interior cut) ------------
+    # Include lance openings + slots (rects) + polygon cuts together so
+    # they merge into one outline; the kerf strips end up absorbed inside
+    # the lance opening so there are no stray walls inside the leg holes.
+    # Corner cuts (radiator-outline shapers) and bend_exts (fillet relief)
+    # are excluded because their boundaries are either on the plate edge
+    # or already represented by the fillet's curved surfaces.
+    P = d.meta['plate'] / 2.0
+    EPS = 0.1
+    bend_set = set(tuple(r) for r in d.meta.get('bend_exts', []))
     wall_shapes = []
-    for h in f.get('hole_walls', f.get('holes', [])):
+    for h in f.get('holes', []):
+        if (h[0] <= -P + EPS or h[1] >= P - EPS or
+            h[2] <= -P + EPS or h[3] >= P - EPS):
+            continue                         # corner cut -> shape goes to perim
+        if tuple(h) in bend_set:
+            continue                         # bend region -> fillet renders it
         wall_shapes.append(_sh_box(h[0], h[2], h[1], h[3]))
     for p in d.meta.get('poly_cuts', ()):
         wall_shapes.append(_ShPoly(p))
@@ -512,7 +522,7 @@ def bend_fillet_extras(design, r=None, t=None, N=10):
 def planar_on_pcb(plate=PLATE, leg_inner=14.0, leg_len=8.0, leg_w=5.0, bend_r=BEND_R):
     P = plate / 2.0
     hw = leg_w / 2.0
-    holes, legfaces, folds, cuts, folds2d = [], [], [], [], []
+    holes, legfaces, folds, cuts, folds2d, bend_exts = [], [], [], [], [], []
     for k, dirn in enumerate(['+x', '-x', '+y', '-y']):
         tab, hole, line, th_up = lance(dirn, leg_inner, leg_len, leg_w)
         cuts += rect_minus(hole, tab)
@@ -529,13 +539,14 @@ def planar_on_pcb(plate=PLATE, leg_inner=14.0, leg_len=8.0, leg_w=5.0, bend_r=BE
             tab2 = (tab[0], tab[1], tab[2], tab[3]-bend_r)
             bend_ext = (-hw, hw, -leg_inner, -leg_inner+bend_r)
         holes.append(hole); holes.append(bend_ext)
+        bend_exts.append(bend_ext)
         legfaces.append(dict(rect=tab2))
         folds.append((0, 1+k, line, -th_up))                # NEGATE -> fold DOWN
         folds2d.append((line, 'V'))                          # valley = down to PCB
     faces = [dict(rect=(-P,P,-P,P), holes=holes, hole_walls=cuts)] + legfaces
     d = Design(faces, folds)
     d.meta = dict(perim=[(-P,-P),(P,-P),(P,P),(-P,P)], cuts=cuts, folds2d=folds2d,
-                  leg_drop=leg_len, bend_r=bend_r, plate=plate)
+                  leg_drop=leg_len, bend_r=bend_r, plate=plate, bend_exts=bend_exts)
     return d
 
 
@@ -674,11 +685,15 @@ def make_poly_slot_extras(d, thick=THICK):
 
 def _slot_shapes(d):
     """All slot shapes (rects + polygons + interior face['holes']) as shapely
-    geometries. Corner cuts (rects that touch the plate edge) are filtered
-    out because they belong to the radiator outline, not the slot pattern."""
+    geometries. Corner cuts (rects touching the plate edge) and bend_exts
+    (the per-leg fillet relief zones recorded in meta['bend_exts']) are
+    filtered out: the former shape the radiator outline, the latter belong
+    to the bend region which the user explicitly exempts from the 1 mm
+    minimum-metal rule."""
     if not HAS_SHAPELY: return []
     P = d.meta['plate'] / 2.0
     EPS = 0.1
+    bend_set = set(tuple(r) for r in d.meta.get('bend_exts', []))
     out = []
     seen = set()
     for r in d.meta.get('cuts', []):
@@ -686,9 +701,10 @@ def _slot_shapes(d):
     for r in d.faces[0].get('holes', []):
         if tuple(r) in seen:
             continue
-        # skip cuts that touch the plate edge (radiator-outline shapers)
         if r[0] <= -P + EPS or r[1] >= P - EPS or r[2] <= -P + EPS or r[3] >= P - EPS:
             continue
+        if tuple(r) in bend_set:
+            continue                 # bend regions exempt from min-metal check
         out.append(_sh_box(r[0], r[2], r[1], r[3]))
     for p in d.meta.get('poly_cuts', ()):
         out.append(_ShPoly(p))
@@ -758,6 +774,7 @@ def add_extra_lance(d, direction, inner, length, width, fold_dir, bend_r=BEND_R)
     mv    = 'M'   if fold_dir == 'up' else 'V'
     d.faces[0]['holes']      += [hole, bend_ext]
     d.faces[0]['hole_walls'] += kerf_strips
+    d.meta.setdefault('bend_exts', []).append(bend_ext)
     new_idx = len(d.faces)
     d.faces.append(dict(rect=tab2))
     d.folds.append((0, new_idx, line, theta))
@@ -811,8 +828,8 @@ PLATES   = [40.0, 45.0, 50.0, 55.0, 60.0]
 LEG_W    = [3.0, 4.0, 5.0, 6.0]
 LEG_LENS = [5.0, 7.0, 9.0, 11.0, 13.0]
 ALPHAS   = [0.75, 0.85, 0.95]
-SHAPE_WEIGHTS = [('square', 30), ('octagonal', 15), ('notched', 15),
-                 ('plus', 20), ('star', 20)]
+SHAPE_WEIGHTS = [('square', 55), ('octagonal', 15), ('notched', 12),
+                 ('plus',   10), ('star',       8)]
 
 
 def _weighted_pick(rng, weighted):
