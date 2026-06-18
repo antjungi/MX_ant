@@ -37,7 +37,7 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 # and skips validation if shapely is not installed.
 try:
     from shapely.geometry import box as _sh_box, Polygon as _ShPoly
-    from shapely.ops import unary_union as _sh_union
+    from shapely.ops import unary_union as _sh_union, triangulate as _sh_triangulate
     HAS_SHAPELY = True
 except ImportError:
     HAS_SHAPELY = False
@@ -157,45 +157,51 @@ class Design:
 
     def quads(self, thick=THICK):
         out = []
-        for i, f in enumerate(self.faces):
-            rect = f['rect']
-            holes = f.get('holes', [])
-            hole_walls = f.get('hole_walls', holes)
-            rgb = f.get('col', STEEL)
-            alpha = f.get('alpha', 1.0)
-            n = self._normal(i)
-            off = 0.5 * thick * n
+        for i in range(len(self.faces)):
+            out.extend(self._face_quads(i, thick))
+        return out
 
-            def top(u, v): return self._map(i, u, v) + off
-            def bot(u, v): return self._map(i, u, v) - off
+    def _face_quads(self, i, thick=THICK):
+        out = []
+        f = self.faces[i]
+        rect = f['rect']
+        holes = f.get('holes', [])
+        hole_walls = f.get('hole_walls', holes)
+        rgb = f.get('col', STEEL)
+        alpha = f.get('alpha', 1.0)
+        n = self._normal(i)
+        off = 0.5 * thick * n
 
-            tiles = [rect]
-            for h in holes:
-                nt = []
-                for r in tiles: nt += rect_minus(r, h)
-                tiles = nt
-            for (x0, x1, y0, y1) in tiles:
-                if x1 - x0 <= 1e-9 or y1 - y0 <= 1e-9: continue
-                out.append(([top(x0, y0), top(x1, y0), top(x1, y1), top(x0, y1)], rgb, alpha))
-                out.append(([bot(x0, y0), bot(x1, y0), bot(x1, y1), bot(x0, y1)], rgb, alpha))
+        def top(u, v): return self._map(i, u, v) + off
+        def bot(u, v): return self._map(i, u, v) - off
 
-            def walls(x0, x1, y0, y1):
-                for (p, qq) in [((x0, y0), (x1, y0)),
-                                ((x1, y0), (x1, y1)),
-                                ((x1, y1), (x0, y1)),
-                                ((x0, y1), (x0, y0))]:
-                    out.append(([top(*p), top(*qq), bot(*qq), bot(*p)], rgb, alpha))
+        tiles = [rect]
+        for h in holes:
+            nt = []
+            for r in tiles: nt += rect_minus(r, h)
+            tiles = nt
+        for (x0, x1, y0, y1) in tiles:
+            if x1 - x0 <= 1e-9 or y1 - y0 <= 1e-9: continue
+            out.append(([top(x0, y0), top(x1, y0), top(x1, y1), top(x0, y1)], rgb, alpha))
+            out.append(([bot(x0, y0), bot(x1, y0), bot(x1, y1), bot(x0, y1)], rgb, alpha))
 
-            perim = f.get('perim', None)
-            if perim is None:
-                walls(*rect)
-            else:
-                for k in range(len(perim)):
-                    p0 = perim[k]; p1 = perim[(k+1) % len(perim)]
-                    out.append(([top(*p0), top(*p1), bot(*p1), bot(*p0)], rgb, alpha))
+        def walls(x0, x1, y0, y1):
+            for (p, qq) in [((x0, y0), (x1, y0)),
+                            ((x1, y0), (x1, y1)),
+                            ((x1, y1), (x0, y1)),
+                            ((x0, y1), (x0, y0))]:
+                out.append(([top(*p), top(*qq), bot(*qq), bot(*p)], rgb, alpha))
 
-            for h in hole_walls:
-                walls(*h)
+        perim = f.get('perim', None)
+        if perim is None:
+            walls(*rect)
+        else:
+            for k in range(len(perim)):
+                p0 = perim[k]; p1 = perim[(k+1) % len(perim)]
+                out.append(([top(*p0), top(*p1), bot(*p1), bot(*p0)], rgb, alpha))
+
+        for h in hole_walls:
+            walls(*h)
         return out
 
 
@@ -307,18 +313,106 @@ def _set_axes_equal_from_pts(ax, pts, view):
     ax.set_box_aspect((1, 1, 1)); ax.view_init(elev=view[0], azim=view[1]); ax.set_axis_off()
 
 
+def _face0_shapely_quads(d, thick=THICK):
+    """Replacement face-0 (radiator) quads with TRUE polygon-slot subtraction.
+    Returns None if shapely isn't available or face 0 has no polygon cuts -- in
+    that case render_assembly falls back to the rect-only engine path."""
+    if (not HAS_SHAPELY) or (not d.meta.get('poly_cuts')):
+        return None
+
+    f = d.faces[0]
+    rgb   = f.get('col',  STEEL)
+    alpha = f.get('alpha', 1.0)
+
+    # Radiator outline as a shapely polygon
+    if 'perim' in f:
+        rad = _ShPoly(f['perim'])
+    else:
+        x0, x1, y0, y1 = f['rect']
+        rad = _ShPoly([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+
+    # Subtract ALL holes (rect + polygon) -> metal region
+    cuts = []
+    for h in f.get('holes', []):
+        cuts.append(_sh_box(h[0], h[2], h[1], h[3]))
+    for p in d.meta.get('poly_cuts', ()):
+        cuts.append(_ShPoly(p))
+
+    if cuts:
+        metal = rad.difference(_sh_union(cuts))
+    else:
+        metal = rad
+    if metal.is_empty:
+        return []
+
+    parts = [metal] if metal.geom_type == 'Polygon' else list(metal.geoms)
+
+    out = []
+    for part in parts:
+        # constrained Delaunay: triangulate vertices, keep tris whose centre lies inside
+        for tri in _sh_triangulate(part):
+            if not part.contains(tri.centroid):
+                continue
+            xy = list(tri.exterior.coords)[:3]
+            top = [(x, y,  thick/2.0) for x, y in xy]
+            bot = [(x, y, -thick/2.0) for x, y in xy]
+            out.append((top, rgb, alpha))
+            out.append((bot, rgb, alpha))
+
+    # Outer perim walls (use face['perim'] if given, else rect corners)
+    perim = f.get('perim', None)
+    if perim is None:
+        x0, x1, y0, y1 = f['rect']
+        perim = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+    for k in range(len(perim)):
+        p0 = perim[k]; p1 = perim[(k+1) % len(perim)]
+        out.append(([(p0[0], p0[1],  thick/2.0),
+                     (p1[0], p1[1],  thick/2.0),
+                     (p1[0], p1[1], -thick/2.0),
+                     (p0[0], p0[1], -thick/2.0)], rgb, alpha))
+
+    # Walls along rectangular hole_walls (skips bend-relief like before)
+    for h in f.get('hole_walls', f.get('holes', [])):
+        x0, x1, y0, y1 = h
+        for (p0, p1) in [((x0, y0), (x1, y0)), ((x1, y0), (x1, y1)),
+                         ((x1, y1), (x0, y1)), ((x0, y1), (x0, y0))]:
+            out.append(([(p0[0], p0[1],  thick/2.0),
+                         (p1[0], p1[1],  thick/2.0),
+                         (p1[0], p1[1], -thick/2.0),
+                         (p0[0], p0[1], -thick/2.0)], rgb, alpha))
+
+    # Walls along polygon-slot edges (the new diagonal cuts)
+    for p in d.meta.get('poly_cuts', ()):
+        n = len(p)
+        for k in range(n):
+            x0, y0 = p[k]; x1, y1 = p[(k+1) % n]
+            out.append(([(x0, y0,  thick/2.0),
+                         (x1, y1,  thick/2.0),
+                         (x1, y1, -thick/2.0),
+                         (x0, y0, -thick/2.0)], rgb, alpha))
+    return out
+
+
 def render_assembly(ax, design, extras=(), fillets=(), view=(26, -52), thick=THICK):
-    main_quads  = list(design.quads(thick)) + list(fillets)
-    extra_quads = list(extras)
-    all_pts = []
-    for quads in [extra_quads, main_quads]:
-        if not quads: continue
-        polys, cols, pts = _shade_quads(quads)
-        all_pts += pts
-        pc = Poly3DCollection(polys, facecolors=cols, edgecolor='none')
-        pc.set_zsort('average')
-        ax.add_collection3d(pc)
-    _set_axes_equal_from_pts(ax, all_pts, view)
+    """Render the whole assembly into ONE Poly3DCollection so depth-sorting is
+    consistent across PCB / radiator / legs / fillets. Polygon slots in face 0
+    are TRUE subtractions (shapely) rather than dark overlay patches."""
+    face0 = _face0_shapely_quads(design, thick)
+    if face0 is not None:
+        # use shapely-aware face 0; engine handles faces 1+
+        main_quads = list(face0)
+        for i in range(1, len(design.faces)):
+            main_quads.extend(design._face_quads(i, thick))
+    else:
+        main_quads = list(design.quads(thick))
+
+    all_quads = list(extras) + main_quads + list(fillets)
+    polys, cols, pts = _shade_quads(all_quads)
+
+    pc = Poly3DCollection(polys, facecolors=cols, edgecolor='none')
+    pc.set_zsort('average')
+    ax.add_collection3d(pc)
+    _set_axes_equal_from_pts(ax, pts, view)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -691,7 +785,7 @@ def four_taps(d, inner, length, width, fold_dir):
 PLATES   = [40.0, 45.0, 50.0, 55.0, 60.0]
 LEG_W    = [3.0, 4.0, 5.0, 6.0]
 LEG_LENS = [5.0, 7.0, 9.0, 11.0, 13.0]
-ALPHAS   = [0.6, 0.7, 0.8, 0.9]
+ALPHAS   = [0.75, 0.85, 0.95]
 SHAPE_WEIGHTS = [('square', 30), ('octagonal', 15), ('notched', 15),
                  ('plus', 20), ('star', 20)]
 
@@ -940,7 +1034,9 @@ if __name__ == "__main__":
             pcb     = pcb_box(plate_size=d.meta['plate'],
                               top_z=-d.meta['leg_drop'] - VIS_EPS)
             fillets = bend_fillet_extras(d)
-            poly_x  = make_poly_slot_extras(d)
+            # if shapely is unavailable, fall back to the dark-overlay extras
+            # for polygon slots; otherwise render_assembly subtracts them itself
+            slot_extras = [] if HAS_SHAPELY else make_poly_slot_extras(d)
             view = (rng.uniform(14.0, 34.0), rng.uniform(-65.0, -30.0))
 
             axc = fig.add_subplot(2, 2, sub*2 + 1)
@@ -948,7 +1044,7 @@ if __name__ == "__main__":
             axc.set_title(f"#{idx+1}  {title}", fontsize=9, fontweight="bold")
 
             ax3 = fig.add_subplot(2, 2, sub*2 + 2, projection="3d")
-            render_assembly(ax3, d, extras=list(pcb) + poly_x,
+            render_assembly(ax3, d, extras=list(pcb) + slot_extras,
                             fillets=list(fillets), view=view)
             ax3.set_title(f"Folded 3D  (view {view[0]:.0f},{view[1]:.0f})",
                           fontsize=10, fontweight="bold")
